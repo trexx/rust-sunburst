@@ -14,5 +14,9 @@
 # xone deliberately does not redistribute it and neither do we.
 /android/app/src/main/assets/xone_dongle_*.bin
 
+# Frontend
+/web/node_modules/
+/web/dist/
+
 # Instrumentation captures, which are per-run and per-machine
 /*.instr.json

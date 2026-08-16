@@ -1,0 +1,241 @@
+/* Single stylesheet, plain CSS with custom properties. No framework, no CSS
+   library — the same hard constraint as android-device-manager.
+   Dark mode follows the OS. */
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #eef0f3;
+  --border: #d8dce1;
+  --text: #1c2024;
+  --text-muted: #6b7280;
+  --accent: #2f6feb;
+  --accent-text: #ffffff;
+  --danger: #d23b3b;
+  --warning-bg: #fff4e0;
+  --warning-text: #8a5a00;
+  --radius: 8px;
+  --space: 12px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --surface: #1b1e24;
+    --surface-2: #23272e;
+    --border: #333941;
+    --text: #e6e8eb;
+    --text-muted: #9aa3ad;
+    --accent: #5b8cf5;
+    --danger: #f06a6a;
+    --warning-bg: #3a2e14;
+    --warning-text: #f0c674;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.app {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: var(--space);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+  flex-wrap: wrap;
+  padding-bottom: var(--space);
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 20px;
+  margin: 0;
+}
+
+nav {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+
+button {
+  font: inherit;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.tab.active {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+button.link {
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  text-decoration: underline;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+  padding-top: var(--space);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space);
+}
+
+.card h2 {
+  margin: 0 0 var(--space);
+  font-size: 16px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+label {
+  display: block;
+  margin: 8px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+input,
+select {
+  display: block;
+  font: inherit;
+  width: 100%;
+  max-width: 420px;
+  margin-top: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.row input {
+  margin-top: 0;
+  width: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+th {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.facts dd {
+  margin: 0;
+}
+
+.hint {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.banner {
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  margin: 8px 0;
+  font-size: 14px;
+}
+
+.banner.warning {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.loading,
+.gate {
+  max-width: 420px;
+  margin: 15vh auto;
+  padding: var(--space);
+  text-align: center;
+}
+
+.gate input {
+  margin: var(--space) auto;
+}

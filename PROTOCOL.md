@@ -79,11 +79,12 @@ over the same bytes gives the same tag. That is exactly why the tag alone is not
 enough. The tag proves origin and integrity; `input_seq` and the replay window
 provide freshness. Neither half is optional.
 
-**Session keys, not the pairing key.** Deriving the packet key straight from the
-pairing secret leaves a hole: `input_seq` restarts at zero each session, so a
-packet captured in one session replays cleanly into the next — valid MAC,
-sequence above the window floor, accepted. Both sides send a random 128-bit
-nonce during the handshake and derive
+**Session keys, not the pairing key.** The `pairing_secret` below is long-lived;
+the packet key is not. Deriving the packet key straight from the pairing secret
+leaves a hole: `input_seq` restarts at zero each session, so a packet captured in
+one session replays cleanly into the next — valid MAC, sequence above the window
+floor, accepted. Both sides send a random 128-bit nonce during the handshake and
+derive
 
 ```
 session_key = BLAKE3::derive_key("sunburst session v1",
@@ -126,6 +127,11 @@ Minimal reliable layer over the same socket: sequence, ack, retransmit on timeou
 ~150 lines. Not a general-purpose stream — messages are small and infrequent.
 
 Client → server:
+- `PairRequest` — name, model, ABI, quirks, `client_nonce`. **Unauthenticated;
+  see Pairing below.**
+- `PairConfirm` — `request_id`, `tag`. Also unauthenticated.
+- `ListApps` — ask for the catalogue
+- `LaunchApp` — `app_id` from the last `AppList`
 - `Hello` — client capabilities, ABI, display info, `client_nonce`, `clock_offset_ns`
 - `DecoderQuirks` — the quirks struct (see CLAUDE.md); server adapts encoder config
 - `RequestIdr` — last resort only; prefer NACK + reference invalidation
@@ -135,6 +141,9 @@ Client → server:
 - `Bye`
 
 Server → client:
+- `PairChallenge` — `request_id`, `server_nonce`. Unauthenticated.
+- `AppList` — `(app_id, name)` pairs. **Names and ids only:** box art is a later
+  phase, and a reliable control channel is the wrong carrier for image payloads.
 - `SessionConfig` — codec, resolution, fps, bitrate, HDR metadata, `server_nonce`,
   `clock_offset_ns`
 - `CodecPrivate` — VPS/SPS/PPS or av1C record. Client cannot configure MediaCodec
@@ -150,6 +159,58 @@ Server → client:
 RTT/2 — sub-millisecond on a wired LAN, which is ample for attributing 5–10ms
 stages. Pad connect/disconnect go over the reliable channel deliberately: they
 are infrequent and must not be lost, which is the opposite of rumble below.
+
+`ListApps` works before a video session exists, which is what listing before
+streaming requires.
+
+---
+
+## Pairing
+
+Produces the `pairing_secret` every session key derives from. It is the root of
+trust for the input path, so it is worth being precise about what this does and
+does not achieve.
+
+**The PIN never crosses the wire.** The client generates it and displays it on
+the TV; the user types it into the web UI. Both ends then derive the same secret
+independently:
+
+```
+pairing_secret = BLAKE3::derive_key("sunburst pairing v1",
+                                    pin ‖ client_nonce ‖ server_nonce)
+```
+
+The obvious alternative — server mints the PIN, client sends it back — puts the
+PIN in a packet, where a passive listener reads it directly and does not have to
+guess at all. This direction is also the easy one to type: eight digits into a
+browser rather than into a TV remote.
+
+**Pairing packets are the one exception to "every control packet carries a MAC",**
+because before pairing there is no key. What keeps that bounded:
+
+- Only accepted while pairing is **armed from the web UI**. Never always-listening.
+- The arming is **single use** and expires after **90 seconds**.
+- PIN attempts are **capped at five**, after which the request is discarded.
+- Anything arriving unarmed is dropped silently. An unsolicited pair request is
+  the normal state of the world, not an incident.
+
+Sequence:
+
+1. Web UI arms. The server generates `server_nonce`.
+2. Client sends `PairRequest`; server replies `PairChallenge` with the nonce.
+3. Client derives the secret from its PIN and sends `PairConfirm` with
+   `tag = BLAKE3::keyed_hash(secret, "sunburst pair confirm v1")[..8]`.
+4. User types the PIN. The server derives a candidate secret and compares tags.
+   A mismatch costs an attempt, not the arming — a typo should not mean walking
+   back to the TV.
+
+**What this is not.** It is not a key exchange. Anyone who captures a pairing
+exchange *and* one later authenticated packet can grind the eight-digit PIN
+offline and recover a secret that stays valid until revoked. That is a
+deliberate choice for a LAN-only threat model, consistent with declining
+encryption for video on the same network — but it is the weakest link in the
+input path, and revoking a client must genuinely delete its secret. Upgrading to
+X25519 would be a two-crate change confined to this section.
 
 ---
 

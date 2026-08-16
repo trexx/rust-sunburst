@@ -245,6 +245,60 @@ latency is measured against a directly-connected pad and the difference reported
 
 ---
 
+## Phase 9 — Management web UI
+
+**Its first half is a Phase 2 prerequisite and lands before the input work.**
+Phase 2 requires authenticated input packets, PROTOCOL.md derives the session key
+from a `pairing_secret`, and nothing else produces or stores one. Configuration,
+the client store and pairing therefore come first; the rest follows whenever.
+
+Covers clients, sessions, start-up, configuration, and the app catalogue the
+client launches from.
+
+- **No Windows service.** Capture and `SendInput` both need the interactive
+  session, so nothing useful can live in session 0. The server autostarts at
+  logon through a scheduled task — `ONLOGON` with highest privileges, because
+  only a task can request those and without them `SendInput` cannot reach an
+  elevated window past UIPI. This drops a service, an installer and a session-0
+  IPC surface, and makes launching an app a plain `CreateProcess`.
+  **With nobody logged in there is no server and no web UI.** Capture could not
+  work in that state either, so nothing is lost that a user need not be present
+  for.
+- **LAN bind, bearer token, plain HTTP.** No TLS: the token is a shared-secret
+  gate, not confidentiality on the wire, which is the same posture CLAUDE.md
+  already takes for unencrypted video on the same network. A LAN bind with no
+  token is refused at load and at save.
+- **Manual app entries only.** Big Picture is an ordinary entry
+  (`steam://open/bigpicture`), which is most of what Phase 7 asks for.
+- **Sessions reuse Phase 1.** `DrainHandle::report()` already produces per-stage
+  percentiles; the UI renders those rather than measuring anything again, and
+  carries `Report::is_lossy` through so a thinned table cannot be quoted by
+  accident.
+
+**Acceptance:** a device pairs from a TV and survives a restart; an app launches
+with its prep commands and has them undone on exit; autostart survives a logoff
+and a fast user switch; input reaches an elevated window.
+
+### Not implemented, deliberately
+
+- **Steam or other launcher scanning.** No `libraryfolders.vdf`,
+  `appmanifest_*.acf`, `shortcuts.vdf`, Epic, GOG or Playnite. Entries are typed
+  in once and there are not many of them; the alternative is parsing formats that
+  change without warning to save a few minutes of typing.
+- **Remote access from outside the LAN.** Plain HTTP, a bearer token,
+  PIN-derived pairing and unencrypted video all assume the LAN. Exposing this to
+  a WAN would invalidate every one of those at once, not just the transport. If
+  it is ever wanted, that is a VPN's job.
+- **Multi-user support.** One operator, one token, one config. The server runs in
+  one interactive session by design, so a second user is not something it could
+  serve anyway.
+
+Box art is **deferred rather than dropped** — the control channel carries names
+and ids only, and nothing forecloses adding an HTTP fetch once there is something
+to fetch.
+
+---
+
 ## Capture backend reference
 
 Ranked by latency. Full detail in CLAUDE.md traps.

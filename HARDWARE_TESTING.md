@@ -188,6 +188,43 @@ slower cores, so the budget needs re-confirming on each.
 
 ---
 
+## 5. Management UI (env S)
+
+The API, pairing, config and catalogue are all covered by tests on the
+development machine — 130 of them, against a fake `Host`. What follows is only
+the part that a fake cannot answer.
+
+- [ ] **Autostart survives a logoff and a fast user switch.** The scheduled task
+      is `ONLOGON`, so this is the whole point of it. Log out, log back in,
+      confirm the server is up and the UI answers.
+- [ ] **The task really does run with highest privileges.** Check the elevated
+      flag on the Status panel. If it reads "no", `SendInput` cannot reach an
+      elevated window past UIPI, and that presents as input doing nothing in one
+      specific game rather than as an error.
+- [ ] **Creating the task without elevation fails visibly.** `schtasks /RL
+      HIGHEST` needs an elevated caller; confirm the UI reports the failure
+      rather than silently leaving autostart off.
+- [ ] **Restart hands the port over.** The replacement retries its bind for ten
+      seconds while the old process exits. Confirm the UI comes back rather than
+      the new process dying on `EADDRINUSE`.
+- [ ] **A real game launches**, with prep commands run before and undone after.
+      Use something that actually changes display state, so a missed undo is
+      visible.
+- [ ] **Prep undo after a crash, not a clean exit.** Kill the game with Task
+      Manager and confirm the undo commands still run — this is the path that
+      leaves a display in the wrong mode.
+- [ ] **`steam://open/bigpicture` launches** through `ShellExecute`. It has no
+      child process to wait on, so confirm the UI does not report it as running
+      forever.
+- [ ] **A device pairs from the TV and survives a restart.** The PIN is shown on
+      the client and typed into the browser. Then restart the server and confirm
+      it is still paired — a pairing that lives only in memory is the failure to
+      look for.
+- [ ] **Revoking really revokes.** Remove a client, restart, and confirm it
+      cannot reconnect without pairing again.
+
+---
+
 ## Hardware still needed
 
 | Needed for | Hardware |

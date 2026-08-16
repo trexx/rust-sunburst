@@ -98,15 +98,40 @@ sunburst-audio/    WASAPI loopback + Opus
 sunburst-input/    ViGEm + SendInput + session helper
 sunburst-net/      UDP, pacing, NACK, rate control
 sunburst-server/   orchestration; tokio lives here and only here
+sunburst-web/      management API: clients, sessions, config, apps. Cross-platform.
 sunburst-android/  cdylib + JNI shim
 android/           Gradle project; Kotlin owns Activity + SurfaceView only
+web/               Vite + React + TS management UI
 spikes/            Phase 0 throwaway. Deletable by design.
 ```
 
 `sunburst-capture`, `-encode`, `-audio`, `-input` and `-server` are
 `#![cfg(windows)]` at the crate root, so they compile to nothing on a Linux
-host. `sunburst-core` and `-net` are cross-platform: the client needs the
-protocol types and the receive half.
+host. `sunburst-core`, `-net` and `-web` are cross-platform: the client needs the
+protocol types and the receive half, and everything Windows-specific the web UI
+needs sits behind the `Host` trait in `sunburst-web/src/host.rs`.
+
+That trait is not abstraction for its own sake — it is what lets the entire
+management surface be tested on the Linux machine instead of the 5070 box.
+`sunburst-server` implements it against Win32; `host::Fake` implements it for
+tests.
+
+## Process model
+
+**There is no Windows service.** Capture and `SendInput` both require the
+interactive session, so nothing useful can live in session 0. The server runs in
+the logged-in session and autostarts through a scheduled task. That drops a
+service, an installer and a session-0 IPC surface, and it makes launching a game
+a plain `CreateProcess` rather than `WTSGetActiveConsoleSessionId` →
+`CreateProcessAsUser`.
+
+The consequence, stated rather than discovered: **with nobody logged in there is
+no server and no web UI.** Capture could not work then either, so a service
+would not have recovered anything.
+
+The session helper in the traps below is still needed for the *desktop* problem —
+re-attaching via `OpenInputDesktop`/`SetThreadDesktop` when the desktop switches
+— just not for a cross-session one.
 
 ## Build and test
 
@@ -118,11 +143,20 @@ cargo test --workspace                            # everything host-testable
 cargo clippy --workspace --all-targets            # SAFETY comments are enforced
 cargo bench -p sunburst-core --bench instr        # record() must stay under 50ns
 
-cargo xwin check --target x86_64-pc-windows-msvc  # the five Windows crates
+cargo xwin build --target x86_64-pc-windows-msvc  # real PE binaries, from Linux
+cargo xwin clippy --workspace --all-targets --target x86_64-pc-windows-msvc
+
 cargo build -p sunburst-android --target aarch64-linux-android
 cargo build -p sunburst-android --target armv7-linux-androideabi
 ./gradlew -p android assembleDebug testDebugUnitTest
+
+cd web && npm install && npm run build            # or `npm run dev`
 ```
+
+**Run `cargo xwin clippy` as well as the plain one.** Clippy on a Linux host
+skips every `#![cfg(windows)]` crate entirely, so the Windows code is unlinted
+unless it is asked for by target — which is how four missing SAFETY comments sat
+in the Phase 0 probe unnoticed.
 
 Prerequisites:
 
@@ -138,9 +172,26 @@ The Android targets need the NDK's toolchain `bin/` on `PATH` —
 `.cargo/config.toml` names the linker wrappers and says which. The Gradle wrapper
 fetches its own JDK.
 
-Real builds, NVENC, and every hardware measurement happen on the 5070 box.
-Cross-checking here catches compile errors without a round trip; it proves
-nothing about behaviour.
+Real NVENC and every hardware measurement happen on the 5070 box. The
+cross-build produces genuine binaries but proves nothing about behaviour.
+
+## Dependencies
+
+The frame path stays bare: `sunburst-core` has `blake3`, `subtle` and `libc`,
+and `serde` is deliberately kept out of it — where the web layer needs core's
+types it mirrors them (`client::QuirksRecord`, `metrics::MetricsRecord`) rather
+than deriving on the originals.
+
+The control plane is allowed more, and `sunburst-web` is where it goes: `tokio`,
+`hyper`, `hyper-util`, `http-body-util`, `serde`, `serde_json`, `getrandom`.
+Roughly 25 crates. The line taken there is worth repeating, because it is not
+"minimal" in the abstract: **routing is hand-rolled because an admin API is a
+match statement; parsing is not hand-rolled, because the LAN-facing parser is the
+last place to save five crates.**
+
+The frontend runs to React and nothing else — no CSS, UI, state or router
+libraries. Styling is plain CSS with custom properties in a single
+`web/src/App.css`.
 
 **What CI can and cannot tell you.** It compiles all three targets and runs the
 host-testable tests. It cannot measure latency — no GPU, no hardware decoder, no
