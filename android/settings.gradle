@@ -1,0 +1,24 @@
+// Repositories are declared centrally here, which FAIL_ON_PROJECT_REPOS enforces.
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+// Lets Gradle fetch the JDK named by the toolchain if it is not installed.
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+dependencyResolutionManagement {
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'sunburst'
+include ':app'

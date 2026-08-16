@@ -9,6 +9,11 @@ members = [
     "sunburst-net",
     "sunburst-server",
     "sunburst-android",
+
+    # Phase 0 throwaway. A workspace member so it is type-checked in the same
+    # pass as everything else, and deleted with the rest of spikes/ when Phase 0
+    # closes.
+    "spikes/probe-windows",
 ]
 
 [workspace.package]

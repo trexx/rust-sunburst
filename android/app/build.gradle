@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.trexx.sunburst'
+    // CLAUDE.md pins these. targetSdk is deliberately behind compileSdk.
+    compileSdk 37
+    ndkVersion '29.0.14206865'
+
+    defaultConfig {
+        applicationId 'com.trexx.sunburst'
+        // API 30 is not arbitrary: KEY_LOW_LATENCY and Surface.setFrameRate()
+        // both landed exactly there, and the Shield sits at API 30.
+        minSdk 30
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+
+        ndk {
+            // Both are required. The Homatics ships a 32-bit userspace on a
+            // 64-bit Amlogic SoC, so armeabi-v7a is not optional.
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        // A lint failure must not be the reason a Phase 0 measurement does not
+        // happen. Tighten this when the app becomes the actual client.
+        abortOnError false
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}

@@ -91,40 +91,76 @@ de-risks Phase 3.
 
 ## 2. Phase 0.2 — Decoder enumeration (env A and B)
 
-Run the enumeration activity in `android/` on both boxes and pull the output
-file. This seeds `DecoderQuirks` with measurements instead of assumptions.
+```bash
+./gradlew -p android assembleDebug
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.trexx.sunburst/.probe.DecoderProbeActivity
+adb pull /sdcard/Android/data/com.trexx.sunburst/files/decoders.json
+```
 
-- [ ] **Every decoder enumerated, not just the first match.** Errata #15 in
+- [x] **Every decoder enumerated, not just the first match.** Errata #15 in
       `decoder-errata.txt`: some devices do not support `FEATURE_LowLatency` on
       their first compatible decoder, and picking the first one silently loses it.
-- [ ] For each HEVC/AV1 decoder record: name, `isHardwareAccelerated`, profiles,
-      levels, max resolution, `FEATURE_LowLatency`, and whether `KEY_LOW_LATENCY`
-      is actually **accepted** rather than merely advertised.
-- [ ] **Shield: HEVC Main10 at 4K60 is present.** It has no AV1 block, so this is
-      its only path.
-- [ ] **Homatics: AV1 Main10 at 4K60 is present.** Same — its only path.
-- [ ] **Vendor low-latency keys** checked on the Amlogic. Errata #16/#17: some
-      Amlogic decoders produce no output at all without an undocumented
-      `MediaFormat` option, which reads as a broken stream rather than a missing
-      flag.
+- [x] **Shield: HEVC Main10 at 4K60 is present**, and there is no AV1 decoder at
+      all — as CLAUDE.md says. *(Verified on SHIELD Android TV, `mdarcy`,
+      Android 11 / API 30.)*
+- [ ] **Homatics: AV1 Main10 at 4K60 is present.** Its only path, since the HEVC
+      decoder is broken.
+- [ ] **Vendor low-latency keys** on the Amlogic. Errata #16/#17: some Amlogic
+      decoders produce no output at all without an undocumented `MediaFormat`
+      option, which reads as a broken stream rather than a missing flag.
 
-| Device | Decoder | HW | LowLatency | KEY_LOW_LATENCY accepted | Max res |
-|---|---|---|---|---|---|
-| | | | | | |
+### Shield results (verified)
+
+| Decoder | MIME | HW | FEATURE_LowLatency | KEY_LOW_LATENCY | 4K60 | Max res |
+|---|---|---|---|---|---|---|
+| `OMX.Nvidia.h265.decode` | hevc | yes | **yes** | silent | **yes** | 3840×2176 |
+| `OMX.Nvidia.h265.decode.secure` | hevc | yes | no | silent | yes | 3840×2176 |
+| `OMX.google.hevc.decoder` | hevc | no | no | rejected | no | 4096×4096 |
+
+`OMX.Nvidia.h265.decode` is the target. Profile list includes `4096`
+(`HEVCProfileMain10`). The software decoder cannot do 4K60 and is not a fallback.
+
+**Read `KEY_LOW_LATENCY` as three-state, not a boolean.** `silent` means
+configure accepted the key without echoing it back, which proves nothing either
+way: MediaCodec silently ignores keys it does not recognise, and a key that took
+effect may still not appear in `getInputFormat()`. Only `rejected` — configure
+threw — is an unambiguous answer. `FEATURE_LowLatency` remains the thing to trust.
+
+> Both flaws above were found by running the probe rather than by reading it. The
+> first version treated a silently-ignored key as accepted, which made every
+> decoder on the Shield report all five vendor low-latency keys as supported —
+> including Google's software decoder, which has never heard of any of them.
 
 ---
 
-## 3. Phase 0.3 — Homatics network PHY (env B)
+## 3. Phase 0.3 — Network PHY (env A and B)
 
-Run `spikes/check-phy.sh`.
+```bash
+spikes/check-phy.sh [adb-serial]
+```
 
-- [ ] **Link negotiates 1000 Mbps, not 100.** A 100Mbit PHY caps usable
-      throughput around 80 Mbps, which would sit below the AV1 target range and
-      reshape the bitrate plan rather than merely tightening it.
-- [ ] Confirm the switch port agrees, not just the box — a bad cable shows up
-      here and nowhere else.
+- [x] **Shield: link is gigabit.** 216 Mbps measured, well past a 100Mbit PHY's
+      ~94 Mbps ceiling. *(Verified over adb-over-TCP.)*
+- [ ] **Homatics: link is gigabit, not 100 Mbit.** This is the one Phase 0.3
+      actually asks about. A 100Mbit PHY caps usable throughput around 80 Mbps,
+      below the 70–100 Mbps AV1 target rather than merely tightening it.
+- [ ] Confirm the switch port agrees, not just the box — a single bad pair
+      negotiates 100 and looks exactly like a hardware limit.
 
-Result: _______ Mbps
+**The obvious check does not work, and the obvious substitute lies.**
+`/sys/class/net/eth0/speed` is `Permission denied` for the shell user under
+SELinux, as are `ip link` and `ethtool` (verified on the Shield). `dumpsys
+ethernet` does report `LinkUpBandwidth>=100000Kbps`, but that is Android's
+hardcoded default for the Ethernet transport, not a measured rate — it reads as
+exactly the failure being looked for, on a link that is actually gigabit. The
+script measures throughput instead, which makes it a reliable yes/no and not a
+rate meter: adb tops out around 200 Mbps.
+
+| Device | Measured | Verdict |
+|---|---|---|
+| Shield | 216 Mbps | gigabit |
+| Homatics | | |
 
 ---
 
