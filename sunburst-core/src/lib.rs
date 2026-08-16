@@ -7,3 +7,4 @@
 //! [`instr::Stage`] values the server does.
 
 pub mod instr;
+pub mod proto;

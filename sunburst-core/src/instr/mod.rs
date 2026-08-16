@@ -12,13 +12,13 @@
 //!
 //! ```no_run
 //! use sunburst_core::instr::{self, Stage};
+//! # let frame_id = 0u32;
 //!
 //! // Once, at thread start.
 //! instr::register_thread("capture");
 //!
 //! // Per frame. No allocation, no formatting, no locks, no logging.
 //! instr::record(Stage::CaptureAcquire, frame_id);
-//! # let frame_id = 0u32;
 //! ```
 //!
 //! # Reading the numbers honestly
