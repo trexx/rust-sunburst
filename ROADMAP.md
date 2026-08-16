@@ -1,0 +1,262 @@
+# Roadmap
+
+Phases are ordered so that each one is independently testable and the
+highest-risk unknowns resolve earliest. Do not start a phase until the previous
+phase's acceptance criteria pass.
+
+---
+
+## Phase 0 — Spikes (2 days)
+
+Throwaway code. The point is to resolve architecture-invalidating unknowns before
+committing to any of them.
+
+### 0.1 NvFBC availability
+NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
+developers to Desktop Duplication; the surviving NvFBC is the Linux one. **Assume
+it is unavailable until proven otherwise on this exact driver.**
+
+Call `NvFBCCreateInstance` / `NvFBCCreateHandle`. Record the result.
+
+- **Available** → NvFBC becomes the priority-1 backend and is worth more to us
+  than it would be on a Ti, since encode latency is a fixed floor and DWM
+  composition becomes the biggest remaining target.
+- **Unavailable** → delete the backend from the plan. The `Capture` trait must be
+  shaped so its absence costs nothing.
+
+### 0.2 Decoder enumeration on both boxes
+Dump full `MediaCodecList` on Shield and Homatics. For each HEVC/AV1 decoder
+record: name, `isHardwareAccelerated`, supported profiles/levels, max resolution,
+`FEATURE_LowLatency`, and whether `KEY_LOW_LATENCY` is accepted.
+
+Seeds the quirks table with real data instead of assumptions.
+
+### 0.3 Homatics network PHY
+Confirm the box negotiates 1000Mbps, not 100. A 100Mbit PHY caps usable
+throughput around 80 Mbps and makes AV1's efficiency load-bearing rather than
+nice-to-have.
+
+### 0.4 Homatics HEVC bug characterisation — **dropped, do not reinstate**
+This asked whether the Homatics HEVC decoder is genuinely broken or merely
+misconfigured. It is broken; its low-latency HEVC decoder is known bad, and there
+is nothing left to characterise. Recorded here rather than deleted so a later
+session does not helpfully propose the experiment again.
+
+Two consequences, which are constraints on Phase 3 onward rather than risks to
+manage later:
+
+- **AV1 is the Homatics path with no fallback behind it.** The AV1 reference
+  state machine and the av1C record carry the whole device, and the av1C record
+  is the known silent-failure point — wrong record, decoder configures cleanly
+  and outputs nothing.
+- **0.1's AV1 capability queries are load-bearing.** If Blackwell's AV1 encoder
+  lacks `SUPPORT_REF_PIC_INVALIDATION`, there is no HEVC path to fall back to and
+  NACK recovery on the Homatics degrades to `RequestIdr`. Better known now than
+  in Phase 4.
+
+**Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
+table seeded.
+
+---
+
+## Phase 1 — Instrumentation (3 days)
+
+First, so every subsequent phase is measurable. Building this later means
+retrofitting timestamps through code that already works, and nobody does that.
+
+- Lock-free SPSC ring, preallocated, fixed-size records: `(stage_id: u8,
+  frame_id: u32, qpc: u64)`. No allocation, no formatting, no locks on push.
+- `QueryPerformanceCounter` throughout; convert to ns only in the drain thread.
+- Drain thread at low priority. Aggregates p50/p95/p99/max per stage over a
+  rolling window.
+- Timestamps ride with the frame through the pipeline and cross the wire in the
+  packet header, so the client can attribute end-to-end.
+- CLI/TUI readout of the current per-stage table.
+- Export a before/after diff format suitable for pasting into a PR.
+
+**Acceptance:** a synthetic 5-stage pipeline reports stable p99s; pushing a record
+costs <50ns; zero allocations after warmup (verify with a counting allocator).
+
+---
+
+## Phase 2 — Input (1 week)
+
+No video. Independently testable in a real game. Front-loaded because the
+session/desktop plumbing is where "works on my machine" goes to die, and finding
+that out now is much cheaper than finding it out in Phase 5.
+
+- UDP socket, single port.
+- Authenticated input/control packets: keyed MAC + sequence number, replay rejection.
+- Minimal reliable channel (seq + ack + retransmit, ~150 lines) for control messages.
+- ViGEmBus gamepad via `vigem-client`. Rumble callback → forward to client.
+- Keyboard via scancode `SendInput` (see CLAUDE.md traps).
+- Mouse: absolute mode (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`,
+  normalised 0–65535) and relative mode. Wheel + horizontal wheel + XBUTTON1/2.
+- Session helper: spawn into interactive session, survive fast user switching,
+  re-attach on desktop change.
+- Throwaway CLI sender to drive it during development.
+
+**Acceptance:** gamepad, keyboard and mouse all work in a real Steam game launched
+from Big Picture. Input survives a UAC prompt and a lock/unlock cycle. Steam Input
+interaction characterised and documented.
+
+---
+
+## Phase 3 — Capture → encode → file (1 week)
+
+Still no network. Output is an elementary stream on disk, verified by playback on
+the actual TVs.
+
+- `Capture` trait + `Caps`. `AccessLost` recoverable at any point.
+- **DDA** backend: blocking `AcquireNextFrame` on a dedicated thread, release
+  immediately after taking the texture reference.
+- **WGC** backend: free-threaded frame pool, `R16G16B16A16Float` for HDR.
+- Backend selection: WGC on Win11, DDA on Win10, fall back to the other on
+  `AccessLost` or repeated black-frame detection.
+- scRGB→P010 compute shader.
+- NVENC init: HEVC Main10 and AV1 Main10, P1–P4, `TUNING_INFO_ULTRA_LOW_LATENCY`,
+  CBR, no lookahead, no B-frames, infinite GOP.
+- **Subframe readback** — slices for HEVC, tiles for AV1. Not optional (see CLAUDE.md).
+- HDR metadata extraction (mastering primaries, MaxCLL/MaxFALL).
+- Dump Annex-B (HEVC) and OBU stream (AV1) to disk.
+
+**Acceptance:** both streams play correctly on their target device with HDR
+active. Capture→encode p99 within budget. Survives alt-tab, resolution change,
+and a Big Picture game launch/exit without a permanent stall.
+
+---
+
+## Phase 4 — Transport (2 weeks)
+
+- Packetization per PROTOCOL.md. MTU-safe, ≤1200 byte payload.
+- **USO send offload** (`WSASetSockopt(UDP_SEND_MSG_SIZE)`) and URO receive
+  (`UDP_RECV_MAX_COALESCED_SIZE`). ~85x syscall reduction at 5,200 pkt/s. This is
+  the single biggest CPU win in the transport and the thing that would otherwise
+  make naive raw UDP lose to a tuned QUIC stack.
+- Pacing against the **frame deadline**, not RTT. Keep pacing even with 1GbE
+  headroom — bursty UDP overruns switch buffers regardless of link speed.
+- Jitter buffer, adaptive depth.
+- NACK + `NvEncInvalidateRefFrames`. Separate state machines for HEVC and AV1.
+- Intra-refresh, no periodic IDR — subject to the quirks table.
+- Delay-gradient rate control (measure one-way delay *gradient*, not loss — reacts
+  before queues build). Applies via `NvEncReconfigureEncoder`, which changes
+  bitrate without tearing down the session.
+
+**Acceptance:** sustained 4K60 at target bitrate to a stub receiver. Induced 2%
+packet loss recovers without a visible hitch and without an IDR. Rate controller
+converges within 2s of a bandwidth change and does not oscillate.
+
+---
+
+## Phase 5 — Android client (2 weeks)
+
+First glass-to-glass number.
+
+- Rust `cdylib`, both ABIs. Network, depacketization, jitter buffer, decode
+  driving all in Rust via the `ndk` crate. Kotlin owns only Activity + `SurfaceView`.
+- Codec selection from the Phase 0 enumeration; quirks sent at handshake.
+- MediaCodec: Surface output, `KEY_LOW_LATENCY`, `KEY_PRIORITY=0`, high
+  `KEY_OPERATING_RATE`, vendor low-latency keys where present.
+- av1C construction for AV1 `csd-0`. HEVC `csd-0` from VPS/SPS/PPS.
+- `Surface.setFrameRate()`; `Choreographer`-paced `releaseOutputBuffer`.
+- HDR: `MediaFormat.KEY_HDR_STATIC_INFO`, check `Display.HdrCapabilities`.
+- Input: `requestPointerCapture()` + `onCapturedPointerEvent` for mouse;
+  `onKeyDown`/`onKeyUp` + `onGenericMotionEvent` for gamepad; `onKeyPreIme` so the
+  IME doesn't swallow keys. Enumerate `getMotionRanges()` rather than assuming
+  deadzones.
+- Client-side cursor rendering.
+- `PerformanceHintManager` behind an API-31 check.
+
+**Acceptance:** 4K60 HDR on both devices. Glass-to-glass measured (high-speed
+camera or LED-on-input rig) and within the 60–100ms budget. No microstutter over
+a 30-minute session.
+
+---
+
+## Phase 6 — Audio (1 week)
+
+- WASAPI loopback via `IAudioClient3` at minimum engine period.
+- Virtual sink so the host stays muted.
+- Opus encode; libopus via NDK on the client, Oboe/AAudio in low-latency mode.
+- A/V sync against the existing Phase 1 timestamps.
+
+**Acceptance:** no drift over 30 minutes. Audio latency measured and reported
+alongside video.
+
+---
+
+## Phase 7 — Optional backends and polish
+
+Ordered by value, not difficulty.
+
+- **Big Picture launch** — `steam://open/bigpicture` from the existing interactive
+  session helper. Win10 HDR global toggle around the session with restore on
+  disconnect. Game launch/exit detection for per-game bitrate profiles.
+- **IDD** — virtual display for client-native resolution and headless operation.
+  Solves resolution matching and HDR mode control cleanly. Requires an EV-signed
+  WDDM driver; strongly consider consuming an existing VDD (Parsec VDD, Virtual
+  Display Driver) rather than authoring one.
+- **NvFBC** — only if Phase 0.1 came back positive.
+- **Swapchain hooking** — opt-in, with an explicit anti-cheat warning. Hook
+  `IDXGISwapChain::Present`/`Present1`/`ResizeBuffers`, `vkQueuePresentKHR`,
+  `wglSwapBuffers`, and D3D9 `EndScene`/`Present`. D3D9Ex can share surfaces to
+  D3D11; plain D3D9 cannot and needs a `StretchRect`→sysmem→upload path that is
+  meaningfully slower. Poor fit for Big Picture (per-process, must chase each
+  launch) but the only way to beat DWM composition if NvFBC is unavailable.
+- **Non-Steam game launching.**
+
+---
+
+## Phase 8 — Xbox Wireless Adapter
+
+Depends on Phase 5 and nothing else — not audio, not the optional capture
+backends — so it can be pulled ahead of Phases 6 and 7 at any point.
+
+The adapter (`045e:02e6`) is not a HID device. It is an MT7612U wireless chip
+that must be given firmware and have a radio brought up before it will speak to a
+pad at all. That half is ~6,500 lines in the xow/xone lineage; GIP itself is
+about 450.
+
+- **Radio: vendored C++** behind a narrow FFI seam, per the same reasoning
+  CLAUDE.md applies to D3D11/NVENC. Proven against this exact adapter, and
+  unforgiving enough that a re-transcription reads as "the dongle does nothing".
+- **GIP: Rust, written from [MS-GIPUSB] v20240916** — not transcribed from
+  `gip.cpp`. The xow-derived code has four known defects against that spec
+  (rumble as a raw byte rather than a percentage, a sign-extension discontinuity
+  on the wired path, a dropped extended status message, and capabilities never
+  advertised). Transcribing reimports all four.
+- **USB**: Kotlin holds `UsbManager` permission and passes
+  `UsbDeviceConnection.getFileDescriptor()` down; Rust wraps the fd. No JNI on
+  the input path.
+- **Firmware**: `FW_ACC_00U.bin`, fetched by `scripts/fetch-firmware.sh` at build
+  time and never committed. Needs `bsdtar` or `cabextract`.
+- **In-app pairing is required, not a nicety.** The physical pairing button on
+  the unit here is dead, and it must be reachable from the TV remote — needing a
+  working pad to pair a pad defeats the point.
+
+**Scope is set by what survives the ViGEm X360 boundary:** four pads, buttons,
+sticks, triggers, rumble. Motion, trigger rumble and battery-to-host are out —
+XInput has nowhere to put them. Battery can still be shown client-side. Pad
+headphone audio depends on Phase 6 and is a separate decision.
+
+**Acceptance:** four pads pair and play simultaneously through Big Picture.
+Rumble arrives and stops cleanly, including when the stop packet is lost. Input
+latency is measured against a directly-connected pad and the difference reported.
+
+---
+
+## Capture backend reference
+
+Ranked by latency. Full detail in CLAUDE.md traps.
+
+| Backend | Latency | Status |
+|---|---|---|
+| Swapchain hook | Pre-composition, saves ~1 frame, uncapped fps | Phase 7, opt-in |
+| IDD | Very good; solves headless + resolution matching | Phase 7 |
+| NvFBC | Lowest official; feeds NVENC directly | Phase 0 probe |
+| WGC | Post-composition, refresh-capped | Phase 3, Win11 default |
+| DDA | Post-composition, refresh-capped | Phase 3, Win10 default |
+
+Not implemented, listed so nobody proposes them: GDI `BitBlt`, `PrintWindow`,
+Magnification API, `DwmGetDxSharedSurface`, mirror drivers. All CPU-readback,
+tens of ms, or dead since Windows 8.
