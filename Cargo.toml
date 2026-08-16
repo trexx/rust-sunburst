@@ -15,6 +15,10 @@ members = [
     # pass as everything else, and deleted with the rest of spikes/ when Phase 0
     # closes.
     "spikes/probe-windows",
+
+    # Development tools. Unlike spikes/, these are kept: the fake client is the
+    # only end-to-end test that runs without a Windows box or a TV.
+    "tools/fakeclient",
 ]
 
 [workspace.package]

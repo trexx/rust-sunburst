@@ -102,6 +102,7 @@ sunburst-web/      management API: clients, sessions, config, apps. Cross-platfo
 sunburst-android/  cdylib + JNI shim
 android/           Gradle project; Kotlin owns Activity + SurfaceView only
 web/               Vite + React + TS management UI
+tools/             development tools. Kept, unlike spikes/.
 spikes/            Phase 0 throwaway. Deletable by design.
 ```
 

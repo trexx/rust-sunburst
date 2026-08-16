@@ -16,11 +16,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use sunburst_net::Endpoint;
 use sunburst_web::api::AppState;
 use sunburst_web::config::Config;
 use sunburst_web::host::{Fake, Host, SessionSummary};
-use sunburst_web::{Store, http};
+use sunburst_web::{Store, WebHandler, http};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,8 +62,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::new(web.bind, web.port);
     let listener = http::bind(addr).await?;
 
+    // The control channel, on its own thread with a blocking socket. This is
+    // what makes the whole pairing path drivable from `tools/fakeclient` without
+    // a Windows box or an Android device.
+    let stream_addr = SocketAddr::new(web.bind, config.stream.port);
+    let mut endpoint = Endpoint::bind(
+        stream_addr,
+        WebHandler::new(Arc::clone(&state), sunburst_web::NoInput),
+    )?;
+    let stop = Box::leak(Box::new(AtomicBool::new(false)));
+    std::thread::spawn(move || {
+        let _ = endpoint.run(stop);
+    });
+
     println!("sunburst-web (fake host) — state in {}", dir.display());
     println!("  http://{addr}/");
+    println!("  udp  {stream_addr}");
     println!("  token: {}", state.token());
 
     http::serve(listener, state).await;

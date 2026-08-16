@@ -323,3 +323,70 @@ fn a_truncated_datagram_does_not_take_the_endpoint_down() {
         .expect("send");
     server.wait_for("the launch after the garbage", |r| !r.launches.is_empty());
 }
+
+#[test]
+fn a_replay_from_a_different_source_port_is_still_refused() {
+    // The hole a per-address replay window leaves. A MAC is deterministic, so a
+    // captured input packet verifies wherever it is resent from; if the window
+    // were keyed by address, a new source port would get a fresh one and the
+    // replay would be accepted. The window follows the client instead.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+
+    let mut first = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    for seq in 1..=3u32 {
+        first
+            .send_input(&InputPacket {
+                input_seq: seq,
+                event: press(),
+            })
+            .expect("send");
+    }
+    server.wait_for("the first three events", |r| r.inputs.len() == 3);
+
+    // A different socket, so a different source port — exactly what an attacker
+    // replaying a capture would look like.
+    let mut replayer = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    for seq in 1..=3u32 {
+        replayer
+            .send_input(&InputPacket {
+                input_seq: seq,
+                event: press(),
+            })
+            .expect("send");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    server.recording(|r| {
+        assert_eq!(
+            r.inputs.len(),
+            3,
+            "replayed input was accepted from a new source port"
+        );
+    });
+}
+
+#[test]
+fn a_client_that_reconnects_from_a_new_port_keeps_working() {
+    // The other side of the same coin: the window following the client must not
+    // lock out a client whose app restarted and got a new ephemeral port.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+
+    let mut first = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    first
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the first event", |r| r.inputs.len() == 1);
+
+    // New socket, continuing the sequence, as a reconnecting client would.
+    let mut again = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    again
+        .send_input(&InputPacket {
+            input_seq: 2,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the event after reconnecting", |r| r.inputs.len() == 2);
+}

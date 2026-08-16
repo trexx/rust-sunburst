@@ -92,9 +92,25 @@ that out now is much cheaper than finding it out in Phase 5.
 - Keyboard via scancode `SendInput` (see CLAUDE.md traps).
 - Mouse: absolute mode (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`,
   normalised 0–65535) and relative mode. Wheel + horizontal wheel + XBUTTON1/2.
-- Session helper: spawn into interactive session, survive fast user switching,
-  re-attach on desktop change.
-- Throwaway CLI sender to drive it during development.
+- ~~Session helper: spawn into interactive session, survive fast user switching~~
+  — **struck.** The no-service decision (Phase 9) made it obsolete: the server
+  already runs in the interactive session, so `WTSGetActiveConsoleSessionId` →
+  `CreateProcessAsUser` is gone entirely. What survives is smaller and different,
+  and is kept below.
+- Desktop re-attach: `OpenInputDesktop`/`SetThreadDesktop` when the **desktop**
+  switches under UAC or the lock screen. Within one session, not across two.
+- `tools/fakeclient` to drive it during development. Kept rather than throwaway:
+  it is the only end-to-end exercise of the transport that runs without a
+  Windows box, it is what CI runs, and Phase 4 will point it at the video path.
+
+**This phase lands in two chunks**, because it splits unevenly by what can be
+verified. The protocol and transport half is testable on the development
+machine; ViGEm and `SendInput` are testable on none of it.
+
+1. **Control channel and transport** *(done)* — control-message payloads, the
+   reliable layer, the UDP endpoint, and the fake client.
+2. **Input injection** — ViGEm, scancode `SendInput`, mouse modes, desktop
+   re-attach. Attaches at the `on_input` seam in `sunburst_net::ControlHandler`.
 
 **Acceptance:** gamepad, keyboard and mouse all work in a real Steam game launched
 from Big Picture. Input survives a UAC prompt and a lock/unlock cycle. Steam Input

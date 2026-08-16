@@ -126,6 +126,50 @@ Payloads:
 Minimal reliable layer over the same socket: sequence, ack, retransmit on timeout.
 ~150 lines. Not a general-purpose stream — messages are small and infrequent.
 
+### Reliable framing
+
+```
+common header (type=3)
+u16  ctrl_seq     this frame's sequence
+u16  ctrl_ack     highest contiguous sequence received from the peer
+u8   ctrl_flags   bit0: carries a payload
+...  message      one control message, envelope included
+u64  mac          absent only for the pairing exchange
+```
+
+Acks are cumulative and piggyback on any outgoing message; a bare ack goes out
+when there is nothing else to say. Window of 8 outstanding, retransmit at 200ms,
+peer declared gone after 8 attempts.
+
+**Delivery is in order, which is the opposite of video and deliberate.** Pairing
+is a three-step exchange, and a `PairConfirm` overtaking its `PairRequest` would
+reach a handler with no pending request to attach to. Anything arriving early is
+held; anything further ahead than the window is dropped, or a peer could withhold
+one sequence and grow the holding area without bound.
+
+### Message envelope
+
+```
+u8   kind         ClientMessage or ServerMessage, by direction
+u16  len
+...  payload
+```
+
+The length is what lets a receiver **skip a kind it does not decode** instead of
+desynchronising, which is what allows a newer client to talk to an older server
+with no version negotiation.
+
+### Which key verifies a packet
+
+The common header carries no client id. The server tries each paired client's
+key on the first authenticated packet from an address and remembers the answer;
+a handful of clients at ~100ns each makes the scan cheap and it happens once.
+`Hello.client_id` only orders that scan — a hint, not a credential.
+
+**Replay state follows the client, not the address.** A MAC is deterministic, so
+a captured packet resent from a different source port verifies perfectly; a
+per-address replay window would be created fresh for that port and accept it.
+
 Client → server:
 - `PairRequest` — name, model, ABI, quirks, `client_nonce`. **Unauthenticated;
   see Pairing below.**

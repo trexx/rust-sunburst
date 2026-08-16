@@ -11,16 +11,41 @@
 //! change. Instead the endpoint tries each paired client's key on the first
 //! authenticated packet from an address, then remembers the answer. There are a
 //! handful of clients and the MAC is about 100ns, so the scan is cheap and it
-//! happens once per peer. A changed DHCP lease simply causes another scan.
+//! happens once per address.
 //!
 //! `Hello` carries a `client_id`, which is used only to order that scan. It is a
 //! hint, not a credential: the MAC is what proves identity.
+//!
+//! # State follows the client, not the address
+//!
+//! The replay window and the reliable channel are keyed by **client id**, and
+//! the source address is only a return path that a session updates as it moves.
+//!
+//! Keying them by address instead is a hole, and not a subtle one: a MAC is
+//! deterministic, so anyone who captures an authenticated input packet can
+//! resend it from a different source port. A per-address window would be created
+//! fresh for that port, the captured packet would verify, and the replay would
+//! be accepted. Keying by client means the window that already saw that sequence
+//! is the one consulted, wherever the packet came from.
+//!
+//! # Known gap: the key is the pairing secret, not a session key
+//!
+//! PROTOCOL.md specifies a per-session key derived from the pairing secret and a
+//! nonce from each side. This endpoint verifies against the pairing secret
+//! directly, because the message that would carry `server_nonce` is
+//! `SessionConfig`, whose fields Phase 3 has not decided.
+//!
+//! What that leaves open, stated rather than buried: the replay window lives in
+//! memory, so **after a server restart a captured input packet can be replayed
+//! once**. Within a run it cannot — the window follows the client, per above.
+//! Session keys close it, and they land with `SessionConfig`.
 //!
 //! # Pairing is the one unauthenticated path
 //!
 //! Before pairing there is no key, so `PairRequest` and `PairConfirm` arrive
 //! without a MAC. They are processed only while the handler reports pairing
-//! armed, only for those two kinds, and dropped silently otherwise.
+//! armed, only for those two kinds, and dropped silently otherwise. Those peers
+//! are tracked by address, because they have no identity yet.
 
 use std::collections::HashMap;
 use std::io;
@@ -29,8 +54,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sunburst_core::proto::pairing::NONCE_LEN;
 use sunburst_core::proto::{
-    ClientControl, ClientMessage, Flags, HEADER_LEN, Header, MAC_LEN, MAX_PAYLOAD, PacketType,
-    ReplayWindow, Seq16, ServerControl, SessionKey,
+    ClientControl, ClientMessage, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN, MAX_PAYLOAD,
+    PacketType, ReplayWindow, Seq16, ServerControl, SessionKey,
 };
 
 use crate::handler::ControlHandler;
@@ -41,27 +66,33 @@ use crate::reliable::{FRAME_HEADER_LEN, Reliable, ReliableError};
 pub const MAX_CONTROL_PAYLOAD: usize = MAX_PAYLOAD - FRAME_HEADER_LEN - MAC_LEN;
 
 /// How long a peer may go silent before its state is dropped.
-const PEER_IDLE_SECS: u64 = 120;
+const IDLE_SECS: u64 = 120;
 
 /// Read timeout, which is also how often `tick` runs.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-struct Peer {
+/// An authenticated client. Survives a change of source address.
+struct Session {
+    key: SessionKey,
+    addr: SocketAddr,
     reliable: Reliable,
-    auth: Option<Authenticated>,
+    replay: ReplayWindow,
     last_seen_ms: u64,
 }
 
-struct Authenticated {
-    client_id: u32,
-    key: SessionKey,
-    replay: ReplayWindow,
+/// A peer that has not authenticated. Pairing only.
+struct Pending {
+    reliable: Reliable,
+    last_seen_ms: u64,
 }
 
 pub struct Endpoint<H: ControlHandler> {
     socket: UdpSocket,
     handler: H,
-    peers: HashMap<SocketAddr, Peer>,
+    sessions: HashMap<u32, Session>,
+    /// Skips the key scan for an address already attributed to a client.
+    by_addr: HashMap<SocketAddr, u32>,
+    pending: HashMap<SocketAddr, Pending>,
     origin: Instant,
 }
 
@@ -72,7 +103,9 @@ impl<H: ControlHandler> Endpoint<H> {
         Ok(Endpoint {
             socket,
             handler,
-            peers: HashMap::new(),
+            sessions: HashMap::new(),
+            by_addr: HashMap::new(),
+            pending: HashMap::new(),
             origin: Instant::now(),
         })
     }
@@ -86,11 +119,6 @@ impl<H: ControlHandler> Endpoint<H> {
     }
 
     /// One receive-or-timeout, then a tick. Returns whether a datagram arrived.
-    ///
-    /// Split out from [`run`] so tests can step the endpoint deterministically
-    /// rather than racing a thread.
-    ///
-    /// [`run`]: Endpoint::run
     pub fn poll_once(&mut self) -> io::Result<bool> {
         let mut buf = [0u8; HEADER_LEN + MAX_PAYLOAD];
         let received = match self.socket.recv_from(&mut buf) {
@@ -106,9 +134,9 @@ impl<H: ControlHandler> Endpoint<H> {
             {
                 false
             }
-            // A refused datagram on a connectionless socket is normal on
-            // Windows (ICMP port unreachable surfaces as ConnectionReset) and
-            // says nothing about the socket's health.
+            // A refused datagram on a connectionless socket is normal on Windows
+            // (an ICMP port-unreachable surfaces as ConnectionReset) and says
+            // nothing about this socket's health.
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => false,
             Err(e) => return Err(e),
         };
@@ -145,15 +173,24 @@ impl<H: ControlHandler> Endpoint<H> {
         }
     }
 
-    /// Find the key for this peer, scanning if necessary.
+    /// Identify the sender, scanning the paired keys if the address is new.
     ///
-    /// `hint` orders the scan when `Hello` claimed an id. Returns whether the
-    /// packet verified.
-    fn authenticate(&mut self, datagram: &[u8], from: SocketAddr, hint: Option<u32>) -> bool {
-        if let Some(auth) = self.peers.get(&from).and_then(|p| p.auth.as_ref())
-            && auth.key.verify_packet(datagram).is_some()
+    /// On success the session's return address is updated, so a client that
+    /// reconnects from a new port keeps its replay window and its channel.
+    fn authenticate(
+        &mut self,
+        datagram: &[u8],
+        from: SocketAddr,
+        hint: Option<u32>,
+    ) -> Option<u32> {
+        let now_ms = self.now_ms();
+
+        if let Some(&client) = self.by_addr.get(&from)
+            && let Some(session) = self.sessions.get_mut(&client)
+            && session.key.verify_packet(datagram).is_some()
         {
-            return true;
+            session.last_seen_ms = now_ms;
+            return Some(client);
         }
 
         let mut keys = self.handler.client_keys();
@@ -162,189 +199,200 @@ impl<H: ControlHandler> Endpoint<H> {
             keys.sort_by_key(|(id, _)| *id != want);
         }
 
-        for (client_id, key) in keys {
-            if key.verify_packet(datagram).is_some() {
-                let now_ms = self.now_ms();
-                let peer = self.peer_mut(from, now_ms);
-                peer.auth = Some(Authenticated {
-                    client_id,
-                    key,
-                    replay: ReplayWindow::new(),
-                });
-                return true;
+        for (client, key) in keys {
+            if key.verify_packet(datagram).is_none() {
+                continue;
             }
-        }
-        false
-    }
 
-    fn peer_mut(&mut self, from: SocketAddr, now_ms: u64) -> &mut Peer {
-        self.peers.entry(from).or_insert_with(|| Peer {
-            reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
-            auth: None,
-            last_seen_ms: now_ms,
-        })
+            match self.sessions.get_mut(&client) {
+                Some(session) => {
+                    // The same client from a different port. The replay window
+                    // and the reliable channel come with it — that is the whole
+                    // point of keying on the client.
+                    self.by_addr.remove(&session.addr);
+                    session.addr = from;
+                    session.last_seen_ms = now_ms;
+                    session.key = key;
+                }
+                None => {
+                    self.sessions.insert(
+                        client,
+                        Session {
+                            key,
+                            addr: from,
+                            reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
+                            replay: ReplayWindow::new(),
+                            last_seen_ms: now_ms,
+                        },
+                    );
+                }
+            }
+            self.by_addr.insert(from, client);
+            // An address that authenticates is no longer a pairing candidate.
+            self.pending.remove(&from);
+            return Some(client);
+        }
+        None
     }
 
     fn on_control(&mut self, datagram: &[u8], body: &[u8], from: SocketAddr) {
         let now_ms = self.now_ms();
         let now = unix_now();
 
-        // Authenticated first. Only if no key verifies is the unauthenticated
-        // pairing path considered, and then only while armed.
-        let authenticated = self.authenticate(datagram, from, None);
-
-        let frame = if authenticated {
-            // The MAC covers the whole packet; strip it before framing.
-            &body[..body.len().saturating_sub(MAC_LEN)]
-        } else {
-            if !self.handler.pairing_armed(now) {
-                return;
+        // Authenticated first. The unauthenticated pairing path is only reached
+        // when no key verifies, and then only while armed.
+        if let Some(client) = self.authenticate(datagram, from, None) {
+            let frame = &body[..body.len().saturating_sub(MAC_LEN)];
+            let messages = {
+                let session = self.sessions.get_mut(&client).expect("just authenticated");
+                session.reliable.on_frame(frame)
+            };
+            for message in messages {
+                self.on_authenticated(&message, client, now);
             }
-            body
-        };
+            return;
+        }
 
-        self.peer_mut(from, now_ms).last_seen_ms = now_ms;
-        let messages = {
-            let peer = self.peers.get_mut(&from).expect("just inserted");
-            peer.reliable.on_frame(frame)
-        };
+        if !self.handler.pairing_armed(now) {
+            return;
+        }
+
+        let entry = self.pending.entry(from).or_insert_with(|| Pending {
+            reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
+            last_seen_ms: now_ms,
+        });
+        entry.last_seen_ms = now_ms;
+        let messages = entry.reliable.on_frame(body);
 
         for message in messages {
-            self.on_control_message(&message, from, authenticated, now);
+            self.on_unauthenticated(&message, from, now);
         }
     }
 
-    fn on_control_message(
-        &mut self,
-        message: &[u8],
-        from: SocketAddr,
-        authenticated: bool,
-        now: u64,
-    ) {
+    /// Messages from a peer with no key. Pairing only.
+    fn on_unauthenticated(&mut self, message: &[u8], from: SocketAddr, now: u64) {
         let Ok((decoded, _)) = ClientControl::decode(message) else {
             return;
         };
 
-        // The allow-list. An unauthenticated peer may only pair; anything else
-        // arriving without a MAC is an attempt to skip authentication.
-        if !authenticated {
-            let allowed = decoded.kind().is_some_and(ClientMessage::is_pre_pairing);
-            if !allowed {
-                return;
-            }
+        // The allow-list. Anything else arriving without a MAC is an attempt to
+        // skip authentication, not a peer that has not got round to it.
+        if !decoded.kind().is_some_and(ClientMessage::is_pre_pairing) {
+            return;
         }
-
-        let client_id = self
-            .peers
-            .get(&from)
-            .and_then(|p| p.auth.as_ref())
-            .map(|a| a.client_id);
 
         match decoded {
             ClientControl::PairRequest(request) => {
                 if let Some((request_id, server_nonce)) = self.handler.on_pair_request(request, now)
                 {
-                    self.send_control(
+                    self.send_pending(
                         from,
                         &ServerControl::PairChallenge {
                             request_id,
                             server_nonce,
                         },
-                        None,
                     );
                 }
             }
             ClientControl::PairConfirm { request_id, tag } => {
                 self.handler.on_pair_confirm(request_id, tag, now);
             }
-            ClientControl::Hello(hello) => {
-                if let Some(client) = client_id {
-                    self.handler.on_hello(client, hello);
-                }
-            }
+            _ => {}
+        }
+    }
+
+    fn on_authenticated(&mut self, message: &[u8], client: u32, _now: u64) {
+        let Ok((decoded, _)) = ClientControl::decode(message) else {
+            return;
+        };
+
+        match decoded {
+            ClientControl::Hello(hello) => self.handler.on_hello(client, hello),
             ClientControl::ListApps => {
                 let apps = self.handler.on_app_list();
-                let key = self.key_for(from);
-                self.send_control(from, &ServerControl::AppList(apps), key);
+                self.send_to_client(client, &ServerControl::AppList(apps));
             }
             ClientControl::LaunchApp { app_id } => {
                 let _ = self.handler.on_launch(app_id);
             }
             ClientControl::Bye => {
-                if let Some(client) = client_id {
-                    self.handler.on_bye(client);
-                }
-                self.peers.remove(&from);
+                self.handler.on_bye(client);
+                self.forget(client);
             }
-            // Reserved or not yet acted on. Decoding succeeded, so the stream is
-            // intact; there is simply nothing to do until the phase that owns it.
+            // Pairing messages from an already-authenticated peer are ignored:
+            // it has a key, so it is not pairing.
+            //
+            // Everything else is reserved or not yet acted on. Decoding
+            // succeeded, so the stream is intact.
             _ => {}
         }
     }
 
     fn on_input(&mut self, datagram: &[u8], body: &[u8], from: SocketAddr) {
-        if !self.authenticate(datagram, from, None) {
-            return;
-        }
-        let now_ms = self.now_ms();
-
-        let Some(peer) = self.peers.get_mut(&from) else {
-            return;
-        };
-        peer.last_seen_ms = now_ms;
-        let Some(auth) = peer.auth.as_mut() else {
+        let Some(client) = self.authenticate(datagram, from, None) else {
             return;
         };
 
         let payload = &body[..body.len().saturating_sub(MAC_LEN)];
-        let Some(packet) = sunburst_core::proto::InputPacket::decode(payload) else {
+        let Some(packet) = InputPacket::decode(payload) else {
             return;
         };
 
-        // MAC verified above; freshness is this. Both halves are needed, since a
-        // MAC is deterministic and a captured packet re-sent verbatim verifies.
-        if !auth.replay.accept(packet.input_seq) {
-            return;
+        let fresh = {
+            let session = self.sessions.get_mut(&client).expect("just authenticated");
+            // The MAC proved origin; this proves freshness. Both are needed,
+            // since a MAC is deterministic and a captured packet re-sent
+            // verbatim verifies perfectly.
+            session.replay.accept(packet.input_seq)
+        };
+        if fresh {
+            self.handler.on_input(client, packet.event);
         }
-        let client_id = auth.client_id;
-        self.handler.on_input(client_id, packet.event);
     }
 
-    fn key_for(&self, from: SocketAddr) -> Option<SessionKey> {
-        self.peers
-            .get(&from)
-            .and_then(|p| p.auth.as_ref())
-            .map(|a| a.key.clone())
+    fn forget(&mut self, client: u32) {
+        if let Some(session) = self.sessions.remove(&client) {
+            self.by_addr.remove(&session.addr);
+        }
     }
 
-    /// Frame, sign if there is a key, and transmit.
-    fn send_control(&mut self, to: SocketAddr, message: &ServerControl, key: Option<SessionKey>) {
+    fn send_to_client(&mut self, client: u32, message: &ServerControl) {
         let Ok(encoded) = message.encode() else {
             return;
         };
         let now_ms = self.now_ms();
 
-        let frame = {
-            let peer = self.peer_mut(to, now_ms);
-            match peer.reliable.send(&encoded, now_ms) {
-                Ok(frame) => frame,
-                // A full window or an oversized message is a bug on this side,
-                // not something the peer can fix by waiting.
-                Err(_) => return,
-            }
+        let Some(session) = self.sessions.get_mut(&client) else {
+            return;
         };
-        self.transmit(to, PacketType::Control, &frame, key.as_ref());
+        let addr = session.addr;
+        let key = session.key.clone();
+        // A full window or an oversized message is a bug on this side, not
+        // something the peer can fix by waiting.
+        let Ok(frame) = session.reliable.send(&encoded, now_ms) else {
+            return;
+        };
+        self.transmit(addr, &frame, Some(&key));
     }
 
-    fn transmit(
-        &self,
-        to: SocketAddr,
-        packet_type: PacketType,
-        body: &[u8],
-        key: Option<&SessionKey>,
-    ) {
+    fn send_pending(&mut self, to: SocketAddr, message: &ServerControl) {
+        let Ok(encoded) = message.encode() else {
+            return;
+        };
+        let now_ms = self.now_ms();
+
+        let Some(peer) = self.pending.get_mut(&to) else {
+            return;
+        };
+        let Ok(frame) = peer.reliable.send(&encoded, now_ms) else {
+            return;
+        };
+        self.transmit(to, &frame, None);
+    }
+
+    fn transmit(&self, to: SocketAddr, body: &[u8], key: Option<&SessionKey>) {
         let header = Header {
-            packet_type,
+            packet_type: PacketType::Control,
             flags: Flags::EMPTY,
             frame_id: Seq16(0),
             qpc_timestamp: 0,
@@ -364,31 +412,51 @@ impl<H: ControlHandler> Endpoint<H> {
     /// Retransmits, owed acks, and dropping peers that have gone quiet.
     fn tick(&mut self) {
         let now_ms = self.now_ms();
-        let mut dead = Vec::new();
-        let mut to_send: Vec<(SocketAddr, Vec<u8>, Option<SessionKey>)> = Vec::new();
+        let idle_ms = IDLE_SECS * 1000;
+        let mut send: Vec<(SocketAddr, Vec<u8>, Option<SessionKey>)> = Vec::new();
+        let mut drop_clients = Vec::new();
+        let mut drop_pending = Vec::new();
 
-        for (addr, peer) in &mut self.peers {
-            if now_ms.saturating_sub(peer.last_seen_ms) > PEER_IDLE_SECS * 1000 {
-                dead.push(*addr);
+        for (client, session) in &mut self.sessions {
+            if now_ms.saturating_sub(session.last_seen_ms) > idle_ms {
+                drop_clients.push(*client);
                 continue;
             }
-            match peer.reliable.tick(now_ms) {
+            match session.reliable.tick(now_ms) {
                 Ok(frames) => {
-                    let key = peer.auth.as_ref().map(|a| a.key.clone());
                     for frame in frames {
-                        to_send.push((*addr, frame, key.clone()));
+                        send.push((session.addr, frame, Some(session.key.clone())));
                     }
                 }
-                Err(ReliableError::PeerGone) => dead.push(*addr),
+                Err(ReliableError::PeerGone) => drop_clients.push(*client),
                 Err(_) => {}
             }
         }
 
-        for (addr, frame, key) in to_send {
-            self.transmit(addr, PacketType::Control, &frame, key.as_ref());
+        for (addr, peer) in &mut self.pending {
+            if now_ms.saturating_sub(peer.last_seen_ms) > idle_ms {
+                drop_pending.push(*addr);
+                continue;
+            }
+            match peer.reliable.tick(now_ms) {
+                Ok(frames) => {
+                    for frame in frames {
+                        send.push((*addr, frame, None));
+                    }
+                }
+                Err(ReliableError::PeerGone) => drop_pending.push(*addr),
+                Err(_) => {}
+            }
         }
-        for addr in dead {
-            self.peers.remove(&addr);
+
+        for (addr, frame, key) in send {
+            self.transmit(addr, &frame, key.as_ref());
+        }
+        for client in drop_clients {
+            self.forget(client);
+        }
+        for addr in drop_pending {
+            self.pending.remove(&addr);
         }
     }
 }
@@ -442,7 +510,7 @@ impl ClientEndpoint {
         self.transmit(PacketType::Control, &frame)
     }
 
-    pub fn send_input(&mut self, packet: &sunburst_core::proto::InputPacket) -> io::Result<()> {
+    pub fn send_input(&mut self, packet: &InputPacket) -> io::Result<()> {
         let mut body = [0u8; sunburst_core::proto::input::MAX_INPUT_BODY];
         let n = packet
             .encode(&mut body)

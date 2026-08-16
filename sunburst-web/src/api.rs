@@ -24,6 +24,7 @@ use crate::metrics::MetricsRecord;
 use crate::pairing::{Pairing, PairingError};
 use crate::random;
 use crate::store::{Store, StoreError};
+use sunburst_core::proto::SessionKey;
 
 /// Request, reduced to what routing actually needs.
 #[derive(Clone, Debug, Default)]
@@ -198,6 +199,78 @@ impl AppState {
             .iter()
             .find(|c| c.id == client_id)
             .map(|c| c.secret)
+    }
+
+    /// Whether pairing is open. Consulted before any unauthenticated packet is
+    /// looked at.
+    pub fn pairing_armed(&self, now: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("not poisoned")
+            .pairing
+            .is_armed(now)
+    }
+
+    /// Take a pair request from the control channel.
+    pub fn pair_request(
+        &self,
+        request: crate::pairing::PairRequest,
+        now: u64,
+    ) -> Option<(u32, [u8; 16])> {
+        self.inner
+            .lock()
+            .expect("not poisoned")
+            .pairing
+            .receive_request(request, now)
+            .ok()
+    }
+
+    /// Take the client's confirmation tag. The PIN is typed in the web UI, so
+    /// this only records; nothing is paired until `/api/pair/confirm`.
+    pub fn pair_confirm(&self, request_id: u32, tag: [u8; 8], now: u64) {
+        let _ = self
+            .inner
+            .lock()
+            .expect("not poisoned")
+            .pairing
+            .receive_confirm(request_id, tag, now);
+    }
+
+    /// Every paired client's session key.
+    ///
+    /// Derived per call rather than cached, so a revoke takes effect at once.
+    pub fn client_keys(&self) -> Vec<(u32, SessionKey)> {
+        self.inner
+            .lock()
+            .expect("not poisoned")
+            .clients
+            .iter()
+            .map(|c| (c.id, SessionKey::from_bytes(c.secret)))
+            .collect()
+    }
+
+    /// Record that a client was heard from, for the UI's "last seen" column.
+    pub fn touch_last_seen(&self, client_id: u32, now: u64) {
+        let mut inner = self.inner.lock().expect("not poisoned");
+        if let Some(client) = inner.clients.iter_mut().find(|c| c.id == client_id) {
+            client.last_seen = Some(now);
+        }
+    }
+
+    /// Launch an app by id, the way the control channel asks for it.
+    ///
+    /// Shares the path the web UI uses, so the two cannot diverge on which
+    /// entries exist or what "already running" means.
+    pub fn launch(&self, app_id: u32) -> Result<(), String> {
+        let app = {
+            let inner = self.inner.lock().expect("not poisoned");
+            inner.config.app(app_id).cloned()
+        };
+        let app = app.ok_or_else(|| format!("no such app: {app_id}"))?;
+        self.host
+            .launch(&app)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// The catalogue as the client sees it: names and ids, nothing else.

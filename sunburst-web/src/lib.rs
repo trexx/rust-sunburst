@@ -29,6 +29,7 @@ pub mod api;
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod control;
 pub mod host;
 pub mod http;
 pub mod metrics;
@@ -38,5 +39,6 @@ pub mod store;
 
 pub use api::{ApiRequest, ApiResponse, AppState, dispatch};
 pub use config::{AppEntry, Config};
+pub use control::{InputSink, NoInput, WebHandler};
 pub use host::{Host, HostError};
 pub use store::{Store, StoreError};

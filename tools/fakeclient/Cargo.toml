@@ -1,0 +1,18 @@
+[package]
+name = "fakeclient"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Deliberately not depending on sunburst-web: a client has no use for hyper, and
+# the pairing derivation it needs lives in core precisely so it does not have to.
+[dependencies]
+sunburst-core.workspace = true
+sunburst-net.workspace = true
+getrandom.workspace = true

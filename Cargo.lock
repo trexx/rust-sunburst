@@ -210,6 +210,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fakeclient"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "sunburst-core",
+ "sunburst-net",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -617,6 +626,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "sunburst-core",
+ "sunburst-net",
  "thiserror",
  "tokio",
 ]
