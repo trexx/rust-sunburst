@@ -1,0 +1,31 @@
+[package]
+name = "sunburst-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Cross-platform on purpose. Everything Windows-specific is behind the `Host`
+# trait in `host.rs`, so the whole API surface is testable on the Linux
+# development machine rather than only on the server.
+[dependencies]
+sunburst-core.workspace = true
+
+blake3.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "test-util"] }

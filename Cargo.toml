@@ -8,6 +8,7 @@ members = [
     "sunburst-input",
     "sunburst-net",
     "sunburst-server",
+    "sunburst-web",
     "sunburst-android",
 
     # Phase 0 throwaway. A workspace member so it is type-checked in the same
@@ -26,8 +27,26 @@ repository = "https://github.com/trexx/sunburst"
 [workspace.dependencies]
 sunburst-core = { path = "sunburst-core" }
 sunburst-net = { path = "sunburst-net" }
+sunburst-web = { path = "sunburst-web" }
 
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
+
+# Control plane only. CLAUDE.md permits tokio in sunburst-server; sunburst-web is
+# the same plane and never sits between the frame path and anything.
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "process"] }
+hyper = { version = "1.11", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+# hyper 1.x moved body helpers out of the core crate. Collecting a request body
+# by hand means writing an async Body impl, which is the one part of this that
+# is genuinely easy to get subtly wrong.
+http-body-util = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# The admin token and the pairing PIN both have to be unguessable, so they need
+# the OS CSPRNG rather than a hash of the clock. This is the crate `rand` itself
+# uses underneath, without the distribution machinery we have no use for.
+getrandom = "0.4"
 subtle = "2.6"
 thiserror = "2.0"
 
