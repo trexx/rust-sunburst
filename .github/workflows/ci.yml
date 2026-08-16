@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# What this can and cannot tell you: it compiles every target and runs the
+# host-testable tests. It cannot measure latency — no GPU, no hardware decoder,
+# no host, and neither client ABI is the runner's. Do not add emulator
+# benchmarks to make it look like it can. Real latency work happens on real
+# hardware and HARDWARE_TESTING.md tracks it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  linux:
+    name: Linux (tests, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      # The zero-allocation and synthetic-pipeline tests live here. They are the
+      # only automated defence of CLAUDE.md's first hot-path rule.
+      - run: cargo test --workspace
+
+  windows:
+    name: Windows (real MSVC build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      # The five Windows-only crates compile to nothing on Linux, so this is the
+      # only job that type-checks them for real. `cargo xwin` locally catches the
+      # same errors sooner; this is the backstop.
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+
+  android:
+    name: Android (both ABIs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          # Pinned to match android/app/build.gradle and moonlight-trexx.
+          ndk-version: r29
+      - name: Build the cdylib for both ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          echo "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+      - name: arm64-v8a (Shield)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo build -p sunburst-android --target aarch64-linux-android
+      # armeabi-v7a is not optional: the Homatics ships a 32-bit userspace on a
+      # 64-bit SoC, so dropping it drops half the supported hardware.
+      - name: armeabi-v7a (Homatics)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo build -p sunburst-android --target armv7-linux-androideabi
