@@ -13,7 +13,8 @@ use super::*;
 use crate::client::QuirksRecord;
 use crate::config::{CodecPreference, ConfigError};
 use crate::host::Fake;
-use crate::pairing::{PairRequest, confirm_tag, derive_secret};
+use crate::pairing::PairRequest;
+use sunburst_core::proto::pairing::{confirm_tag, derive_secret};
 
 const NOW: u64 = 1_700_000_000;
 

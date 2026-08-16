@@ -591,6 +591,7 @@ name = "sunburst-net"
 version = "0.1.0"
 dependencies = [
  "sunburst-core",
+ "thiserror",
 ]
 
 [[package]]

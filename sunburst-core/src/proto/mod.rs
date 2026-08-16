@@ -26,12 +26,17 @@ pub mod auth;
 pub mod control;
 pub mod header;
 pub mod input;
+pub mod pairing;
 pub mod rumble;
 pub mod seq;
 
 pub use auth::{MAC_LEN, NONCE_LEN, SessionKey};
-pub use control::{ClientMessage, DecoderQuirks, ServerMessage};
+pub use control::{
+    AppListing, ClientControl, ClientMessage, DecoderQuirks, Hello, PairRequest, ServerControl,
+    ServerMessage,
+};
 pub use header::{Flags, HEADER_LEN, Header, MAX_PAYLOAD, PacketType};
 pub use input::{GamepadState, InputEvent, InputKind, InputPacket, MouseButton, MouseMotion};
+pub use pairing::{PIN_DIGITS, TAG_LEN, confirm_tag, derive_secret, tags_match};
 pub use rumble::{Rumble, RumbleTracker};
 pub use seq::{REPLAY_WINDOW, ReplayWindow, Seq16};

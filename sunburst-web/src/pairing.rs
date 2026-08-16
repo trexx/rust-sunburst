@@ -34,10 +34,12 @@
 //! pairing is only possible while explicitly armed from the UI, the window is
 //! short, the arming is single-use, and PIN attempts are capped.
 
-use subtle::ConstantTimeEq;
+use sunburst_core::proto::pairing::{confirm_tag, derive_secret, tags_match};
 
 use crate::client::{PairedClient, QuirksRecord};
 use crate::random;
+
+pub use sunburst_core::proto::pairing::TAG_LEN;
 
 /// How long an arming stays open. Long enough to walk to the TV, short enough
 /// that the window is not simply left open.
@@ -49,12 +51,6 @@ pub const WINDOW_SECS: u64 = 90;
 /// captured request would reduce it from 10^8 to however long someone is willing
 /// to sit there.
 pub const MAX_PIN_ATTEMPTS: u32 = 5;
-
-const DERIVE_CONTEXT: &str = "sunburst pairing v1";
-const CONFIRM_MESSAGE: &[u8] = b"sunburst pair confirm v1";
-
-/// Bytes in the confirmation tag.
-pub const TAG_LEN: usize = 8;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PairingError {
@@ -264,27 +260,6 @@ impl Pairing {
             self.pending.clear();
         }
     }
-}
-
-/// Both ends compute this independently; only the nonces are ever transmitted.
-pub fn derive_secret(pin: &str, client_nonce: &[u8; 16], server_nonce: &[u8; 16]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key(DERIVE_CONTEXT);
-    hasher.update(pin.as_bytes());
-    hasher.update(client_nonce);
-    hasher.update(server_nonce);
-    *hasher.finalize().as_bytes()
-}
-
-/// The client's proof that it derived the same secret.
-pub fn confirm_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
-    let full = blake3::keyed_hash(secret, CONFIRM_MESSAGE);
-    let mut tag = [0u8; TAG_LEN];
-    tag.copy_from_slice(&full.as_bytes()[..TAG_LEN]);
-    tag
-}
-
-fn tags_match(a: &[u8; TAG_LEN], b: &[u8; TAG_LEN]) -> bool {
-    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -506,38 +481,6 @@ mod tests {
         ));
         let paired = p.confirm(homatics_id, "22222222", 1, NOW).expect("pin");
         assert_eq!(paired.name, "Homatics");
-    }
-
-    #[test]
-    fn different_pins_derive_different_secrets() {
-        let a = derive_secret("12345678", &[1; 16], &[2; 16]);
-        let b = derive_secret("12345679", &[1; 16], &[2; 16]);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn different_nonces_derive_different_secrets() {
-        let pin = "12345678";
-        assert_ne!(
-            derive_secret(pin, &[1; 16], &[2; 16]),
-            derive_secret(pin, &[9; 16], &[2; 16])
-        );
-        assert_ne!(
-            derive_secret(pin, &[1; 16], &[2; 16]),
-            derive_secret(pin, &[1; 16], &[9; 16])
-        );
-    }
-
-    #[test]
-    fn nonce_order_matters_in_the_derivation() {
-        // Concatenating in the wrong order still "works" between two ends that
-        // agree, which is how an asymmetry becomes a compatibility bug rather
-        // than a test failure.
-        let pin = "12345678";
-        assert_ne!(
-            derive_secret(pin, &[1; 16], &[2; 16]),
-            derive_secret(pin, &[2; 16], &[1; 16])
-        );
     }
 
     #[test]

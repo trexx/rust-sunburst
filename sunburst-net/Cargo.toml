@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
+thiserror.workspace = true
