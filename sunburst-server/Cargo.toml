@@ -13,6 +13,8 @@ workspace = true
 sunburst-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+sunburst-input.workspace = true
+sunburst-net.workspace = true
 sunburst-web.workspace = true
 tokio.workspace = true
 windows = { version = "0.62", features = [

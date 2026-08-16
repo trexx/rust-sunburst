@@ -32,6 +32,7 @@ repository = "https://github.com/trexx/sunburst"
 sunburst-core = { path = "sunburst-core" }
 sunburst-net = { path = "sunburst-net" }
 sunburst-web = { path = "sunburst-web" }
+sunburst-input = { path = "sunburst-input" }
 
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
 

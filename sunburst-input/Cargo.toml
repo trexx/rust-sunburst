@@ -11,3 +11,11 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
+sunburst-net.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_StationsAndDesktops",
+] }

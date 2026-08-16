@@ -225,6 +225,60 @@ the part that a fake cannot answer.
 
 ---
 
+## 6. Keyboard and mouse injection (env S)
+
+The decisions are unit-tested on the development machine — 18 of them, covering
+extended keys, modifier reconciliation and the `MOUSEEVENTF` mapping. What
+follows is everything those tests structurally cannot reach.
+
+Pair once, then drive it from the box itself:
+
+```
+fakeclient pair  --server 127.0.0.1:47811
+fakeclient input --server 127.0.0.1:47811 --script keyboard
+fakeclient input --server 127.0.0.1:47811 --script mouse
+```
+
+- [ ] **Keys reach a game, not just Notepad.** The scancode-versus-virtual-key
+      trap only shows up in something reading DirectInput or raw input. A VK
+      based `SendInput` types fine into Notepad and does nothing in a game, so
+      Notepad working proves nothing at all.
+- [ ] **The extended set produces the right key**, not its numpad twin: arrows,
+      Ins/Del/Home/End/PgUp/PgDn, right Ctrl, right Alt, numpad Enter, numpad
+      divide. Without the flag Home becomes 7 and Up becomes 8. Check against
+      `keymap::EXPECTED_EXTENDED`, which is the checklist, not the mechanism.
+- [ ] **Ctrl+Shift+Esc opens Task Manager.** Three keys, the worst case for
+      modifier ordering, and it needs elevation to work at all.
+- [ ] **Alt+F4, Ctrl+V, Win, Win+D** behave. Each exercises a different modifier
+      path.
+- [ ] **No stuck modifier** after releasing a chord. Then the harder one: kill
+      `fakeclient` mid-chord and confirm nothing is left held. The injector
+      releases what it believes is down when the queue closes.
+- [ ] **Input survives a UAC prompt**, and a lock/unlock cycle. This is the
+      desktop re-attach, and the item Phase 2's acceptance names. Expect input to
+      do nothing *while* the secure desktop is up — that is correct, and capture
+      cannot see it either — and to resume afterwards without a restart.
+- [ ] **Input reaches an elevated window**, or the Status panel honestly says
+      the server is not elevated. UIPI, and it presents as "input does nothing in
+      one specific game".
+- [ ] **Absolute mode lands where it should on a multi-monitor setup**, and on a
+      scaled display. `MOUSEEVENTF_VIRTUALDESK` is what makes 0–65535 span every
+      monitor rather than the primary; without it a second display is
+      unreachable, and DPI scaling is where the coordinates go wrong.
+- [ ] **Both X buttons do different things.** They share `XDOWN`/`XUP` and are
+      told apart only by `mouseData`, so getting it wrong turns X2 into X1.
+- [ ] **Wheel and horizontal wheel scroll the right way.** The sign is the
+      direction.
+- [ ] **Enhanced Pointer Precision off.** Note how relative motion felt with it
+      on before turning it off, so the decision not to compensate is recorded
+      against evidence rather than assumption.
+
+`Injector::stats()` carries the counters worth reading when something does
+nothing: `dropped` (queue full), `refused` (`SendInput` rejected it — usually
+UIPI), `reattached` and `attach_failed`.
+
+---
+
 ## Hardware still needed
 
 | Needed for | Hardware |

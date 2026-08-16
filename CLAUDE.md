@@ -106,11 +106,17 @@ tools/             development tools. Kept, unlike spikes/.
 spikes/            Phase 0 throwaway. Deletable by design.
 ```
 
-`sunburst-capture`, `-encode`, `-audio`, `-input` and `-server` are
-`#![cfg(windows)]` at the crate root, so they compile to nothing on a Linux
-host. `sunburst-core`, `-net` and `-web` are cross-platform: the client needs the
-protocol types and the receive half, and everything Windows-specific the web UI
-needs sits behind the `Host` trait in `sunburst-web/src/host.rs`.
+`sunburst-capture`, `-encode`, `-audio` and `-server` are `#![cfg(windows)]` at
+the crate root, so they compile to nothing on a Linux host. `sunburst-core`,
+`-net` and `-web` are cross-platform: the client needs the protocol types and the
+receive half, and everything Windows-specific the web UI needs sits behind the
+`Host` trait in `sunburst-web/src/host.rs`.
+
+`sunburst-input` is the interesting case — deliberately **not** Windows-only at
+the root. Its `keymap` module holds the decisions (scancode, extended flag,
+modifier reconciliation, `MOUSEEVENTF` bits) as pure functions with real tests,
+and only `inject` is gated. Those decisions are the part that is easy to get
+wrong, so they are tested on a machine where `SendInput` does not exist.
 
 That trait is not abstraction for its own sake — it is what lets the entire
 management surface be tested on the Linux machine instead of the 5070 box.
@@ -218,11 +224,26 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   see scancodes only — a VK-based `SendInput` works on the desktop and does
   nothing in-game. Set `KEYEVENTF_EXTENDEDKEY` for arrows, right Ctrl/Alt,
   Ins/Del/Home/End/PgUp/PgDn, numpad Enter.
-- `SendInput` targets the calling thread's desktop. Helper process must live in
-  the interactive session (`WTSGetActiveConsoleSessionId` → `CreateProcessAsUser`)
-  and re-attach via `OpenInputDesktop`/`SetThreadDesktop` on desktop switch.
-- Enhanced Pointer Precision applies an accel curve to injected relative deltas.
-  Compensate or document.
+- `SendInput` targets the calling thread's **desktop**, and desktop attachment
+  is per-thread. UAC and the lock screen switch the desktop *inside* the session,
+  so a process that never went anywhere finds itself attached to the wrong one
+  and its input silently goes nowhere. Re-attach via
+  `OpenInputDesktop`/`SetThreadDesktop` from the same thread that injects.
+  `OpenInputDesktop` returns a fresh handle every call, so compare by **name**
+  (`GetUserObjectInformationW`, `UOI_NAME`) — two handles to one desktop are
+  different values. There is no notification for this;
+  `WTSRegisterSessionNotification` reports *session* changes, which this is not,
+  so poll.
+  (This trap once said the helper must live in the interactive session via
+  `WTSGetActiveConsoleSessionId` → `CreateProcessAsUser`. That went away with the
+  no-service decision — see *Process model*. The whole server is already in the
+  interactive session; only the desktop problem survives, and it is a different
+  and smaller one.)
+- **Turn Enhanced Pointer Precision off on the server.** It applies an
+  acceleration curve to injected relative deltas. Compensating was considered and
+  declined: the curve is undocumented and varies with pointer speed, and being
+  subtly wrong reads as "the mouse feels off", which is close to unattributable.
+  One checkbox per install beats a guess that drifts.
 - Steam Input grabs ViGEm pads and presents its own emulated device. Usually
   transparent; occasionally double-enumerates. Test this path early — it presents
   as "controller does nothing in one specific game".

@@ -17,6 +17,23 @@
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, SessionKey};
 
+/// Where authenticated input goes once it has been verified.
+///
+/// Separate from [`ControlHandler`] because it is the one seam that is genuinely
+/// platform-bound: `sunburst-input` implements it against `SendInput` on
+/// Windows. It lives here rather than in `sunburst-web` so that the crate doing
+/// the injecting does not have to depend on `hyper` to reach the trait.
+pub trait InputSink: Send {
+    fn inject(&mut self, client: u32, event: InputEvent);
+}
+
+/// Drops input. What the server uses until an injector is attached.
+pub struct NoInput;
+
+impl InputSink for NoInput {
+    fn inject(&mut self, _client: u32, _event: InputEvent) {}
+}
+
 pub trait ControlHandler: Send {
     /// Whether unauthenticated pairing messages may be processed at all.
     ///

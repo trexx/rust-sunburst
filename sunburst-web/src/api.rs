@@ -182,6 +182,11 @@ impl AppState {
             .clone()
     }
 
+    /// The UDP port the control channel and video share.
+    pub fn stream_port(&self) -> u16 {
+        self.inner.lock().expect("not poisoned").config.stream.port
+    }
+
     pub fn web_config(&self) -> WebConfig {
         self.inner.lock().expect("not poisoned").config.web.clone()
     }

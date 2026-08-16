@@ -14,9 +14,12 @@ pub use win_host::WindowsHost;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use sunburst_input::Injector;
+use sunburst_net::Endpoint;
 use sunburst_web::api::AppState;
-use sunburst_web::{Store, http};
+use sunburst_web::{Store, WebHandler, http};
 
 /// Load state, bind, and serve until the process ends.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,8 +37,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::new(web.bind, web.port);
     let listener = http::bind(addr).await?;
 
+    // The control channel and input, on their own threads with blocking
+    // sockets. No tokio below this line: CLAUDE.md keeps the input path off an
+    // async runtime, and the injector thread has to be the one attached to the
+    // desktop it injects into.
+    let stream_port = state.stream_port();
+    let stream_addr = SocketAddr::new(web.bind, stream_port);
+    let injector = Injector::start()?;
+    let mut endpoint = Endpoint::bind(stream_addr, WebHandler::new(Arc::clone(&state), injector))?;
+    let stop = Box::leak(Box::new(AtomicBool::new(false)));
+    std::thread::spawn(move || {
+        let _ = endpoint.run(stop);
+    });
+
     println!("sunburst — configuration in {}", config_dir.display());
     println!("  http://{addr}/");
+    println!("  udp  {stream_addr}");
     // Printed rather than left in the file, so the token can be found without
     // going looking for it. This is the control plane, not a frame path, and it
     // happens once at startup.

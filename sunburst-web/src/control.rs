@@ -14,25 +14,13 @@ use std::sync::Arc;
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, SessionKey};
+// Re-exported so callers of this crate do not need to reach past it for the
+// seam its own handler is generic over.
 use sunburst_net::ControlHandler;
+pub use sunburst_net::{InputSink, NoInput};
 
 use crate::api::AppState;
 use crate::client::QuirksRecord;
-
-/// Where authenticated input goes.
-///
-/// `sunburst-input` implements this on Windows. Until then the default drops
-/// events, which is honest: nothing can inject them yet.
-pub trait InputSink: Send {
-    fn inject(&mut self, client: u32, event: InputEvent);
-}
-
-/// Drops input. What the server uses until the Windows injection chunk lands.
-pub struct NoInput;
-
-impl InputSink for NoInput {
-    fn inject(&mut self, _client: u32, _event: InputEvent) {}
-}
 
 pub struct WebHandler<S: InputSink> {
     state: Arc<AppState>,

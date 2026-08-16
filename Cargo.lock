@@ -593,6 +593,8 @@ name = "sunburst-input"
 version = "0.1.0"
 dependencies = [
  "sunburst-core",
+ "sunburst-net",
+ "windows",
 ]
 
 [[package]]
@@ -608,6 +610,8 @@ name = "sunburst-server"
 version = "0.1.0"
 dependencies = [
  "sunburst-core",
+ "sunburst-input",
+ "sunburst-net",
  "sunburst-web",
  "tokio",
  "windows",
