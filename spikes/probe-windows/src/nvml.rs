@@ -46,13 +46,17 @@ pub fn encoder_sessions() -> Result<EncoderStats, String> {
         Ok(p as *const c_void)
     };
 
-    // SAFETY for each transmute: the export exists with this signature per the
-    // NVML API. The `_v2` suffixes are the current ABI; the unsuffixed names are
-    // the deprecated ones and would silently differ.
+    // The `_v2` suffixes matter: the unsuffixed names are the deprecated ABI and
+    // would differ in signature rather than fail to resolve.
+
+    // SAFETY: the export exists and takes no arguments, per the NVML API.
     let init: FnInit = unsafe { std::mem::transmute(sym("nvmlInit_v2")?) };
+    // SAFETY: as above.
     let shutdown: FnShutdown = unsafe { std::mem::transmute(sym("nvmlShutdown")?) };
+    // SAFETY: the export exists and takes (index, out handle).
     let get_handle: FnGetHandle =
         unsafe { std::mem::transmute(sym("nvmlDeviceGetHandleByIndex_v2")?) };
+    // SAFETY: the export exists and takes (device, out count, out fps, out latency).
     let stats: FnEncoderStats = unsafe { std::mem::transmute(sym("nvmlDeviceGetEncoderStats")?) };
 
     // SAFETY: no arguments, and paired with the shutdown below.

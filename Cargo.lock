@@ -598,6 +598,9 @@ name = "sunburst-server"
 version = "0.1.0"
 dependencies = [
  "sunburst-core",
+ "sunburst-web",
+ "tokio",
+ "windows",
 ]
 
 [[package]]

@@ -11,3 +11,14 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+sunburst-web.workspace = true
+tokio.workspace = true
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
