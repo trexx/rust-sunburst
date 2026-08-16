@@ -1,0 +1,14 @@
+# The NDK's per-API-level wrapper scripts must be on PATH. Both installed NDKs
+# (27.0.12077973 and 29.0.14206865) provide these exact names; android/ pins
+# 29.0.14206865 to match moonlight-trexx.
+#
+#   export PATH="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+#
+# API 30 is deliberate and not merely the minSdk: KEY_LOW_LATENCY and
+# Surface.setFrameRate() both landed exactly there.
+
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android30-clang"
+
+[target.armv7-linux-androideabi]
+linker = "armv7a-linux-androideabi30-clang"

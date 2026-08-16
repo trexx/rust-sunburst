@@ -1,0 +1,33 @@
+[package]
+name = "sunburst-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3.workspace = true
+subtle.workspace = true
+
+# For clock_gettime only. Worth the dependency rather than declaring timespec by
+# hand: its layout differs between armeabi-v7a and arm64-v8a, and getting that
+# wrong yields plausible-looking garbage rather than a compile error.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "instr"
+harness = false
+
+[features]
+# Swaps in a counting global allocator so tests can assert the frame path
+# allocates nothing after warmup. Never enable outside tests: it puts an atomic
+# increment in front of every allocation in the process.
+count-alloc = []

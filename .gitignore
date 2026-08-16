@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+
+# Android / Gradle
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/app/src/main/jniLibs/
+
+# Microsoft's MT7612U dongle firmware, fetched at build time by
+# scripts/fetch-firmware.sh rather than committed. See CLAUDE.md "Licensing":
+# xone deliberately does not redistribute it and neither do we.
+/android/app/src/main/assets/xone_dongle_*.bin
+
+# Instrumentation captures, which are per-run and per-machine
+/*.instr.json

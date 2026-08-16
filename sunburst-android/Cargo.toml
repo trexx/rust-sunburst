@@ -1,0 +1,17 @@
+[package]
+name = "sunburst-android"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+sunburst-core.workspace = true
+sunburst-net.workspace = true

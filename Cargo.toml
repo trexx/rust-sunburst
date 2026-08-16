@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "sunburst-core",
+    "sunburst-capture",
+    "sunburst-encode",
+    "sunburst-audio",
+    "sunburst-input",
+    "sunburst-net",
+    "sunburst-server",
+    "sunburst-android",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/trexx/sunburst"
+
+[workspace.dependencies]
+sunburst-core = { path = "sunburst-core" }
+sunburst-net = { path = "sunburst-net" }
+
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
+subtle = "2.6"
+thiserror = "2.0"
+
+[workspace.lints.rust]
+# The FFI crates are largely unsafe transcription; making every unsafe operation
+# name itself is what keeps the blast radius of a mistake readable.
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# CLAUDE.md asks for comments explaining why. For unsafe blocks that is not a
+# style preference, so the compiler asks rather than the reviewer.
+undocumented_unsafe_blocks = "warn"
+
+# Release builds are what the latency budget is written against; never measure a
+# debug build and never ship one.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+# Frame-path stalls are diagnosed from stack traces on a machine that is not
+# this one, so the symbols are worth more than the binary size.
+debug = "line-tables-only"
+
+# No [profile.bench] override: it already inherits from release, and cargo
+# ignores `panic` for test and bench profiles, so criterion still unwinds
+# despite `panic = "abort"` above.
