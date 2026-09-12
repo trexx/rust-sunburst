@@ -192,8 +192,9 @@ fn report_encoder() -> Result<(), String> {
     if crate::nvenc::driver_is_new_enough(nvenc.driver_max_version) {
         println!("  OK -- at or above the API this build targets.");
     } else {
-        println!("  WARNING: below the API this build targets. r570 or newer is required;");
-        println!("  older headers carry no AV1 GUIDs, so AV1 answers would be false negatives.");
+        println!("  WARNING: below the API this build targets. Update the driver until it");
+        println!("  reports at least that; older headers carry no AV1 GUIDs, so every AV1");
+        println!("  answer below would be a false negative rather than an error.");
     }
 
     // A D3D11 device is only needed to open the session; nothing is rendered.
@@ -302,7 +303,7 @@ fn interpret(session: &Session<'_>, has: impl Fn(Guid) -> bool) {
     if let Ok(engines) = session.cap(av1, caps::NUM_ENCODER_ENGINES) {
         println!("  {engines} encoder engine(s).");
         if engines < 2 {
-            println!("  -> As expected on a non-Ti. No Split Frame Encoding; encode time stays");
+            println!("  -> As expected on AD104. No Split Frame Encoding; encode time stays");
             println!("     a fixed floor and subframe readback is how it gets hidden.");
         } else {
             println!("  -> More than one engine. CLAUDE.md assumes exactly one; if this is");

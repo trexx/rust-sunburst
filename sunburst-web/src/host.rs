@@ -9,7 +9,7 @@
 //!
 //! This exists to make the API testable on the Linux development machine, not
 //! for abstraction's sake. Without it, none of `api.rs` could be exercised
-//! without the 5070 box.
+//! without the 4070 box.
 
 use std::sync::Mutex;
 

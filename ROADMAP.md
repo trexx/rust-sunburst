@@ -64,8 +64,7 @@ manage later:
   The risk was that an AV1 encoder without `SUPPORT_REF_PIC_INVALIDATION` would
   leave the Homatics with no HEVC path to fall back to, degrading NACK recovery
   there to `RequestIdr`. The probe reports it supported, so Phase 4 keeps its
-  design on both codecs. Measured on a 4070 rather than the 5070; see
-  `HARDWARE_TESTING.md` §1 for why that answer carries and what is still owed.
+  design on both codecs. See `HARDWARE_TESTING.md` §1.
 
 **Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
 table seeded.

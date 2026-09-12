@@ -12,7 +12,7 @@
 //! box degrades to `RequestIdr`, and Phase 4 is shaped differently. Better known
 //! now than then.
 //!
-//! Run on the 5070 box and paste the output into HARDWARE_TESTING.md §1.
+//! Run on the 4070 box and paste the output into HARDWARE_TESTING.md §1.
 
 #[cfg(windows)]
 mod nvenc;

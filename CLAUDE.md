@@ -7,10 +7,17 @@ Replaces Sunshine/Moonlight for a two-device household. Not a general-purpose pr
 
 **Server**
 - Windows 10 1903+ and Windows 11
-- RTX 5070 **non-Ti** (GB205, Blackwell, 9th-gen NVENC)
-- **1 NVENC + 1 NVDEC.** No Split Frame Encoding (needs 2+ encoders).
-- NVIDIA Video Codec SDK 13.0+, driver r570+. Version-check at startup; older
-  headers lack the AV1 GUIDs and Blackwell caps.
+- RTX 4070 (AD104, Ada Lovelace, 8th-gen NVENC), 12 GB
+- **1 NVENC + 1 NVDEC.** No Split Frame Encoding — it needs 2+ encoders and
+  AD104 has one.
+- Built against NVIDIA Video Codec SDK 13.1, and the startup check requires the
+  driver to report **NVENC API ≥ 13.1** — which is what the code actually
+  compares, so state the API version rather than a driver branch number. AV1
+  encode arrived with Ada and needs only SDK 12.0+, so that floor is about the
+  headers this build is written against, not about AV1.
+- The encoder caps are **measured, not assumed** — see `HARDWARE_TESTING.md` §1.
+  The load-bearing result: AV1 has parity with HEVC on reference invalidation and
+  subframe readback.
 
 **Clients**
 | Device | SoC | Codec | ABI | Link |
@@ -43,7 +50,10 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   as they complete overlaps encode with transmit and is the only way to hide it.
 - **Never enable AV1 UHQ mode.** It buys compression via pre-analysis — exactly
   the latency we're eliminating. Stay on `TUNING_INFO_ULTRA_LOW_LATENCY`, P1–P4.
-- 4:2:2 and MV-HEVC (Blackwell additions) are irrelevant; Android decoders want 4:2:0.
+- 4:2:2 and MV-HEVC are Blackwell additions this card does not have, and would be
+  irrelevant if it did — Android decoders want 4:2:0. AV1 4:4:4 is absent too
+  (HEVC 4:4:4 is present); also irrelevant, and noted only so its absence is
+  never read as a finding.
 
 ## Hot path rules
 
@@ -74,7 +84,7 @@ changes that look free — the point is to catch the ones that aren't.
 | DWM composition | ~16.7ms | Only NvFBC/hooking avoids this |
 | Capture acquire | 0.5–2ms | |
 | scRGB→P010 shader | 0.8–1.5ms | |
-| NVENC HEVC P1 ULL | 5–9ms | Fixed floor; no SFE on non-Ti |
+| NVENC HEVC P1 ULL | 5–9ms | Fixed floor; one NVENC, so no SFE |
 | NVENC AV1 P1 ULL | 6–10ms | |
 | Packetize + send | <0.5ms | USO offload |
 | Wire @ 1GbE | 1–3ms | |
@@ -84,6 +94,11 @@ changes that look free — the point is to catch the ones that aren't.
 
 Honest glass-to-glass: **60–100ms**. Sub-40ms claims elsewhere measure
 capture-to-wire, not what the eye sees. Do not chase them.
+
+The two NVENC rows are **targets, not measurements** — they were written against
+the Blackwell encoder this project originally assumed and have not been measured
+on Ada. `HARDWARE_TESTING.md` §4 is where the real numbers land, and they replace
+these when they arrive.
 
 Bitrate: HEVC 100–150 Mbps, AV1 70–100 Mbps. Shield's decoder caps out before
 1GbE does — treat ~150 Mbps as its practical ceiling.
@@ -119,7 +134,7 @@ and only `inject` is gated. Those decisions are the part that is easy to get
 wrong, so they are tested on a machine where `SendInput` does not exist.
 
 That trait is not abstraction for its own sake — it is what lets the entire
-management surface be tested on the Linux machine instead of the 5070 box.
+management surface be tested on the Linux machine instead of the 4070 box.
 `sunburst-server` implements it against Win32; `host::Fake` implements it for
 tests.
 
@@ -179,7 +194,7 @@ The Android targets need the NDK's toolchain `bin/` on `PATH` —
 `.cargo/config.toml` names the linker wrappers and says which. The Gradle wrapper
 fetches its own JDK.
 
-Real NVENC and every hardware measurement happen on the 5070 box. The
+Real NVENC and every hardware measurement happen on the 4070 box. The
 cross-build produces genuine binaries but proves nothing about behaviour.
 
 ## Dependencies
@@ -282,7 +297,10 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
 - AV1's reference model (8 slots, explicit signalling) differs enough from HEVC
   that reference invalidation needs a **separate** state machine, not a shared one.
 - Query `NvEncGetEncodeCaps` with `NV_ENC_CODEC_AV1_GUID` for
-  `SUPPORT_REF_PIC_INVALIDATION` and `SUPPORT_INTRA_REFRESH`. Do not assume parity.
+  `SUPPORT_REF_PIC_INVALIDATION` and `SUPPORT_INTRA_REFRESH`. Do not assume
+  parity. On this card both came back supported (`HARDWARE_TESTING.md` §1), so
+  Phase 4 keeps reference invalidation on both codecs — but keep the query, since
+  it is what makes the code correct on a machine that answers differently.
 
 **Client**
 - `SurfaceView`, never `TextureView` — TextureView costs a full frame of compositing.

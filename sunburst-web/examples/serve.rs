@@ -3,7 +3,7 @@
 //! Run the management API against a fake host, on any platform.
 //!
 //! This is what makes the frontend developable on the Linux machine. Without it
-//! the UI could only be exercised on the 5070 box, which would waste the whole
+//! the UI could only be exercised on the 4070 box, which would waste the whole
 //! reason [`sunburst_web::host::Host`] is a trait.
 //!
 //! ```text

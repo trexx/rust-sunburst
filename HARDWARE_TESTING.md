@@ -17,8 +17,7 @@ fixed**, so the same case gets re-tested afterwards.
 
 | # | Device | OS / driver | Notes |
 |---|---|---|---|
-| S | Windows server — the target | | RTX 5070 non-Ti (GB205). Record the driver version — the AV1 GUIDs and Blackwell caps need r570+. |
-| S4 | Windows box §1 was measured on | NVENC API 13.1 | **RTX 4070, 12 GiB — Ada, not the target.** Same shape as S for what §1 asks: one NVENC, AV1 encode present. Its answers carry; Blackwell-specific caps are still owed a re-run on S. |
+| S | Windows server | NVENC API 13.1 | RTX 4070, 12 GiB (AD104, Ada). One NVENC, one NVDEC. Record the driver version alongside any result. |
 | A | NVIDIA Shield TV | Android 11 / API 30 | `arm64-v8a`, Tegra X1, HEVC Main10 only |
 | B | Homatics Box R 4K Plus | Android 14 | `armeabi-v7a`, Amlogic S905X4, AV1 Main10. HEVC decoder is broken — do not retest. |
 
@@ -56,7 +55,7 @@ enumeration tool below writes a file for exactly this reason.
 
 ---
 
-## 1. Phase 0.1 — Encoder and capture capabilities (env S4; re-run owed on S)
+## 1. Phase 0.1 — Encoder and capture capabilities (env S)
 
 ```
 probe-windows                  # everything, no side effects
@@ -67,21 +66,22 @@ Run `spikes/probe-windows`. It answers more than the roadmap asked for, because
 the extra questions cost nothing once the encoder session is open and each one
 de-risks Phase 3.
 
-**Measured on env S4 — an RTX 4070, not the 5070.** Recorded rather than
-discarded, because the answers below are ones the two parts share by
-construction: both are single-NVENC consumer cards with an AV1 encoder, and
-Blackwell's encoder feature set is a superset of Ada's. That is enough to close
-every *design* question Phase 0.1 was there to gate. It is not enough to satisfy
-CLAUDE.md's own rule — **query, do not assume parity** — so the matrix gets
-re-run on S when that box is available, and a difference is then a finding
-rather than a surprise.
+**Measured on env S.** This project was originally specified against an RTX 5070
+and the hardware is actually a 4070, so these are the numbers that count and
+CLAUDE.md has been corrected to match. Nothing in the matrix below was affected
+by the mix-up — both parts are single-NVENC consumer cards with an AV1 encoder,
+which is all Phase 0.1 asks about — but the Blackwell-only items are now simply
+absent rather than deferred: no 4:2:2, no MV-HEVC, and Split Frame Encoding was
+never reachable with one encoder either way.
 
-- [x] **Driver is new enough.** The probe reports **NVENC API 13.1**, above the
-      13.0 this build targets — which is the check the startup version gate
-      actually performs, and the one that gates the AV1 GUIDs. The probe prints
-      the API version, not the driver version string; if the r570 number itself
-      is ever wanted, that is a line to add to the probe rather than a fact to
-      infer from this.
+- [x] **Driver is new enough.** The probe reports **NVENC API 13.1**, exactly
+      what this build targets, and the startup gate compares against that rather
+      than a driver branch number. Worth keeping straight: AV1 encode arrived
+      with Ada and needs only SDK 12.0+, so 13.1 is the floor for *the headers
+      this build is written against*, not for AV1. The probe prints the API
+      version and not the driver version string; if the driver number itself is
+      ever wanted, that is a line to add to the probe rather than a fact to infer
+      from this.
 - [!] **NvFBC: the first answer was wrong, and the question is reopened.** The
       probe reported "no `NvFBCCreateInstance`, treat as unavailable". That was
       a **false negative from asking the wrong entry point**: there are two
@@ -142,9 +142,10 @@ AV1's 8-slot explicit signalling differs enough that sharing one would be the bu
 one NVENC and no SFE this is the only mechanism that hides encode time, and it
 exists on both codecs rather than just HEVC.
 
-**One encoder engine, as expected on a non-Ti.** No Split Frame Encoding. Encode
-time stays a fixed 5–10ms floor, which is what makes the line above load-bearing
-rather than an optimisation.
+**One encoder engine, as AD104 has.** No Split Frame Encoding — it needs two or
+more. Encode time stays a fixed 5–10ms floor, which is what makes the line above
+load-bearing rather than an optimisation. Note the floor itself is still the
+inherited Blackwell-era *estimate*; §4 is where Ada's real number goes.
 
 **NvFBC is undecided, and that is the one open item from 0.1.** DWM composition
 is ~16.7ms in CLAUDE.md's budget — the largest single line in the table, larger
@@ -377,7 +378,7 @@ UIPI), `reattached` and `attach_failed`.
 
 | Needed for | Hardware |
 |---|---|
-| §1 in full | The 5070 box with r570+ |
+| §1's NvFBC row | The 4070 box; `--enable-nvfbc` needs elevation |
 | §2 | Both Android boxes, adb reachable |
 | §4 client rows | Phase 5 client, so not yet |
 | Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads |

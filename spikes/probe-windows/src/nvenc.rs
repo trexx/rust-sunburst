@@ -51,9 +51,11 @@ pub const fn decode_driver_version(packed: u32) -> (u32, u32) {
 /// Whether the driver implements at least the API this build was written
 /// against.
 ///
-/// The check CLAUDE.md asks for at startup: below r570 the headers carry no AV1
-/// GUIDs at all, so every AV1 answer would be a false negative rather than an
-/// error.
+/// The check CLAUDE.md asks for at startup. Stated as an API version because
+/// that is what the driver reports and what this compares; a driver branch
+/// number would be a second, unverifiable way of saying the same thing. Too old
+/// and the headers carry no AV1 GUIDs, so every AV1 answer below would be a
+/// false negative rather than an error.
 pub const fn driver_is_new_enough(packed: u32) -> bool {
     let (major, minor) = decode_driver_version(packed);
     let want_major = NVENCAPI_VERSION & 0xFF;
@@ -249,7 +251,7 @@ impl Nvenc {
             return Err(format!(
                 "NvEncodeAPICreateInstance failed with {status}. \
                  The driver supports API {dmaj}.{dmin}; this build asks for {}.{}. \
-                 Update to r570 or newer",
+                 Update the driver until it reports at least that",
                 NVENCAPI_VERSION & 0xFF,
                 NVENCAPI_VERSION >> 24,
             ));
