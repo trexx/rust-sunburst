@@ -25,7 +25,11 @@ mod probe;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
-    probe::run()
+    // `NvFBC_Enable` switches the feature on machine-wide and resets the display
+    // driver doing it, which on a box someone is watching looks indistinguishable
+    // from a crash. A probe does not get to do that unasked.
+    let attempt_enable = std::env::args().any(|a| a == "--enable-nvfbc");
+    probe::run(attempt_enable)
 }
 
 // The crate stays a workspace member on Linux so it is type-checked in the same

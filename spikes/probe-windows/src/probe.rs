@@ -14,12 +14,12 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::core::Interface;
 
-pub fn run() -> ExitCode {
+pub fn run(attempt_enable: bool) -> ExitCode {
     println!("sunburst probe-windows -- Phase 0.1\n");
 
     report_adapter();
     println!();
-    report_nvfbc();
+    report_nvfbc(attempt_enable);
     println!();
     report_nvml();
     println!();
@@ -64,24 +64,104 @@ fn describe_adapter() -> Result<String, String> {
     ))
 }
 
-fn report_nvfbc() {
+fn report_nvfbc(attempt_enable: bool) {
+    use crate::nvfbc::{Generation, result_name};
+
     println!("== NvFBC (ROADMAP 0.1) ==");
-    match crate::nvfbc::probe() {
-        crate::nvfbc::NvfbcStatus::Available { dll } => {
-            println!("  AVAILABLE via {dll}");
-            println!("  -> NvFBC becomes the priority-1 capture backend.");
-            println!("     Worth more here than on a Ti: encode time is a fixed floor with");
-            println!("     one NVENC and no SFE, so DWM composition is the biggest target left.");
+    let report = crate::nvfbc::probe(attempt_enable);
+
+    let Some(dll) = report.dll else {
+        println!("  UNAVAILABLE -- no NvFBC runtime found.");
+        println!("  -> Delete the backend from the plan; the Capture trait must be");
+        println!("     shaped so its absence costs nothing.");
+        return;
+    };
+    println!("  {dll} loaded.");
+    if report.proxy_shim_present {
+        println!("  NOTE: NvFBC64_.dll also present, so a proxy shim is installed.");
+        println!("        Anything below may be the shim's doing rather than this probe's.");
+    }
+
+    match report.generation {
+        Generation::Neither => {
+            println!("  Exports neither NvFBCCreateInstance nor NvFBC_CreateEx.");
+            println!("  -> Not an NvFBC runtime we know. Treat as unavailable.");
+            return;
         }
-        crate::nvfbc::NvfbcStatus::DllWithoutEntryPoint { dll } => {
-            println!("  {dll} loaded but has no NvFBCCreateInstance.");
-            println!("  -> Treat as unavailable; this looks like a much older Capture SDK.");
+        Generation::Modern => {
+            println!("  Exports NvFBCCreateInstance -- the 7.x/Linux-shaped API.");
+            println!("  -> Unexpected on Windows. The keyed legacy path below does not apply;");
+            println!("     this one takes a function table and needs its own probe.");
+            return;
         }
-        crate::nvfbc::NvfbcStatus::Unavailable => {
-            println!("  UNAVAILABLE -- no NvFBC runtime found.");
-            println!("  -> The expected answer. Delete the backend from the plan; the Capture");
-            println!("     trait must be shaped so its absence costs nothing.");
+        Generation::Legacy => {
+            println!("  Legacy Windows API: {}", report.exports.join(", "));
         }
+    }
+
+    if let Some(v) = report.sdk_version {
+        println!("  NvFBC_GetSDKVersion: {v} (0x{v:x})");
+    }
+    if let Some(code) = report.enable {
+        println!("  NvFBC_Enable(ENABLE): {} ({code})", result_name(code));
+    }
+
+    for (label, status) in [
+        ("unkeyed", &report.status_plain),
+        ("keyed  ", &report.status_keyed),
+    ] {
+        if let Some(s) = status {
+            println!(
+                "  GetStatusEx {label}: {} -- capture_possible {}, capturing {}, \
+multi_head {}, multi_client {}, iface v{}",
+                result_name(s.result),
+                s.capture_possible as u8,
+                s.currently_capturing as u8,
+                s.multi_head as u8,
+                s.multi_client as u8,
+                s.nvfbc_version,
+            );
+        }
+    }
+
+    for (label, create) in [
+        ("unkeyed", &report.create_plain),
+        ("keyed  ", &report.create_keyed),
+    ] {
+        if let Some(c) = create {
+            println!(
+                "  CreateEx    {label}: {} -- object {}, max {}x{}",
+                result_name(c.result),
+                c.got_object as u8,
+                c.max_width,
+                c.max_height,
+            );
+        }
+    }
+
+    let worked = |c: &Option<crate::nvfbc::Create>| {
+        c.as_ref().is_some_and(|c| c.result == 0 && c.got_object)
+    };
+    println!();
+    if worked(&report.create_plain) {
+        println!("  -> NvFBC works with no key at all, so this card is not gated.");
+        println!("     It becomes a candidate priority-1 backend on its own merits.");
+    } else if worked(&report.create_keyed) {
+        println!("  -> NvFBC is present and switched OFF, not absent: the same call that");
+        println!("     fails unkeyed succeeds carrying the private-data key. That is the");
+        println!("     evidence the key is what mattered -- a keyed-only run proves nothing.");
+        println!("     What it licenses is a measurement, not a backend. See");
+        println!("     HARDWARE_TESTING.md section 1 before building on it.");
+    } else if report
+        .status_keyed
+        .as_ref()
+        .is_some_and(|s| s.capture_possible)
+    {
+        println!("  -> Status says capture is possible but CreateEx still refused. Worth a");
+        println!("     re-run with --enable-nvfbc, which is the step that needs elevation.");
+    } else {
+        println!("  -> Unavailable on this driver even with the key. Delete the backend");
+        println!("     from the plan; the Capture trait must survive its absence anyway.");
     }
 }
 

@@ -11,18 +11,29 @@ phase's acceptance criteria pass.
 Throwaway code. The point is to resolve architecture-invalidating unknowns before
 committing to any of them.
 
-### 0.1 NvFBC availability
+### 0.1 NvFBC availability — **still open, and for an instructive reason**
 NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
-developers to Desktop Duplication; the surviving NvFBC is the Linux one. **Assume
-it is unavailable until proven otherwise on this exact driver.**
+developers to Desktop Duplication. The instruction was to assume it unavailable
+until proven otherwise on this exact driver, and the first probe run appeared to
+confirm that: `NvFBC64.dll` loads but exports no `NvFBCCreateInstance`.
 
-Call `NvFBCCreateInstance` / `NvFBCCreateHandle`. Record the result.
+**That was the wrong question, not a negative answer.** `NvFBCCreateInstance` is
+the 7.x/Linux-shaped API; the Windows one is the legacy `NvFBC_CreateEx` /
+`NvFBC_GetStatusEx` / `NvFBC_Enable` set, which the driver does still export. The
+probe now walks that path, and because legacy NvFBC is gated to professional
+cards by a private-data key, it asks **unkeyed and keyed and reports the pair** —
+a keyed success means nothing except beside an unkeyed failure.
 
-- **Available** → NvFBC becomes the priority-1 backend and is worth more to us
-  than it would be on a Ti, since encode latency is a fixed floor and DWM
-  composition becomes the biggest remaining target.
-- **Unavailable** → delete the backend from the plan. The `Capture` trait must be
-  shaped so its absence costs nothing.
+So the branch is not taken yet. What has changed is that the third possibility is
+now visible and testable: not "available" or "absent" but **present and switched
+off**. `HARDWARE_TESTING.md` §1 records what a keyed success would license, which
+is a *measurement* of what skipping DWM composition actually recovers — enough to
+price the Phase 7 swapchain-hook work — rather than a priority-1 backend that can
+vanish in a driver update.
+
+The other half of 0.1 — the encoder capability matrix — is answered, with AV1 at
+parity with HEVC on reference invalidation and subframe readback. That is the
+answer Phase 4 was waiting on.
 
 ### 0.2 Decoder enumeration on both boxes
 Dump full `MediaCodecList` on Shield and Homatics. For each HEVC/AV1 decoder
@@ -49,13 +60,22 @@ manage later:
   state machine and the av1C record carry the whole device, and the av1C record
   is the known silent-failure point — wrong record, decoder configures cleanly
   and outputs nothing.
-- **0.1's AV1 capability queries are load-bearing.** If Blackwell's AV1 encoder
-  lacks `SUPPORT_REF_PIC_INVALIDATION`, there is no HEVC path to fall back to and
-  NACK recovery on the Homatics degrades to `RequestIdr`. Better known now than
-  in Phase 4.
+- **0.1's AV1 capability queries are load-bearing** — and have now come back.
+  The risk was that an AV1 encoder without `SUPPORT_REF_PIC_INVALIDATION` would
+  leave the Homatics with no HEVC path to fall back to, degrading NACK recovery
+  there to `RequestIdr`. The probe reports it supported, so Phase 4 keeps its
+  design on both codecs. Measured on a 4070 rather than the 5070; see
+  `HARDWARE_TESTING.md` §1 for why that answer carries and what is still owed.
 
 **Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
 table seeded.
+
+One of the three is done: the codec matrix is measured. The NvFBC decision is
+**not** made — the first answer was a wrong-entry-point false negative and the
+keyed legacy path has not been run yet. The quirks table is half-seeded: the
+Shield is enumerated, the Homatics is not. So **the NvFBC re-run, 0.2 and 0.3 all
+stand between here and Phase 0 closing** — one needs the server, two need the
+Homatics.
 
 ---
 
@@ -212,7 +232,11 @@ Ordered by value, not difficulty.
   Solves resolution matching and HDR mode control cleanly. Requires an EV-signed
   WDDM driver; strongly consider consuming an existing VDD (Parsec VDD, Virtual
   Display Driver) rather than authoring one.
-- **NvFBC** — only if Phase 0.1 came back positive.
+- **NvFBC** — still conditional on Phase 0.1, which is not settled: the legacy
+  Windows API is present and the keyed probe has not been run. Note that even a
+  positive result does not make this a default backend — an undocumented key that
+  a driver update can invalidate is at most an opt-in fast path behind DDA/WGC.
+  Its first use is to *price* the swapchain-hook item below.
 - **Swapchain hooking** — opt-in, with an explicit anti-cheat warning. Hook
   `IDXGISwapChain::Present`/`Present1`/`ResizeBuffers`, `vkQueuePresentKHR`,
   `wglSwapBuffers`, and D3D9 `EndScene`/`Present`. D3D9Ex can share surfaces to
@@ -323,7 +347,7 @@ Ranked by latency. Full detail in CLAUDE.md traps.
 |---|---|---|
 | Swapchain hook | Pre-composition, saves ~1 frame, uncapped fps | Phase 7, opt-in |
 | IDD | Very good; solves headless + resolution matching | Phase 7 |
-| NvFBC | Lowest official; feeds NVENC directly | Phase 0 probe |
+| NvFBC | Lowest official; feeds NVENC directly | Phase 0 probe — **legacy API present, keyed run pending** |
 | WGC | Post-composition, refresh-capped | Phase 3, Win11 default |
 | DDA | Post-composition, refresh-capped | Phase 3, Win10 default |
 

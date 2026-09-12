@@ -17,7 +17,8 @@ fixed**, so the same case gets re-tested afterwards.
 
 | # | Device | OS / driver | Notes |
 |---|---|---|---|
-| S | Windows server | | RTX 5070 non-Ti (GB205). Record the driver version — the AV1 GUIDs and Blackwell caps need r570+. |
+| S | Windows server — the target | | RTX 5070 non-Ti (GB205). Record the driver version — the AV1 GUIDs and Blackwell caps need r570+. |
+| S4 | Windows box §1 was measured on | NVENC API 13.1 | **RTX 4070, 12 GiB — Ada, not the target.** Same shape as S for what §1 asks: one NVENC, AV1 encode present. Its answers carry; Blackwell-specific caps are still owed a re-run on S. |
 | A | NVIDIA Shield TV | Android 11 / API 30 | `arm64-v8a`, Tegra X1, HEVC Main10 only |
 | B | Homatics Box R 4K Plus | Android 14 | `armeabi-v7a`, Amlogic S905X4, AV1 Main10. HEVC decoder is broken — do not retest. |
 
@@ -55,37 +56,130 @@ enumeration tool below writes a file for exactly this reason.
 
 ---
 
-## 1. Phase 0.1 — Encoder and capture capabilities (env S)
+## 1. Phase 0.1 — Encoder and capture capabilities (env S4; re-run owed on S)
+
+```
+probe-windows                  # everything, no side effects
+probe-windows --enable-nvfbc   # adds NvFBC_Enable: needs elevation, resets the driver
+```
 
 Run `spikes/probe-windows`. It answers more than the roadmap asked for, because
 the extra questions cost nothing once the encoder session is open and each one
 de-risks Phase 3.
 
-- [ ] **Driver is r570 or newer.** Older headers lack the AV1 GUIDs entirely, so
-      every AV1 answer below would be a false negative.
-- [ ] **NvFBC availability.** Assume unavailable until proven otherwise —
-      NVIDIA deprecated it on Windows and points at Desktop Duplication.
-      Available makes it priority-1 and worth more here than on a Ti, since
-      encode latency is a fixed floor and DWM composition becomes the biggest
-      remaining target. Unavailable deletes the backend from the plan.
-- [ ] **HEVC caps**: `SUPPORT_REF_PIC_INVALIDATION`, `SUPPORT_INTRA_REFRESH`,
-      subframe/slice output, 10-bit, max bitrate.
-- [ ] **AV1 caps**: the same list. **Do not assume parity with HEVC.** This is
-      the one that matters most — the Homatics has no HEVC path behind it, so an
-      AV1 encoder without reference invalidation means NACK recovery there
-      degrades to `RequestIdr`, and that changes Phase 4.
+**Measured on env S4 — an RTX 4070, not the 5070.** Recorded rather than
+discarded, because the answers below are ones the two parts share by
+construction: both are single-NVENC consumer cards with an AV1 encoder, and
+Blackwell's encoder feature set is a superset of Ada's. That is enough to close
+every *design* question Phase 0.1 was there to gate. It is not enough to satisfy
+CLAUDE.md's own rule — **query, do not assume parity** — so the matrix gets
+re-run on S when that box is available, and a difference is then a finding
+rather than a surprise.
+
+- [x] **Driver is new enough.** The probe reports **NVENC API 13.1**, above the
+      13.0 this build targets — which is the check the startup version gate
+      actually performs, and the one that gates the AV1 GUIDs. The probe prints
+      the API version, not the driver version string; if the r570 number itself
+      is ever wanted, that is a line to add to the probe rather than a fact to
+      infer from this.
+- [!] **NvFBC: the first answer was wrong, and the question is reopened.** The
+      probe reported "no `NvFBCCreateInstance`, treat as unavailable". That was
+      a **false negative from asking the wrong entry point**: there are two
+      generations of NvFBC, `NvFBCCreateInstance` belongs to the 7.x/Linux one,
+      and the Windows API the driver still exports is the legacy
+      `NvFBC_CreateEx` / `NvFBC_GetStatusEx` / `NvFBC_Enable` set. A missing
+      modern export is a *version detection*, not a verdict.
+
+      The probe now walks the legacy path, and legacy NvFBC is gated to
+      professional cards by a private-data key. It asks **both ways** and prints
+      the pair, because a keyed success only means something next to an unkeyed
+      failure — a keyed-only run proves nothing, since a Quadro passes either
+      way. Re-run and record the four lines it prints (`GetStatusEx` and
+      `CreateEx`, unkeyed and keyed).
+- [ ] **`--enable-nvfbc`, only if `CreateEx` refuses while status says capture is
+      possible.** `NvFBC_Enable` needs elevation and **resets the display driver**,
+      which on a box someone is watching is indistinguishable from a crash — so
+      the probe never calls it unless asked by name.
+- [x] **HEVC caps.** Reference invalidation, intra refresh, subframe readback,
+      10-bit and dynamic bitrate change all supported.
+- [x] **AV1 caps — parity holds on everything load-bearing.** Reference
+      invalidation *and* subframe readback are both supported. This was the most
+      consequential question in Phase 0 and it came back the good way.
 - [ ] **Second NVENC session detected** when ShadowPlay, Instant Replay or OBS is
       running. The driver time-shares one physical encoder and per-frame times get
       jittery in a way that reads exactly like our bug, so this becomes a startup
-      warning.
+      warning. **Half-done:** the NVML query works and reports `0 sessions, 0 fps,
+      0 us` on an idle box, so the plumbing is proven. It has never been seen
+      report a *non-zero* count, which is the half that matters — re-run with OBS
+      open before trusting the warning.
 
 | Cap | HEVC | AV1 |
 |---|---|---|
-| Ref pic invalidation | | |
-| Intra refresh | | |
-| Subframe readback | | |
-| 10-bit | | |
-| Max bitrate | | |
+| Ref pic invalidation | yes | **yes** |
+| Intra refresh | yes | yes |
+| Subframe readback | yes | **yes** |
+| 10-bit encode | yes | yes |
+| Dynamic bitrate change | yes | yes |
+| YUV 4:4:4 | yes | no |
+| Max width × height | 8192 × 8192 | 8192 × 8192 |
+| Max level | 186 → 6.2, the HEVC maximum | 23 `seq_level_idx`, far above 4K60 |
+| Encoder engines | 1 | 1 |
+
+Max bitrate is absent from the table because there is no per-codec cap to query:
+the real ceiling is the Shield's decoder, well below 1GbE. CLAUDE.md's ~150 Mbps
+practical limit stands as the operative number.
+
+### What 0.1 settled
+
+**AV1 keeps reference invalidation, so Phase 4 is unchanged.** ROADMAP 0.4 spelt
+out the bad branch: the Homatics has no HEVC path behind it, so an AV1 encoder
+without `SUPPORT_REF_PIC_INVALIDATION` would have degraded NACK recovery on that
+box to `RequestIdr` and changed Phase 4's design. It does not. Both codecs keep
+the same recovery strategy — still **two** state machines, per CLAUDE.md, because
+AV1's 8-slot explicit signalling differs enough that sharing one would be the bug.
+
+**AV1 keeps subframe readback, so tiles can be emitted as they complete.** With
+one NVENC and no SFE this is the only mechanism that hides encode time, and it
+exists on both codecs rather than just HEVC.
+
+**One encoder engine, as expected on a non-Ti.** No Split Frame Encoding. Encode
+time stays a fixed 5–10ms floor, which is what makes the line above load-bearing
+rather than an optimisation.
+
+**NvFBC is undecided, and that is the one open item from 0.1.** DWM composition
+is ~16.7ms in CLAUDE.md's budget — the largest single line in the table, larger
+than encode — and NvFBC and swapchain hooking are the only two ways past it. So
+which way this lands matters more here than it would on a Ti, and it is worth
+the re-run rather than the assumption.
+
+**What a keyed success would and would not license.** It would not make NvFBC a
+priority-1 backend, for three reasons that are all independent of whether the
+call succeeds:
+
+- The key is undocumented and can stop working on any driver update. A capture
+  backend that can vanish in a driver release is not a default; at most it is an
+  opt-in fast path behind one that always works.
+- NVIDIA deprecated NvFBC on Windows from the Windows 10 October 2019 update
+  onward, and CLAUDE.md's floor is Windows 10 1903+ — so essentially the whole
+  supported OS range is past the deprecation.
+- Phase 3 still needs DDA and WGC regardless, because they are what works on an
+  unpatched machine.
+
+  What it *would* license is a **measurement**: how much of the ~16.7ms does
+  skipping composition actually recover on this hardware? That number is worth
+  having even if the backend never ships, because it prices the swapchain-hook
+  work in Phase 7 — which is the other way past composition and the expensive
+  one. Getting a real figure cheaply, before committing to hooking, is the whole
+  value of this result.
+
+If it comes back negative even with the key, the original conclusion stands:
+delete the backend, and swapchain hooking becomes the only remaining route to a
+pre-composition frame — which does not promote it either, given it is
+per-process, a poor fit for Big Picture launching each game into a new window,
+and carries an anti-cheat warning.
+
+**4:4:4 on AV1 is absent and irrelevant.** Android decoders want 4:2:0, as
+CLAUDE.md says. Recorded only so its absence is never mistaken for a finding.
 
 ---
 
