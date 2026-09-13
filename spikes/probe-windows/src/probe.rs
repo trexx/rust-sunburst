@@ -68,6 +68,10 @@ fn describe_adapter() -> Result<String, String> {
 /// 4K sysmem readback costs, this is a window of roughly two seconds.
 const GRAB_COUNT: u32 = 500;
 
+/// Blocking grabs wait for the display, so fewer of them still spans a useful
+/// window and the probe does not sit there for ten seconds.
+const BLOCKING_COUNT: u32 = 300;
+
 /// Unique frames below which the throughput comparison means nothing.
 ///
 /// A 60Hz desktop with something moving on it produces tens of unique frames in
@@ -82,26 +86,29 @@ const MIN_UNIQUE_FOR_VERDICT: usize = 20;
 /// Deliberately comparative. An NvFBC frame rate on its own says nothing, since
 /// a static desktop produces few unique frames however fast the calls return —
 /// so this runs DDA over the same wall-clock window and compares.
-fn interpret_capture(c: &crate::tosys::Capture) {
+fn interpret_capture(polled: &crate::tosys::Capture, blocked: &crate::tosys::Capture) {
     // A static desktop yields few unique frames however fast the calls return,
     // so unique-per-second is the honest rate, not raw call rate.
-    let unique_fps = c.unique as f64 * 1e9 / c.elapsed_ns.max(1) as f64;
-    println!(
-        "      -> {unique_fps:.1} unique frames/sec at {:.1} grabs/sec.",
-        c.fps()
-    );
+    let unique_fps = blocked.unique as f64 * 1e9 / blocked.elapsed_ns.max(1) as f64;
+    let polled_unique_fps = polled.unique as f64 * 1e9 / polled.elapsed_ns.max(1) as f64;
+    println!();
+    println!("      polling : {polled_unique_fps:.1} unique frames/sec");
+    println!("      blocking: {unique_fps:.1} unique frames/sec  <- NvFBC's actual ceiling");
+    println!("      The gap between them is wasted work: a poll that finds no new frame");
+    println!("      still pays the full copy, so only the blocking figure is comparable.");
 
-    // True regardless of how the comparison lands, and it is a cost the
-    // pipeline would pay on every frame.
+    // True regardless of how the comparison lands, and a cost the pipeline would
+    // pay on every frame.
     println!(
-        "      Each grab cost {:.2}ms at p50 even with the desktop idle, which is the",
-        c.p50_ns as f64 / 1e6
+        "      Per-grab cost {:.2}ms p50 / {:.2}ms p99 -- the sysmem readback, paid",
+        polled.p50_ns as f64 / 1e6,
+        polled.p99_ns as f64 / 1e6
     );
-    println!("      sysmem readback itself -- ToSys copies whether or not the frame is new.");
+    println!("      whether or not the frame is new.");
 
     println!();
     println!("  DDA over the same window, as the control:");
-    let dda = match crate::dda::run(c.elapsed_ns) {
+    let dda = match crate::dda::run(blocked.elapsed_ns) {
         Ok(dda) => dda,
         Err(e) => {
             println!("      unavailable -- {e}");
@@ -116,8 +123,8 @@ fn interpret_capture(c: &crate::tosys::Capture) {
     );
 
     println!();
-    if c.unique < MIN_UNIQUE_FOR_VERDICT {
-        println!("      -> INCONCLUSIVE. Only {} unique frame(s) in the window, so both", c.unique);
+    if blocked.unique < MIN_UNIQUE_FOR_VERDICT {
+        println!("      -> INCONCLUSIVE. Only {} unique frame(s) in the window, so both", blocked.unique);
         println!("         numbers measure how often the screen changed, not how fast either");
         println!("         path can capture. No verdict is drawn from this.");
         println!();
@@ -129,16 +136,19 @@ fn interpret_capture(c: &crate::tosys::Capture) {
 
     let ratio = unique_fps / dda.fps().max(0.001);
     if ratio >= 1.5 {
-        println!("      -> NvFBC produced {ratio:.1}x DDA's unique frames over the same window.");
+        println!("      -> NvFBC delivered {ratio:.1}x DDA's frames, blocking against blocking.");
         println!("         It is not refresh-capped, so it is not composition-bound, and");
-        println!("         CLAUDE.md's ~16.7ms DWM composition line is REAL.");
+        println!("         CLAUDE.md's ~16.7ms DWM composition line is REAL for this path.");
     } else {
-        println!("      -> NvFBC is within {ratio:.1}x of DDA, with both producing enough");
-        println!("         frames for that to mean something. Both look refresh-capped, so");
-        println!("         NvFBC does not escape composition here. CLAUDE.md's");
-        println!("         'only NvFBC/hooking avoids this' would need correcting.");
+        println!("      -> NvFBC delivered {ratio:.2}x DDA over the same window, with both");
+        println!("         producing enough frames for that to mean something. NvFBC ToSys");
+        println!("         does not beat DDA here.");
     }
-    println!("         Read this against the display's actual refresh rate before acting.");
+    println!();
+    println!("         Scope: this measures NVFBC_TO_SYS only, which copies every frame to");
+    println!("         system memory. It does NOT settle whether NvFBC escapes composition --");
+    println!("         NvFBCToDx9Vid and NvFBCToCuda keep the frame on the GPU and were not");
+    println!("         tested. Read against the display's real refresh rate before acting.");
 }
 
 fn report_nvfbc(attempt_enable: bool) {
@@ -240,12 +250,16 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
         // time; each attempt below likewise lives only as long as it is needed.
         if let Some((mut session, variant)) = crate::tosys::probe_variants(false, false) {
             println!("  SetUp accepted with: {}", variant.name().trim());
-            let argb = crate::tosys::run(&mut session, GRAB_COUNT);
-            crate::tosys::report("ARGB   8-bit", &argb);
-            captured = argb.grabs > 0;
+            // Polling first, which exposes the per-grab copy cost, then blocking,
+            // which is the only fair basis for a delivery-rate comparison.
+            let polled = crate::tosys::run(&mut session, GRAB_COUNT, false);
+            crate::tosys::report("ARGB poll  ", &polled);
+            let blocked = crate::tosys::run(&mut session, BLOCKING_COUNT, true);
+            crate::tosys::report("ARGB block ", &blocked);
+            captured = polled.grabs > 0;
             shape = Some(variant);
             if captured {
-                interpret_capture(&argb);
+                interpret_capture(&polled, &blocked);
             }
             // Dropped here, before the 10-bit session is asked for.
         } else {
@@ -259,7 +273,7 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
         && let Some(variant) = shape
         && let Some(mut session) = crate::tosys::open(variant, true, true)
     {
-        let hdr = crate::tosys::run(&mut session, GRAB_COUNT);
+        let hdr = crate::tosys::run(&mut session, GRAB_COUNT, false);
         crate::tosys::report("ARGB10 + HDR", &hdr);
         if hdr.is_hdr {
             println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");

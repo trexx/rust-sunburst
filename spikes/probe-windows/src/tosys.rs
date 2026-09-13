@@ -62,11 +62,16 @@ const NVFBC_TOSYS_ARGB10: u32 = 6;
 /// `NVFBCToSysGrabMode::NVFBC_TOSYS_SOURCEMODE_FULL`.
 const NVFBC_TOSYS_SOURCEMODE_FULL: u32 = 0;
 
-/// `NVFBC_TOSYS_GRAB_FLAGS::NVFBC_TOSYS_NOWAIT`.
-///
-/// Without this the grab blocks until the desktop changes, which would measure
-/// how often the desktop changes rather than what capture costs.
+/// `NVFBC_TOSYS_GRAB_FLAGS::NVFBC_TOSYS_NOWAIT`. Returns whatever is there,
+/// new or not, which is what exposes the unconditional copy cost.
 const NVFBC_TOSYS_NOWAIT: u32 = 0x1;
+
+/// `NVFBC_TOSYS_NOFLAGS`: wait for a genuinely new frame.
+///
+/// Needed for a fair rate comparison. Polling with NOWAIT re-copies stale frames
+/// at full cost, so it measures how often we asked, not how fast NvFBC can
+/// deliver — the first comparison against DDA was depressed by exactly that.
+const NVFBC_TOSYS_NOFLAGS: u32 = 0x0;
 
 /// `bHDRRequest`, bit 3 of the setup params bitfield — after `bWithHWCursor`,
 /// `bDiffMap` and `bEnableSeparateCursorCapture`.
@@ -359,10 +364,14 @@ impl ToSys {
         unsafe { f(self.object, &mut params) }
     }
 
-    fn grab(&self, info: &mut FrameGrabInfo) -> i32 {
+    fn grab(&self, info: &mut FrameGrabInfo, blocking: bool) -> i32 {
         let mut params = GrabParams {
             version: nvfbc::struct_version(GRAB_SIZE, 1),
-            flags: NVFBC_TOSYS_NOWAIT,
+            flags: if blocking {
+                NVFBC_TOSYS_NOFLAGS
+            } else {
+                NVFBC_TOSYS_NOWAIT
+            },
             grab_mode: NVFBC_TOSYS_SOURCEMODE_FULL,
             grab_info: info,
             ..Default::default()
@@ -515,6 +524,7 @@ pub fn open(variant: Variant, ten_bit: bool, hdr: bool) -> Option<ToSys> {
 
 /// One capture run's results.
 pub struct Capture {
+    pub blocking: bool,
     pub setup_result: i32,
     pub grabs: u32,
     pub failures: u32,
@@ -563,8 +573,12 @@ fn sample_hash(buffer: *const u8, len: usize) -> u64 {
 }
 
 /// Grab `count` frames from an already-set-up session, timing each grab.
-pub fn run(session: &mut ToSys, count: u32) -> Capture {
+///
+/// `blocking` waits for a new frame each time, which measures the delivery rate.
+/// Polling instead measures the cost of asking.
+pub fn run(session: &mut ToSys, count: u32, blocking: bool) -> Capture {
     let mut result = Capture {
+        blocking,
         setup_result: 0,
         grabs: 0,
         failures: 0,
@@ -589,7 +603,7 @@ pub fn run(session: &mut ToSys, count: u32) -> Capture {
     for _ in 0..count {
         let mut info = FrameGrabInfo::default();
         let before = clock::now();
-        let status = session.grab(&mut info);
+        let status = session.grab(&mut info, blocking);
         let after = clock::now();
 
         if status != 0 {
@@ -648,14 +662,18 @@ pub fn report(label: &str, capture: &Capture) {
         capture.p50_ns as f64 / 1e6,
         capture.p99_ns as f64 / 1e6,
     );
-    if capture.blocking_grabs > 0 {
+    // Only remarkable when NOWAIT was asked for; in blocking mode a blocked grab
+    // is the point.
+    if capture.blocking_grabs > 0 && !capture.blocking {
         println!(
             "      dwWaitModeUsed non-zero on {} of {} grabs, despite NOWAIT.",
             capture.blocking_grabs, capture.grabs
         );
         println!("      Treat with suspicion: this field arrived in a struct generation");
         println!("      newer than the setup params this driver accepts, so it may not be");
-        println!("      populated the way the 7.1 header describes.");
+        println!("      populated the way the 7.1 header describes. NOWAIT does take effect");
+        println!("      -- most grabs return a repeat frame -- so the field, not the flag,");
+        println!("      is what looks wrong.");
     }
     if capture.driver_errors > 0 {
         println!(
