@@ -33,4 +33,13 @@ windows = { version = "0.62", features = [
     "Graphics_DirectX_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_System_WinRT_Direct3D11",
+
+    # The pad spike: HIDMaestro's shared-memory sections, and reading HID input
+    # reports to time a forwarded device against a directly-connected one.
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
 ] }

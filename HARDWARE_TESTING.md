@@ -710,12 +710,101 @@ defensible against 4ms.
 
 ---
 
+## 8. Phase 2's pad path — two candidates (env S)
+
+Phase 2's acceptance needs a gamepad in a real game, and the roadmap's
+`vigem-client` line predates some news: **ViGEmBus was retired and archived on
+2 November 2023** after a trademark conflict with ViGEM GmbH. It still works and
+still ships EV-signed, and a frozen ABI is the easiest thing to hand-write a
+binding against — but it is worth knowing what else exists before committing.
+
+### What was surveyed
+
+| Option | Finding |
+|---|---|
+| **ViGEmBus** | Archived Nov 2023, BSD-3, 4.2k stars, EV-signed, works. The fallback: ~6 ioctls, ABI frozen by abandonment. X360 target caps motion/trigger-rumble/battery; its **DS4 target** (`IOCTL_DS4_SUBMIT_REPORT`, `0x2AA80C`) carries gyro if that ceiling ever matters. |
+| **HIDMaestro** | MIT, active, created **2026-04-10**. Reaches DirectInput, XInput, SDL3 **and WGI/GameInput**, byte-exact VID/PID. **User mode, self-signed cert, no EV, no test-signing.** |
+| **USB/IP** (`usbip-win2`) | **Attestation signed** — installs normally. Active: releases Apr/Jul/Sep 2026. v0.9.8.0 added WSK event callbacks aimed at *"devices that generate small amounts of data but at a high frequency, such as HID keyboard/mouse"*. Use **≥ 0.9.8.0**; 0.9.7.8 shipped a memory-corruption BSOD. |
+| `libvirtualhid` | **Ruled out on licence.** Its Windows driver, broker and generated MSI are under the "LizardByte Source-Available License 1.0", which opens *"This License is not an open source license"* and whose §3(b) forbids distribution "by any means… commercial, non-commercial, educational, individual, charitable, internal, public, private, or otherwise". Sunburst is GPL-2.0-or-later in a public repo, so vendoring is distribution and distribution is prohibited. The MIT half does not help: on Windows the driver *is* the functionality. |
+| WinUHid | MIT, from Moonlight's author, but **dormant since 2025-05-28** and framework-level — you supply the HID descriptor, so generic HID rather than XUSB. |
+| `inputtino` | Linux `uhid`. Not applicable to a Windows server. |
+
+> **A correction recorded deliberately.** USB/IP was first written off here because
+> the Windows client was said to require Test Signing Mode. **That was wrong** —
+> it has been attestation signed since v0.9.7.7 (2026-04-21). The claim came from
+> a search summary citing an old issue rather than from the project's own
+> releases, and it was then used to argue against an explicit instruction to
+> evaluate USB/IP first. Kept visible because the failure was the method, not the
+> conclusion: release notes were available and were not read.
+
+### Investigation A — USB/IP
+
+The prize is Phase 8: forward `045e:02e6` and let Windows' own driver own the
+adapter, deleting ~6,500 lines of vendored MT7612U radio and ~450 of GIP, and
+lifting the X360 ceiling. The cost is TCP where an interrupt transfer becomes a
+round trip.
+
+**The decisive unknown is Android, not Windows.** A USB/IP *server* normally needs
+the `usbip-host` kernel module and root; stock Android TV has neither, so an
+unrooted client would mean implementing the USB/IP server protocol over
+`UsbDeviceConnection` ourselves. So test the Windows half first, with the **Linux
+dev machine standing in as the server** — no Android code written until the
+numbers justify it.
+
+- [ ] **Attach gate.** `usbipd` on Linux (`sudo dnf install usbip`, plus
+      `kernel-modules-extra` if `usbip_host` is missing — it is not present on the
+      dev box now), `usbip attach` from Windows, device enumerates as itself.
+- [ ] **`probe-windows --hidreport` direct, then forwarded.** Same device, same
+      handling. **p50 is the device's poll interval; the tail is what the link
+      adds.** If p50 itself moves, the transport is rate-limiting rather than
+      jittering, which is a different and worse problem.
+- [ ] **Only then** scope the Android userspace server.
+
+### Investigation B — HIDMaestro from Rust
+
+Feeding reports is easy; **creating the device is not** — `Internal/` is ~600KB of
+C#, `DeviceOrchestrator.cs` alone 147KB, and `docs/INTERNALS.md` describes
+`SwDeviceCreate` with non-sentinel ContainerIDs, an `UpperFilters = "xinputhid"`
+registry tripwire found by **Ghidra-decompiling `Windows.Gaming.Input.dll`**, a
+slot-1-skip workaround from decompiling `xinput1_4.dll`, `BTHLEDEVICE` spoofing
+and per-profile driver generation. So the only viable shape is **their C# owning
+lifecycle, Rust writing reports** — and both directions turn out to be shared
+memory, so no .NET on the hot path.
+
+- [ ] **Install gate.** Self-signed cert, **no test-signing, no EV**. The entire
+      attraction rests on this.
+- [ ] **Pad visible** in `joy.cpl` first — absent there means absent from games —
+      then XInput, then a real game.
+- [ ] **`probe-windows --hidmaestro` with `joy.cpl` open.** Create a pad with
+      HIDMaestro's own tooling first. The probe writes 40 frames over 4 seconds,
+      sticks to each extreme in turn, one button per phase — a wrong byte order
+      shows as the wrong axis moving rather than as a subtly wrong value. **This
+      is the question the spike exists for.**
+- [ ] **Rumble.** Trigger vibration in a game while the probe runs; it reads the
+      64-slot output ring. The layout says rumble is reachable without their C#
+      event — confirm rather than assume.
+- [ ] **Lifetime.** Does the pad survive the creating process exiting? That is
+      "run a helper at startup" versus "ship and supervise a .NET service".
+
+### What each outcome means
+
+- **Both work** → USB/IP owns the adapter natively (Phase 8 sheds ~6,950 lines,
+  the ceiling lifts); HIDMaestro covers phone and Bluetooth pads, where a lower
+  fidelity bar is fine.
+- **HIDMaestro only** → it becomes the pad path; Phase 8's radio work stands.
+- **USB/IP only** → adapter native, virtual pad falls back to ViGEmBus.
+- **Neither** → ViGEmBus, the fallback all along.
+
+---
+
 ## Hardware still needed
 
 | Needed for | Hardware |
 |---|---|
 | §1's NvFBC row | The 4070 box; `--enable-nvfbc` needs elevation |
 | §7 latency | The 4070 box, screen left alone while it runs |
+| §8 HIDMaestro | HIDMaestro installed and its cert trusted; a pad created |
+| §8 USB/IP | `usbip-win2` ≥ 0.9.8.0 on the box, `usbip` here, a USB device to forward |
 | §2 | Both Android boxes, adb reachable |
 | §4 client rows | Phase 5 client, so not yet |
 | Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads |

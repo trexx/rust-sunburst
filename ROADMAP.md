@@ -112,7 +112,12 @@ that out now is much cheaper than finding it out in Phase 5.
 - UDP socket, single port.
 - Authenticated input/control packets: keyed MAC + sequence number, replay rejection.
 - Minimal reliable channel (seq + ack + retransmit, ~150 lines) for control messages.
-- ViGEmBus gamepad via `vigem-client`. Rumble callback → forward to client.
+- Gamepad: **driver choice is being spiked, not assumed.** The `vigem-client`
+  line here predates ViGEmBus's retirement (archived 2 November 2023, trademark
+  conflict). Two candidates are under measurement — HIDMaestro, and USB/IP for
+  the adapter case — with ViGEmBus as the fallback. See `HARDWARE_TESTING.md` §8;
+  `libvirtualhid` is ruled out on licence and `inputtino`/WinUHid do not apply.
+  Rumble callback → forward to client, whichever driver wins.
 - Keyboard via scancode `SendInput` (see CLAUDE.md traps).
 - Mouse: absolute mode (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`,
   normalised 0–65535) and relative mode. Wheel + horizontal wheel + XBUTTON1/2.
@@ -133,8 +138,14 @@ machine; ViGEm and `SendInput` are testable on none of it.
 
 1. **Control channel and transport** *(done)* — control-message payloads, the
    reliable layer, the UDP endpoint, and the fake client.
-2. **Input injection** — ViGEm, scancode `SendInput`, mouse modes, desktop
-   re-attach. Attaches at the `on_input` seam in `sunburst_net::ControlHandler`.
+2. **Input injection** — scancode `SendInput`, mouse modes, desktop re-attach
+   *(done)*. Attaches at the `on_input` seam in `sunburst_net::ControlHandler`.
+3. **Gamepad and rumble** — still open, and now gated on the driver spike in
+   `HARDWARE_TESTING.md` §8. `inject.rs` drops `InputEvent::Gamepad` today, and
+   `rumble.rs` defines `Rumble`/`RumbleTracker` that nothing references. Rumble
+   also needs an outbound seam on `Endpoint` that does not exist — and should be
+   designed for Phase 3's four reserved server→client messages too, not for
+   rumble alone.
 
 **Acceptance:** gamepad, keyboard and mouse all work in a real Steam game launched
 from Big Picture. Input survives a UAC prompt and a lock/unlock cycle. Steam Input
@@ -290,7 +301,16 @@ about 450.
 
 **Scope is set by what survives the ViGEm X360 boundary:** four pads, buttons,
 sticks, triggers, rumble. Motion, trigger rumble and battery-to-host are out —
-XInput has nowhere to put them. Battery can still be shown client-side. Pad
+XInput has nowhere to put them.
+
+**That boundary may not have to exist.** Two routes past it are being measured in
+`HARDWARE_TESTING.md` §8. **USB/IP** would forward the adapter to Windows and let
+its own driver own it, deleting the radio and GIP work below entirely and lifting
+the ceiling — `usbip-win2` is attestation signed and actively tuned for HID
+latency, and the open question is whether an unrooted Android app can serve
+USB/IP from a `UsbDeviceConnection` fd. **HIDMaestro** reaches WGI/GameInput with
+byte-exact device identity, which lifts the ceiling without touching the radio
+work. Do not start the 6,950 lines below until §8 has reported. Battery can still be shown client-side. Pad
 headphone audio depends on Phase 6 and is a separate decision.
 
 **Acceptance:** four pads pair and play simultaneously through Big Picture.

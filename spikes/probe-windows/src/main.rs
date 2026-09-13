@@ -19,6 +19,9 @@
 //! probe-windows --latency        # present -> capture, DDA vs WGC vs NvFBC
 //! probe-windows --tosys          # also the sysmem path, which copies every frame
 //! probe-windows --enable-nvfbc   # NvFBC_Enable: needs elevation, resets the driver
+//! probe-windows --hidmaestro     # can Rust drive HIDMaestro's shared memory?
+//! probe-windows --hidreport      # list HID devices
+//! probe-windows --hidreport 045e:02e6   # time one device's report intervals
 //! ```
 //!
 //! `--latency` is the one that prices CLAUDE.md's DWM composition line. It opens
@@ -35,6 +38,10 @@ mod capture;
 mod cuda;
 #[cfg(windows)]
 mod dda;
+#[cfg(windows)]
+mod hidmaestro;
+#[cfg(windows)]
+mod hidreport;
 #[cfg(windows)]
 mod latency;
 #[cfg(windows)]
@@ -64,6 +71,14 @@ fn main() -> std::process::ExitCode {
     let attempt_enable = std::env::args().any(|a| a == "--enable-nvfbc");
     if std::env::args().any(|a| a == "--latency") {
         latency::run();
+        return std::process::ExitCode::SUCCESS;
+    }
+    if std::env::args().any(|a| a == "--hidmaestro") {
+        hidmaestro::run();
+        return std::process::ExitCode::SUCCESS;
+    }
+    if std::env::args().any(|a| a == "--hidreport") {
+        hidreport::run();
         return std::process::ExitCode::SUCCESS;
     }
     probe::run(attempt_enable)
