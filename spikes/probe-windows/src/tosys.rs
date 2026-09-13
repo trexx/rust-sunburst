@@ -333,6 +333,20 @@ impl ToSys {
                         NVFBC_TOSYS_ARGB
                     };
                     (*v2).pp_buffer = &raw mut self.buffer;
+                    if hdr {
+                        // Rebuilding `params` above dropped the flag set before
+                        // the match, which is why the first HDR run reported
+                        // "bIsHDR clear" -- it had never asked.
+                        //
+                        // Bit 3 is INFERRED, not read. It is bHDRRequest in the
+                        // V3 struct this driver rejects; in the 5.0-era V2 it is
+                        // still inside bReservedBits. SDK 6.0 added HDR while V2
+                        // was current, so it most likely took this bit, but that
+                        // header is not on hand. A wrong guess sets a reserved
+                        // bit, which is why the result is reported rather than
+                        // trusted.
+                        (*v2).flags |= SETUP_FLAG_HDR_REQUEST;
+                    }
                 }
             }
         }
@@ -636,9 +650,12 @@ pub fn report(label: &str, capture: &Capture) {
     );
     if capture.blocking_grabs > 0 {
         println!(
-            "      {} of {} grabs actually blocked despite NOWAIT (dwWaitModeUsed)",
+            "      dwWaitModeUsed non-zero on {} of {} grabs, despite NOWAIT.",
             capture.blocking_grabs, capture.grabs
         );
+        println!("      Treat with suspicion: this field arrived in a struct generation");
+        println!("      newer than the setup params this driver accepts, so it may not be");
+        println!("      populated the way the 7.1 header describes.");
     }
     if capture.driver_errors > 0 {
         println!(

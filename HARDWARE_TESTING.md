@@ -107,22 +107,58 @@ never reachable with one encoder either way.
       `bSupportConfigurableDiffMap`, with `bSupportImageClassification` new at
       bit 5. Same struct size, so nothing errored; it simply printed a real bit
       under a stale name.
-- [ ] **Capture throughput vs DDA — the measurement that matters, not yet run.**
-      The probe now drives `INvFBCToSys_v4` properly and reports unique frames/sec
-      against a DDA control over the same wall-clock window.
+- [x] **Capture works, via the V2 setup struct — not the V3 the headers describe.**
+      Setup with `NVFBC_TOSYS_SETUP_PARAMS_V3` returns `ERROR_INVALID_PTR` every
+      time; the 0x50-era **V2** layout is accepted and captures 3840×2160 with no
+      failed grabs.
 
-      This is what settles CLAUDE.md's **~16.7ms DWM composition** line, the
-      largest in the latency budget and currently an *assumption*. Clearly above
-      DDA means NvFBC is not composition-bound and the line is real; level with
-      DDA means it is wrong and comes out — which also removes the main argument
-      for the Phase 7 swapchain hook.
+      Both structs are **504 bytes**, so the size check in the version word
+      passes either way and only the version nibble and field order differ — the
+      driver reads `ppBuffer` from offset 16, not 24. That is why the failure was
+      `INVALID_PTR` rather than a version error, and why it survived four rounds
+      of inspection: the parameters matched NVIDIA's own sample field for field,
+      and the layout was confirmed against the MSVC ABI with clang. Both were
+      right; the *generation* was wrong.
 
-      **Run it with something animating on screen.** On a static desktop both
-      paths produce almost no unique frames and the result says nothing; the
-      probe detects that case and tells you so rather than printing a number.
-- [ ] **10-bit and HDR capture.** `NVFBC_TOSYS_ARGB10` (= 6) with `bHDRRequest`,
-      checking `NvFBCFrameGrabInfo::bIsHDR`. **Turn Windows HDR on first**, or a
-      clear `bIsHDR` means "not in HDR mode", not "cannot do HDR".
+      The vtable dump settled the other half — all five slots resolve inside
+      `NvFBC64.dll`, so the call was reaching NvFBC and the driver really was
+      refusing. Worth keeping: the driver reports `0x70` from `GetSDKVersion`
+      while rejecting that generation's setup struct, so **the reported version
+      does not tell you which struct generation to send.**
+- [ ] **Capture throughput vs DDA — ran, and came back INCONCLUSIVE.**
+      First attempt: NvFBC 2.4 unique frames/sec, DDA 2.4 new frames/sec. Those
+      are equal, and they are equal because **the desktop was idle** — two unique
+      frames in the whole window. Both numbers measure how often the screen
+      changed, not how fast either path can capture.
+
+      The probe printed a confident verdict off that anyway, because its
+      static-desktop guard only triggered at ≤1 unique frame. The guard is now 20
+      and it reports inconclusive instead. **CLAUDE.md's ~16.7ms DWM line stands
+      as written — neither confirmed nor refuted.**
+
+      **Re-run with something animating full-screen**, a video or a game in Big
+      Picture. That is the whole experiment; an idle desktop cannot answer it.
+- [x] **ToSys costs ~4ms per grab at 4K, idle or not.** p50 4.08ms, p99 4.77ms
+      with nothing moving on screen, which is the **sysmem readback** — ToSys
+      copies whether or not the frame is new.
+
+      That is a large fraction of the frame budget spent moving pixels *off* the
+      GPU, and this pipeline then needs them back on it for the scRGB→P010 shader
+      and NVENC. It is an argument against `NVFBC_TO_SYS` specifically, separate
+      from and unaffected by how the composition question lands: if NvFBC is ever
+      pursued, `NvFBCToDx9Vid` or `NvFBCToCuda` are the interfaces to measure,
+      since both hand back something already on the GPU.
+- [ ] **10-bit and HDR capture — first attempt did not actually ask.**
+      `ARGB10` captured fine, but `bIsHDR` came back clear because the V2 code
+      path rebuilt the setup params and dropped the HDR request flag on the way.
+      That result meant nothing and has been discarded.
+
+      Two cautions for the re-run. **Turn Windows HDR on first**, or a clear
+      `bIsHDR` still only means "not in HDR mode". And `bHDRRequest`'s bit
+      position in the **V2** struct is *inferred*, not read — it is bit 3 in V3,
+      which this driver rejects, and the SDK 6.0 header that would confirm it for
+      V2 is not on hand. `bIsHDR` sits in the same newer generation, so a clear
+      result may mean the bit was never asked for rather than refused.
 
       Note the format is **A2B10G10R10** — a 10-bit integer buffer, *not* the
       scRGB linear FP16 the HDR notes in CLAUDE.md assume. If this path were ever

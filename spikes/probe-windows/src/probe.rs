@@ -64,8 +64,18 @@ fn describe_adapter() -> Result<String, String> {
     ))
 }
 
-/// Enough grabs for a stable p99 without making the probe slow.
-const GRAB_COUNT: u32 = 200;
+/// Enough grabs for a stable p99 without making the probe slow. At the ~4ms a
+/// 4K sysmem readback costs, this is a window of roughly two seconds.
+const GRAB_COUNT: u32 = 500;
+
+/// Unique frames below which the throughput comparison means nothing.
+///
+/// A 60Hz desktop with something moving on it produces tens of unique frames in
+/// the window above. Two means the desktop sat still, and both capture paths
+/// then report how often the screen changed rather than how fast they can go.
+/// The first run printed a confident verdict off two frames; this is the guard
+/// that should have stopped it.
+const MIN_UNIQUE_FOR_VERDICT: usize = 20;
 
 /// The question the capture run exists to answer.
 ///
@@ -80,6 +90,14 @@ fn interpret_capture(c: &crate::tosys::Capture) {
         "      -> {unique_fps:.1} unique frames/sec at {:.1} grabs/sec.",
         c.fps()
     );
+
+    // True regardless of how the comparison lands, and it is a cost the
+    // pipeline would pay on every frame.
+    println!(
+        "      Each grab cost {:.2}ms at p50 even with the desktop idle, which is the",
+        c.p50_ns as f64 / 1e6
+    );
+    println!("      sysmem readback itself -- ToSys copies whether or not the frame is new.");
 
     println!();
     println!("  DDA over the same window, as the control:");
@@ -97,25 +115,28 @@ fn interpret_capture(c: &crate::tosys::Capture) {
         dda.attempts
     );
 
-    if c.unique <= 1 {
+    println!();
+    if c.unique < MIN_UNIQUE_FOR_VERDICT {
+        println!("      -> INCONCLUSIVE. Only {} unique frame(s) in the window, so both", c.unique);
+        println!("         numbers measure how often the screen changed, not how fast either");
+        println!("         path can capture. No verdict is drawn from this.");
         println!();
-        println!("      -> Only {} unique NvFBC frame(s). The desktop was static, so neither", c.unique);
-        println!("         number is a throughput result. Re-run with something animating");
-        println!("         on screen -- a video, or Big Picture moving -- or this says nothing.");
+        println!("         Re-run with something animating full-screen -- a video, or a game");
+        println!("         in Big Picture. Until then CLAUDE.md's ~16.7ms DWM line stands as");
+        println!("         written, neither confirmed nor refuted.");
         return;
     }
 
-    println!();
     let ratio = unique_fps / dda.fps().max(0.001);
     if ratio >= 1.5 {
         println!("      -> NvFBC produced {ratio:.1}x DDA's unique frames over the same window.");
         println!("         It is not refresh-capped, so it is not composition-bound, and");
         println!("         CLAUDE.md's ~16.7ms DWM composition line is REAL.");
     } else {
-        println!("      -> NvFBC is within {ratio:.1}x of DDA. Both look refresh-capped, so");
-        println!("         NvFBC does NOT escape composition on this setup. CLAUDE.md's");
-        println!("         'only NvFBC/hooking avoids this' should be corrected, which also");
-        println!("         removes the main argument for the Phase 7 swapchain hook.");
+        println!("      -> NvFBC is within {ratio:.1}x of DDA, with both producing enough");
+        println!("         frames for that to mean something. Both look refresh-capped, so");
+        println!("         NvFBC does not escape composition here. CLAUDE.md's");
+        println!("         'only NvFBC/hooking avoids this' would need correcting.");
     }
     println!("         Read this against the display's actual refresh rate before acting.");
 }
