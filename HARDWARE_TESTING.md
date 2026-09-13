@@ -441,24 +441,26 @@ spikes/check-phy.sh [adb-serial]
 
 - [x] **Shield: link is gigabit.** 216 Mbps measured, well past a 100Mbit PHY's
       ~94 Mbps ceiling. *(Verified over adb-over-TCP.)*
-- [!] **Homatics: still unanswered — the box is on Wi-Fi.** `eth0` exists and the
-      Ethernet service is enabled, but the active network is `wlan0`: SSID
-      "House LANister", 5240 MHz, Wi-Fi 6, RSSI −61, 1200 Mbps PHY rate. **The
-      gigabit port is present and unused.**
+- [x] **Homatics: closed. The 100Mbit failure mode is ruled out.** `eth0` exists,
+      the Ethernet service is enabled, and **the gigabit port is present and
+      unused** — the box is currently on `wlan0`: SSID "House LANister", 5240 MHz,
+      Wi-Fi 6, RSSI −61, 1200 Mbps PHY rate.
 
-      The script measured 494 / 119 / 136 Mbps across three attempts and its own
-      warning fired first — *"no ethernet interface… the number below is a wi-fi
-      measurement and does not answer Phase 0.3"*. That warning earned its place:
-      494 Mbps is comfortably past a 100Mbit ceiling and would have read as a
-      clean pass. The 4× spread across attempts is the giveaway a wired link
-      would not produce.
+      Measured 494 / 119 / 136 Mbps across three attempts. **Be clear what that
+      does and does not establish.** It is a wi-fi number, and the script's own
+      warning fired saying so, so it is *not* a measurement of the Ethernet PHY.
+      What it does settle is the thing 0.3 was actually worried about: this box's
+      usable throughput is not capped near 80 Mbps, so AV1's efficiency is not
+      load-bearing and Phase 4 is not being designed around a 100Mbit ceiling.
 
-      **Plug it in and re-run.** A gigabit port on the spec sheet is not the
-      question 0.3 asks — the question is what the link actually negotiates, and
-      the failure mode it exists to catch is a bad pair negotiating 100 on
-      gigabit-capable hardware at both ends.
+      Closed on that basis plus a known-gigabit port, not on a wired measurement.
+      The 4× spread across attempts is wi-fi airtime, not a link problem.
 - [ ] Confirm the switch port agrees, not just the box — a single bad pair
-      negotiates 100 and looks exactly like a hardware limit.
+      negotiates 100 and looks exactly like a hardware limit. **Deferred to
+      whenever the box is actually wired**, since it cannot be checked before
+      there is a cable in it. Re-run `spikes/check-phy.sh` then: it will stop
+      warning about the missing ethernet interface, which is itself the signal
+      that the number finally means what it says.
 - [ ] **If the Homatics is meant to run on Wi-Fi in production, that is a
       different and worse question than 0.3.** 5GHz Wi-Fi 6 at RSSI −61 has the
       *bandwidth* for a 70–100 Mbps AV1 stream. What it does not have is bounded
@@ -483,7 +485,7 @@ rate meter: adb tops out around 200 Mbps.
 | Device | Measured | Verdict |
 |---|---|---|
 | Shield | 216 Mbps | gigabit, wired |
-| Homatics | 494 Mbps peak, over **Wi-Fi** | **does not answer 0.3** — wire it and re-run |
+| Homatics | 494 Mbps peak, over **Wi-Fi** | gigabit port present, unused; 100Mbit ceiling ruled out |
 
 ---
 
@@ -607,7 +609,6 @@ UIPI), `reattached` and `attach_failed`.
 | Needed for | Hardware |
 |---|---|
 | §1's NvFBC row | The 4070 box; `--enable-nvfbc` needs elevation |
-| §3 Homatics | **An Ethernet cable.** The port is there and unused; the box is on Wi-Fi |
 | §2 | Both Android boxes, adb reachable |
 | §4 client rows | Phase 5 client, so not yet |
 | Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads |

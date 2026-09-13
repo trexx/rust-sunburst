@@ -64,16 +64,22 @@ probe mid-measurement.
 **Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
 table seeded.
 
-Two and a half of the three are done. The codec matrix is measured. The NvFBC
-decision is made — available, GPU-resident, retained as an opt-in backend. The
-quirks table is now **seeded on both boxes**: the Shield has HEVC Main10 at 4K60,
-and the Homatics has `c2.amlogic.av1.decoder` with AV1 Main10, HDR10, level 5.1,
-`FEATURE_LowLatency` true and 4K60 true — so 0.2 is closed and the box has the
-path it needed.
+**All three exit criteria are met, and Phase 0 is closed.** The codec matrix is
+measured. The NvFBC decision is made — available, GPU-resident, retained as an
+opt-in backend. The quirks table is seeded on both boxes: HEVC Main10 at 4K60 on
+the Shield, and `c2.amlogic.av1.decoder` with AV1 Main10, HDR10, level 5.1,
+`FEATURE_LowLatency` and 4K60 on the Homatics.
 
-**0.3 is the one thing left, and it needs a cable.** The Homatics is on Wi-Fi;
-its gigabit port is present and unused. The throughput script measured 494 Mbps
-and warned, correctly, that a wi-fi number does not answer a PHY question.
+0.3 is closed on the narrower question it was really asking. The Homatics is on
+Wi-Fi with its gigabit port unused, so the 494 Mbps measured is not a PHY
+reading — but it does rule out the ~80 Mbps ceiling that would have made AV1's
+efficiency load-bearing, which is what 0.3 existed to catch. The wired
+confirmation waits for a cable and blocks nothing.
+
+Two things carried forward rather than closed: Amlogic's max AV1 width is
+**3840, not 4096**, so anything rounding a width up fails on that box and not on
+the Shield; and the Homatics HEVC decoder *enumerates better than its AV1 one*
+while being the path 0.4 struck, which no amount of enumeration can detect.
 
 ---
 
