@@ -20,3 +20,18 @@
 
 # Instrumentation captures, which are per-run and per-machine
 /*.instr.json
+
+# Runtime state. Both the server store and the fake client default to paths
+# outside the tree ($APPDATA/sunburst, ~/.config/sunburst, $TMPDIR/sunburst-dev),
+# but both honour SUNBURST_CONFIG_DIR, and pointing that at the repo is a
+# plausible thing to do while developing. These files hold the admin token and
+# every client's pairing secret, so the cost of being wrong is not symmetric.
+clients.json
+config.json
+fakeclient.key
+
+# NVIDIA Capture SDK headers, read from outside the tree. They carry NVIDIA's
+# "Licensed Deliverables" notice and this repo is GPL-2.0-or-later; same
+# reasoning as the dongle firmware above. Values are transcribed, not vendored.
+/NVIDIA Capture SDK/
+/inc/NvFBC/
