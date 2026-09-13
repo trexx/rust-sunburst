@@ -219,16 +219,17 @@ pub struct Status {
 pub struct Create {
     pub result: i32,
     /// The `INvFBCToSys` instance, for [`crate::tosys`] to drive. Null on
-    /// failure.
+    /// failure, and nulled again once released.
     pub object: *mut c_void,
+    /// Whether this attempt produced an object, recorded at the time.
+    ///
+    /// Separate from `object` because detection releases what it creates —
+    /// **NvFBC hands out one session at a time**, so a detection session left
+    /// open makes every later create fail. The verdict still needs to know it
+    /// worked after the handle is gone.
+    pub succeeded: bool,
     pub max_width: u32,
     pub max_height: u32,
-}
-
-impl Create {
-    pub fn got_object(&self) -> bool {
-        !self.object.is_null()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -340,6 +341,7 @@ fn try_create(f: PfnCreateEx, keyed: bool) -> Create {
     Create {
         result,
         object: params.nvfbc,
+        succeeded: result == 0 && !params.nvfbc.is_null(),
         max_width: params.max_display_width,
         max_height: params.max_display_height,
     }
@@ -415,30 +417,59 @@ pub fn probe(attempt_enable: bool) -> Report {
     if let Some(p) = symbol(module, "NvFBC_CreateEx") {
         // SAFETY: signature transcribed from nvFBC.h.
         let f: PfnCreateEx = unsafe { cast_fn(p) };
-        let plain = try_create(f, false);
+        let mut plain = try_create(f, false);
         // Only reach for the key if it is actually needed. A plain success
         // means this card was never gated and the key is a red herring.
-        let needed = plain.result != 0 || !plain.got_object();
+        let needed = !plain.succeeded;
+        // Detection is done with it, and NvFBC only allows one session at a
+        // time — holding this open is what made every later create fail.
+        release(&mut plain);
         report.create_plain = Some(plain);
         if needed {
-            report.create_keyed = Some(try_create(f, true));
+            let mut keyed = try_create(f, true);
+            release(&mut keyed);
+            report.create_keyed = Some(keyed);
         }
     }
 
     report
 }
 
-/// Create one more keyed session, for a second capture configuration.
+/// Release a session, so the next create can succeed.
 ///
-/// `NvFBCToSysSetUp` configures a session once; a run at a different pixel
-/// format needs its own object rather than a second setup call on a live one.
-pub fn create_session() -> Option<Create> {
-    let module = CANDIDATES.into_iter().find_map(load)?;
-    let p = symbol(module, "NvFBC_CreateEx")?;
+/// NvFBC hands out one session at a time on this driver, so every created object
+/// has to be given back before another is asked for.
+fn release(created: &mut Create) {
+    if created.object.is_null() {
+        return;
+    }
+    // SAFETY: a live INvFBCToSys from NvFBC_CreateEx, released exactly once —
+    // the pointer is nulled below.
+    unsafe { crate::tosys::release(created.object) };
+    created.object = std::ptr::null_mut();
+}
+
+/// Create one keyed session for the caller to own and release.
+///
+/// Returns the attempt either way, so a failure can be reported with its actual
+/// result code rather than as a bare absence.
+pub fn create_session() -> Create {
+    let failed = || Create {
+        result: -1,
+        object: std::ptr::null_mut(),
+        succeeded: false,
+        max_width: 0,
+        max_height: 0,
+    };
+    let Some(module) = CANDIDATES.into_iter().find_map(load) else {
+        return failed();
+    };
+    let Some(p) = symbol(module, "NvFBC_CreateEx") else {
+        return failed();
+    };
     // SAFETY: signature transcribed from nvFBC.h.
     let f: PfnCreateEx = unsafe { cast_fn(p) };
-    let created = try_create(f, true);
-    (created.result == 0 && created.got_object()).then_some(created)
+    try_create(f, true)
 }
 
 /// `NVFBCRESULT` names, from `nvFBC.h`.

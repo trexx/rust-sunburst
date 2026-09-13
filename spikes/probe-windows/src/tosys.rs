@@ -373,6 +373,21 @@ impl Drop for ToSys {
     }
 }
 
+/// Release an `INvFBCToSys` without wrapping it.
+///
+/// # Safety
+///
+/// `object` must be a live instance from `NvFBC_CreateEx`, not owned by a
+/// [`ToSys`], and must not be used afterwards.
+pub(crate) unsafe fn release(object: *mut c_void) {
+    // SAFETY: slot 4 is NvFBCToSysRelease(), taking only the object.
+    unsafe {
+        let vtable = *(object as *const *const *const c_void);
+        let f: PfnRelease = nvfbc::cast_fn(*vtable.add(Slot::Release as usize));
+        f(object);
+    }
+}
+
 /// Report where each vtable slot actually points.
 ///
 /// If slot 0 is not inside `NvFBC64.dll`, the vtable read is wrong and every
@@ -421,26 +436,67 @@ pub fn report_vtable(session: &ToSys) {
     }
 }
 
-/// Try each setup shape until one is accepted, reporting every result.
+/// Try each setup shape, reporting every result, then hand back a fresh session
+/// configured with whichever was accepted.
+///
+/// Each attempt is created and released before the next: **NvFBC allows one
+/// session at a time**, so holding a winner open while testing the rest would
+/// make every later create fail — which is exactly what it did the first time
+/// this ran.
 pub fn probe_variants(ten_bit: bool, hdr: bool) -> Option<(ToSys, Variant)> {
-    let mut accepted = None;
+    let mut winner = None;
+    let mut dumped = false;
+
     for variant in Variant::ALL {
-        let Some(created) = nvfbc::create_session() else {
-            println!("    {}: no session to try it on", variant.name());
+        let created = nvfbc::create_session();
+        if !created.succeeded {
+            println!(
+                "    {}: no session -- CreateEx said {}",
+                variant.name(),
+                result_name(created.result)
+            );
             continue;
-        };
-        // SAFETY: a fresh live object from NvFBC_CreateEx, wrapped once.
+        }
+        // SAFETY: a fresh live object from NvFBC_CreateEx, wrapped once, and
+        // released when this binding drops at the end of the iteration.
         let mut session = unsafe { ToSys::new(created.object) };
-        if accepted.is_none() {
+        if !dumped {
             report_vtable(&session);
+            dumped = true;
         }
         let status = session.setup_with(variant, ten_bit, hdr);
         println!("    {}: {}", variant.name(), result_name(status));
-        if status == 0 && accepted.is_none() {
-            accepted = Some((session, variant));
+        if status == 0 && winner.is_none() {
+            winner = Some(variant);
         }
     }
-    accepted
+
+    // Only now, with every trial session released, take one for real.
+    let variant = winner?;
+    open(variant, ten_bit, hdr).map(|session| (session, variant))
+}
+
+/// Open one session in a known-good shape.
+///
+/// Any previously opened session must already be dropped — one at a time.
+pub fn open(variant: Variant, ten_bit: bool, hdr: bool) -> Option<ToSys> {
+    let created = nvfbc::create_session();
+    if !created.succeeded {
+        println!(
+            "    no session for {}: {}",
+            variant.name().trim(),
+            result_name(created.result)
+        );
+        return None;
+    }
+    // SAFETY: a fresh live object, wrapped once; the caller owns it.
+    let mut session = unsafe { ToSys::new(created.object) };
+    let status = session.setup_with(variant, ten_bit, hdr);
+    if status != 0 {
+        println!("    SetUp failed for that shape: {}", result_name(status));
+        return None;
+    }
+    Some(session)
 }
 
 /// One capture run's results.

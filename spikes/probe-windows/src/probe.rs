@@ -189,7 +189,7 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
             println!(
                 "  CreateEx    {label}: {} -- object {}, max {}x{}",
                 result_name(c.result),
-                c.got_object() as u8,
+                c.succeeded as u8,
                 c.max_width,
                 c.max_height,
             );
@@ -197,7 +197,7 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
     }
 
     let worked = |c: &Option<crate::nvfbc::Create>| {
-        c.as_ref().is_some_and(|c| c.result == 0 && c.got_object())
+        c.as_ref().is_some_and(|c| c.succeeded)
     };
     // Decide the verdict from the create results *before* anything consumes
     // them. An earlier version took them first and then tested the emptied
@@ -211,26 +211,33 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
         .is_some_and(|s| s.capture_possible);
 
     let mut captured = false;
+    let mut shape = None;
     if created_unkeyed || created_keyed {
         println!();
         println!("== NvFBC capture ==");
-        // Each variant needs its own session, so the sessions created during
-        // detection are not reused here; they are released on drop.
+        // Detection released its own sessions, because NvFBC hands out one at a
+        // time; each attempt below likewise lives only as long as it is needed.
         if let Some((mut session, variant)) = crate::tosys::probe_variants(false, false) {
             println!("  SetUp accepted with: {}", variant.name().trim());
             let argb = crate::tosys::run(&mut session, GRAB_COUNT);
             crate::tosys::report("ARGB   8-bit", &argb);
             captured = argb.grabs > 0;
+            shape = Some(variant);
             if captured {
                 interpret_capture(&argb);
             }
+            // Dropped here, before the 10-bit session is asked for.
         } else {
             println!("  No setup shape was accepted. The capture question stays open;");
             println!("  the vtable dump above says whether the calls even reached NvFBC.");
         }
     }
 
-    if captured && let Some((mut session, _)) = crate::tosys::probe_variants(true, true) {
+    // Reuse the shape already known to work rather than re-running the matrix.
+    if captured
+        && let Some(variant) = shape
+        && let Some(mut session) = crate::tosys::open(variant, true, true)
+    {
         let hdr = crate::tosys::run(&mut session, GRAB_COUNT);
         crate::tosys::report("ARGB10 + HDR", &hdr);
         if hdr.is_hdr {
