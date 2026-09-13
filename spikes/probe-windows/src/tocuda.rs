@@ -136,6 +136,9 @@ type PfnRelease = unsafe extern "system" fn(*mut c_void) -> i32;
 pub struct ToCuda<'a> {
     object: *mut c_void,
     cuda: &'a Cuda,
+    /// NvFBC's context, adopted rather than owned — recorded so it is obvious
+    /// at the drop site that this is not ours to destroy.
+    #[expect(dead_code, reason = "documents ownership; see Drop")]
     context: CuContext,
     buffer: CuDevicePtr,
 }
@@ -222,7 +225,23 @@ impl<'a> ToCuda<'a> {
 }
 
 impl Drop for ToCuda<'_> {
+    /// Teardown order is not a style choice.
+    ///
+    /// The SDK's own sample frees the device buffer **before** releasing the
+    /// session, and its comment says so explicitly. Getting it backwards frees
+    /// an allocation in a context the session may already have torn down.
+    ///
+    /// And the context is **not destroyed here at all**. NvFBC created it,
+    /// because neither `pDevice` nor `cudaCtx` was passed to `CreateEx`; the
+    /// sample only calls `cuCtxDestroy` on the D3D9 branch, where the caller
+    /// made the context itself. Destroying someone else's is what killed the
+    /// first run of this probe — it took the process out after the blocking
+    /// grabs, before the DDA control could run.
     fn drop(&mut self) {
+        if self.buffer != 0 {
+            self.cuda.mem_free(self.buffer);
+            self.buffer = 0;
+        }
         if !self.object.is_null() {
             // SAFETY: slot 5 is NvFBCCudaRelease(), taking only the object.
             let f: PfnRelease = unsafe { self.slot(Slot::Release) };
@@ -230,15 +249,7 @@ impl Drop for ToCuda<'_> {
             unsafe { f(self.object) };
             self.object = std::ptr::null_mut();
         }
-        // After the session, never before: NvFBC is writing into it until then.
-        if self.buffer != 0 {
-            self.cuda.mem_free(self.buffer);
-            self.buffer = 0;
-        }
-        if !self.context.is_null() {
-            self.cuda.ctx_destroy(self.context);
-            self.context = std::ptr::null_mut();
-        }
+        // self.context is deliberately left alone; it is NvFBC's.
     }
 }
 
@@ -300,6 +311,7 @@ pub fn open(cuda: &Cuda, ten_bit: bool, hdr: bool) -> Option<ToCuda<'_>> {
 pub fn run(session: &mut ToCuda, count: u32, blocking: bool) -> Capture {
     let mut result = Capture {
         blocking,
+        overhead_ns: 0,
         setup_result: 0,
         grabs: 0,
         failures: 0,
@@ -349,6 +361,7 @@ pub fn run(session: &mut ToCuda, count: u32, blocking: bool) -> Capture {
     }
 
     result.elapsed_ns = clock::ticks_to_ns(clock::now() - started);
+    result.overhead_ns = result.elapsed_ns.saturating_sub(per_grab.iter().sum::<u64>());
 
     per_grab.sort_unstable();
     if !per_grab.is_empty() {

@@ -488,6 +488,7 @@ pub fn open(variant: Variant, ten_bit: bool, hdr: bool) -> Option<ToSys> {
 pub fn run(session: &mut ToSys, count: u32, blocking: bool) -> Capture {
     let mut result = Capture {
         blocking,
+        overhead_ns: 0,
         setup_result: 0,
         grabs: 0,
         failures: 0,
@@ -538,6 +539,7 @@ pub fn run(session: &mut ToSys, count: u32, blocking: bool) -> Capture {
     }
 
     result.elapsed_ns = clock::ticks_to_ns(clock::now() - started);
+    result.overhead_ns = result.elapsed_ns.saturating_sub(per_grab.iter().sum::<u64>());
 
     per_grab.sort_unstable();
     if !per_grab.is_empty() {

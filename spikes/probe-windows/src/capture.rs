@@ -54,6 +54,11 @@ impl FrameGrabInfo {
 /// One capture run's results.
 pub struct Capture {
     pub blocking: bool,
+    /// Wall clock spent outside the grabs themselves — the uniqueness check,
+    /// mostly. Reported rather than hidden: for ToCuda's polling run it is a
+    /// large fraction, because a sub-millisecond grab sits next to a
+    /// device-to-host copy that is not free.
+    pub overhead_ns: u64,
     pub setup_result: i32,
     pub grabs: u32,
     pub failures: u32,
@@ -114,6 +119,11 @@ pub fn report(label: &str, capture: &Capture) {
         "  {label}: {}x{}, {} grabs ({} failed)",
         capture.width, capture.height, capture.grabs, capture.failures
     );
+    let overhead_pct = if capture.elapsed_ns > 0 {
+        capture.overhead_ns as f64 * 100.0 / capture.elapsed_ns as f64
+    } else {
+        0.0
+    };
     println!(
         "      {:.1} fps, {} unique frame(s), per-grab p50 {:.2}ms p99 {:.2}ms",
         capture.fps(),
@@ -121,6 +131,11 @@ pub fn report(label: &str, capture: &Capture) {
         capture.p50_ns as f64 / 1e6,
         capture.p99_ns as f64 / 1e6,
     );
+    if overhead_pct >= 5.0 {
+        println!(
+            "      {overhead_pct:.0}% of that wall clock was the uniqueness check, not capture -- the per-grab figure above is the real cost."
+        );
+    }
     // Only remarkable when NOWAIT was asked for; in blocking mode a blocked grab
     // is the point.
     if capture.blocking_grabs > 0 && !capture.blocking {

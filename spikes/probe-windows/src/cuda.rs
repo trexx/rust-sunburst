@@ -6,6 +6,10 @@
 //! device buffer to grab into, and pull back a few kilobytes to tell one frame
 //! from another.
 //!
+//! There is deliberately no `cuCtxDestroy` here. NvFBC creates the context when
+//! it is not given one, so destroying it is not ours to do — and doing it anyway
+//! is what killed the first run of this probe.
+//!
 //! # Why this costs nothing
 //!
 //! `nvcuda.dll` is the *driver* API and ships with every NVIDIA driver, so this
@@ -39,7 +43,6 @@ pub const CUDA_SUCCESS: i32 = 0;
 type PfnInit = unsafe extern "system" fn(u32) -> i32;
 type PfnCtxPopCurrent = unsafe extern "system" fn(*mut CuContext) -> i32;
 type PfnCtxPushCurrent = unsafe extern "system" fn(CuContext) -> i32;
-type PfnCtxDestroy = unsafe extern "system" fn(CuContext) -> i32;
 type PfnMemAlloc = unsafe extern "system" fn(*mut CuDevicePtr, usize) -> i32;
 type PfnMemFree = unsafe extern "system" fn(CuDevicePtr) -> i32;
 type PfnMemcpyDtoH = unsafe extern "system" fn(*mut c_void, CuDevicePtr, usize) -> i32;
@@ -48,7 +51,6 @@ pub struct Cuda {
     init: PfnInit,
     ctx_pop: PfnCtxPopCurrent,
     ctx_push: PfnCtxPushCurrent,
-    ctx_destroy: PfnCtxDestroy,
     mem_alloc: PfnMemAlloc,
     mem_free: PfnMemFree,
     memcpy_dtoh: PfnMemcpyDtoH,
@@ -95,7 +97,6 @@ impl Cuda {
         let init = need("cuInit");
         let ctx_pop = need("cuCtxPopCurrent");
         let ctx_push = need("cuCtxPushCurrent");
-        let ctx_destroy = need("cuCtxDestroy");
         let mem_alloc = need("cuMemAlloc");
         let mem_free = need("cuMemFree");
         let memcpy_dtoh = need("cuMemcpyDtoH");
@@ -116,7 +117,6 @@ impl Cuda {
                 init: crate::nvfbc::cast_fn(init.unwrap()),
                 ctx_pop: crate::nvfbc::cast_fn(ctx_pop.unwrap()),
                 ctx_push: crate::nvfbc::cast_fn(ctx_push.unwrap()),
-                ctx_destroy: crate::nvfbc::cast_fn(ctx_destroy.unwrap()),
                 mem_alloc: crate::nvfbc::cast_fn(mem_alloc.unwrap()),
                 mem_free: crate::nvfbc::cast_fn(mem_free.unwrap()),
                 memcpy_dtoh: crate::nvfbc::cast_fn(memcpy_dtoh.unwrap()),
@@ -146,11 +146,6 @@ impl Cuda {
     pub fn ctx_push(&self, ctx: CuContext) -> i32 {
         // SAFETY: `ctx` came from `ctx_pop` and is still live.
         unsafe { (self.ctx_push)(ctx) }
-    }
-
-    pub fn ctx_destroy(&self, ctx: CuContext) -> i32 {
-        // SAFETY: `ctx` is live and destroyed exactly once by the caller.
-        unsafe { (self.ctx_destroy)(ctx) }
     }
 
     pub fn mem_alloc(&self, bytes: usize) -> Result<CuDevicePtr, i32> {
