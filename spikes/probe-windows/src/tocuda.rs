@@ -374,3 +374,56 @@ pub fn run(session: &mut ToCuda, count: u32, blocking: bool) -> Capture {
 
     result
 }
+
+// ---------------------------------------------------------------- latency watcher
+
+/// A ToCuda session presented as a [`crate::watch::Watcher`].
+///
+/// Lives here rather than in `watch.rs` because reading the signal needs the
+/// session's device pointer and the pitch from its own grab info, both of which
+/// are private to this module.
+pub struct Watch<'a> {
+    session: ToCuda<'a>,
+    x: u32,
+    y: u32,
+}
+
+impl<'a> Watch<'a> {
+    pub fn open(cuda: &'a Cuda, x: u32, y: u32, ten_bit: bool, hdr: bool) -> Option<Watch<'a>> {
+        Some(Watch {
+            session: open(cuda, ten_bit, hdr)?,
+            x,
+            y,
+        })
+    }
+}
+
+impl crate::watch::Watcher for Watch<'_> {
+    fn name(&self) -> &'static str {
+        "NvFBC "
+    }
+
+    fn poll(&mut self, out: &mut [u8; crate::readback::SAMPLE_BYTES]) -> Result<bool, String> {
+        let mut info = FrameGrabInfo::default();
+        let status = self.session.grab(&mut info, false);
+        if status != 0 {
+            return Err(format!("NvFBCCudaGrabFrame: {}", result_name(status)));
+        }
+        if info.buffer_width == 0 {
+            return Ok(false);
+        }
+
+        // ARGB and ARGB10 are both 32bpp, so the pitch is the padded width in
+        // pixels times four whichever format the session was set up with.
+        let pitch = u64::from(info.buffer_width) * 4;
+        let offset = u64::from(self.y) * pitch + u64::from(self.x) * 4;
+        let status = self
+            .session
+            .cuda
+            .memcpy_dtoh(out, self.session.buffer + offset);
+        if status != CUDA_SUCCESS {
+            return Err(format!("cuMemcpyDtoH at the read point: {status}"));
+        }
+        Ok(true)
+    }
+}

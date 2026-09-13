@@ -604,11 +604,73 @@ UIPI), `reattached` and `attach_failed`.
 
 ---
 
+## 7. Present→capture latency (env S)
+
+```bash
+probe-windows --latency
+```
+
+**The one measurement that prices the budget's largest line.** CLAUDE.md gives DWM
+composition ~16.7ms — more than encode — and nothing has ever measured it. Every
+capture number before this was throughput, which is not what this project
+optimises and which answered none of it.
+
+A camera is *not* needed for this. Glass-to-glass needs one, because it spans the
+decoder and the panel; present→capture does not, and that interval is where
+composition sits. Both ends are QPC timestamps taken in one process.
+
+**Method.** A topmost 256×256 window at (64, 64) presents continuously and changes
+colour every 100ms, publishing the QPC of the `Present` that carried each change.
+Each backend — DDA, WGC, NvFBC ToCuda — polls the desktop pixel at the window's
+centre and times the change against that timestamp. Backends run **one at a
+time**; concurrent sessions would measure contention between them.
+
+Three details that are decisions, not incidentals:
+
+- **The read point is inset from (0, 0).** WGC draws a capture-indicator border
+  around the captured region on some Windows versions, and at the origin it would
+  land exactly where the probe reads — timing the border instead of the content.
+- **Change is detected on raw bytes, not decoded colour.** The three paths return
+  `B8G8R8A8`, `R16G16B16A16Float` and `A2B10G10R10` respectively; comparing bytes
+  needs no per-format branch, and the presenter's timestamp is what carries the
+  meaning.
+- **Flips are 100ms apart on purpose.** A colour alternating every frame cannot be
+  attributed — a refresh-capped backend has no way to say which `Present` it is
+  looking at. A `flip_seq` guard stops one flip yielding several samples.
+
+- [ ] **Run it with HDR off, and again with HDR on.** All three capture formats
+      change with the desktop's colour mode, and the ToSys 8-bit freeze already
+      showed a format mismatch presenting as a working-but-frozen capture rather
+      than an error.
+- [ ] **Sanity check before believing anything: DDA and WGC p50s should land in
+      the same region.** Both are post-composition. If they diverge widely the
+      harness is measuring itself, not the path.
+- [ ] **Expect ~10 samples per second of run time.** Far fewer means changes are
+      being missed; far more means the `flip_seq` guard is not holding.
+- [ ] **Stress mode needs tearing support** to say anything about a backend
+      exceeding the panel. The probe reports whether it got it; without it, read
+      the figures as keep-up only.
+
+| Backend | p50 | p99 | max | distinct frames/sec (stress) |
+|---|---|---|---|---|
+| DDA | | | | |
+| WGC | | | | |
+| NvFBC ToCuda | | | | |
+
+**What the answer changes.** A DDA p50 near 16.7ms confirms the budget and keeps
+Phase 7's swapchain hook justified. A few milliseconds says the largest line in
+the table is wrong — and takes the hook's reason for existing with it, since that
+item exists only to beat composition. Either way Phase 3's backend selection gets
+a real basis, and NvFBC finally gets measured on the metric it was retained for.
+
+---
+
 ## Hardware still needed
 
 | Needed for | Hardware |
 |---|---|
 | §1's NvFBC row | The 4070 box; `--enable-nvfbc` needs elevation |
+| §7 latency | The 4070 box, screen left alone while it runs |
 | §2 | Both Android boxes, adb reachable |
 | §4 client rows | Phase 5 client, so not yet |
 | Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads |
