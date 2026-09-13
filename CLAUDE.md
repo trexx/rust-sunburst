@@ -42,6 +42,18 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   calls `SendInput` is a remote input-injection hole.
 - **Capture the monitor, never a window.** Big Picture launches games in new
   windows with new swapchains; display capture rides through it invisibly.
+- **Three capture backends, and NvFBC is never the default.** WGC on Win11, DDA
+  on Win10, each falling back to the other. NvFBC is opt-in only: it needs an
+  undocumented private-data key a driver update can invalidate, and NVIDIA's last
+  supported Windows 10 build for it is 1803 — below this project's 1903 floor. It
+  is kept because DDA goes black on DRM-protected content and dies on the secure
+  desktop, so a second GPU-resident path is resilience. It measured 0.86–0.94× DDA
+  on throughput; latency is what would justify it and has no number yet.
+- **The `Capture` trait yields a D3D11 texture**, whatever produced it. NvFBC
+  hands back a CUDA device pointer, so that backend registers it with
+  `cuGraphicsD3D11RegisterResource` and copies device-to-device. One HLSL shader,
+  one NVENC session type, one frame path — the interop copy is a cost only the
+  opt-in backend pays.
 - **Render the cursor client-side** from separately-delivered shape data. Removes
   the network round-trip from perceived pointer latency. Biggest single
   responsiveness win in the system.
@@ -98,9 +110,13 @@ capture-to-wire, not what the eye sees. Do not chase them.
 The DWM row is still an **assumption** — the largest line in the table, and never
 measured directly. What *is* measured is that **NvFBC does not remove it**:
 GPU-resident capture via `NvFBCToCuda` came in at 0.86–0.94× Desktop Duplication
-in every controlled run (`HARDWARE_TESTING.md` §1), so the backend is struck and
-swapchain hooking is the only remaining candidate. Pricing the row itself needs
-the latency rig, not a throughput probe.
+in every controlled run (`HARDWARE_TESTING.md` §1). NvFBC is kept as an opt-in
+backend anyway, on grounds those runs did not test — see the traps below.
+
+**Pricing this row does not need a camera.** Present→capture latency is
+measurable in software, and that interval is where composition sits; a camera is
+only required past the decoder, for glass-to-glass. Anything in this file
+claiming otherwise is stale.
 
 The two NVENC rows are **targets, not measurements** — they were written against
 the Blackwell encoder this project originally assumed and have not been measured
@@ -125,8 +141,15 @@ sunburst-android/  cdylib + JNI shim
 android/           Gradle project; Kotlin owns Activity + SurfaceView only
 web/               Vite + React + TS management UI
 tools/             development tools. Kept, unlike spikes/.
-spikes/            Phase 0 throwaway. Deletable by design.
+spikes/            Phase 0 throwaway. Deletable by design -- with one exception, below.
 ```
+
+**The exception: `spikes/probe-windows` now holds the only working NvFBC code in
+the project** — `nvfbc.rs`, `tocuda.rs`, `cuda.rs`, `capture.rs`. It cost seven
+hardware runs to get right, and the keyed `CreateEx`, the V2-not-V3 setup struct,
+the vtable slot order and the CUDA teardown order are all things that were wrong
+at least once before they were right. **Promote it into `sunburst-capture` before
+deleting `spikes/`**, or that goes with it.
 
 `sunburst-capture`, `-encode`, `-audio` and `-server` are `#![cfg(windows)]` at
 the crate root, so they compile to nothing on a Linux host. `sunburst-core`,

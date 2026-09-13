@@ -181,10 +181,13 @@ never reachable with one encoder either way.
       sees nothing DDA misses; they do not establish behaviour under content that
       outruns the refresh rate.
 
-      That gap is the honest limit of this experiment, and it is not worth
-      closing: the composition question needs content rendering *above* 144Hz to
-      answer by throughput at all, and what it would really need is the latency
-      rig in §5. Meanwhile NvFBC has never once been measured above DDA.
+      That gap is the honest limit of this experiment, and the next chunk closes
+      it: content rendering *above* 144Hz is what a throughput answer would need,
+      and **present→capture latency is measurable in software** — no camera. A
+      borderless window flipping a corner region on every `Present`, with each
+      backend timing when it sees the flip, gives both. That interval is where
+      DWM composition sits, so the same harness finally prices the budget's
+      largest line.
 
       Setup notes worth keeping: the interface id is **0x1007** at 0x70 where the
       older header says `0x1006`; `NvFBCCudaSetup` is **vtable slot 1** (slot 0 is
@@ -275,30 +278,32 @@ more. Encode time stays a fixed 5–10ms floor, which is what makes the line abo
 load-bearing rather than an optimisation. Note the floor itself is still the
 inherited Blackwell-era *estimate*; §4 is where Ada's real number goes.
 
-**NvFBC is unlocked, working, GPU-resident — and closed. It does not beat DDA.**
+**NvFBC is unlocked, working, GPU-resident, and kept — as an opt-in backend
+beside DDA and WGC, not as a default.**
 
-Across every controlled comparison, in both colour modes and both pixel formats,
-`NvFBCToCuda` delivered **0.86–0.94× Desktop Duplication** over the same window.
-It has never once measured above DDA. The GPU-resident path works exactly as
-intended — 0.15–0.19ms per grab against ToSys's 3.6ms — so this is not a
-question of having tested it badly. There is simply no throughput to win.
+Across every controlled comparison `NvFBCToCuda` delivered **0.86–0.94× Desktop
+Duplication**, never above it. The GPU-resident path works exactly as intended —
+0.15–0.19ms per grab against ToSys's 3.6ms — so this is not a badly built test.
 
-So the ~16.7ms DWM line is not something NvFBC removes, and **swapchain hooking
-is the only remaining candidate for a pre-composition frame** — which does not
-promote it: per-process, a poor fit for Big Picture launching each game into a
-new window, and an anti-cheat warning attached.
+**But that settles throughput, which is not what this project optimises**, and
+the first write-up of it here ("closed, does not beat DDA") was broader than the
+evidence. Three things it does not cover:
 
-**What this does not prove.** It is a throughput result, not a latency one, and
-in every run DDA itself sat at ~38–40 frames/sec on a 144Hz display — the content
-was the limit, so neither path was near its ceiling. Content rendering *above*
-the refresh rate would be needed to answer the composition question by throughput
-at all, and the real answer needs the latency rig in §5. That work is worth doing
-for the budget's sake; it is not worth doing for NvFBC's sake, because the
-three reasons below apply whatever it would have shown.
+- **Latency was never measured.** Equal delivery at lower per-frame cost is still
+  a win, and DDA's `AcquireNextFrame`-plus-copy has no number beside NvFBC's
+  0.15ms.
+- **Neither path was stressed.** DDA itself sat at ~38–40 frames/sec on a 144Hz
+  display in every run — the content was the limit, not the capture path.
+- **DDA has failure modes NvFBC may not share**: black on DRM-protected content,
+  dead on the secure desktop, constant `AccessLost`. A second GPU-resident path
+  is resilience as much as speed.
 
-**Why this was never going to be a backend even if it had been fast.** Three
-reasons, all independent of the measurement, and worth keeping because they are
-why the result was not a disappointment:
+So the ~16.7ms DWM line still stands unmeasured, and NvFBC does not remove it —
+that much *was* established. What decides NvFBC's real worth is the
+**present→capture latency harness** that follows Phase 0.
+
+**Why it is opt-in and never the default.** Three reasons, all independent of any
+measurement, and all still true now that it is being kept:
 
 - The key is undocumented and can stop working on any driver update. A capture
   backend that can vanish in a driver release is not a default; at most it is an

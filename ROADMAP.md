@@ -11,7 +11,11 @@ phase's acceptance criteria pass.
 Throwaway code. The point is to resolve architecture-invalidating unknowns before
 committing to any of them.
 
-### 0.1 NvFBC availability — **closed: available, GPU-resident, and no faster than DDA**
+One piece is no longer throwaway: `spikes/probe-windows`'s NvFBC implementation
+is the only working copy in the project and has to be promoted into
+`sunburst-capture` in Phase 3 before this directory is deleted.
+
+### 0.1 NvFBC availability — **closed: available, GPU-resident, kept as an option**
 NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
 developers to Desktop Duplication. The instruction was to assume it unavailable
 until proven otherwise on this exact driver, and the first probe run appeared to
@@ -29,11 +33,25 @@ And the third possibility turned out to be the real one: not "available" or
 fails, on this exact driver, for a 3840x2160 session.
 
 Then it was measured properly — GPU-resident via `NvFBCToCuda`, against a
-same-window Desktop Duplication control, in both colour modes — and **the second
-branch is taken: delete the backend from the plan.** NvFBC came in at 0.86–0.94×
-DDA every time, and never once above it. The frame genuinely stays on the GPU
-(0.15–0.19ms per grab against ToSys's 3.6ms), so this is not a badly built test;
-there is just nothing to win.
+same-window Desktop Duplication control, in both colour modes. NvFBC came in at
+0.86–0.94× DDA every time and never once above it, and the frame genuinely stays
+on the GPU (0.15–0.19ms per grab against ToSys's 3.6ms), so this is not a badly
+built test.
+
+**Neither branch is taken, because the branches asked about throughput and this
+project is not optimising throughput.** That result was written up as "delete the
+backend", which was broader than the evidence: latency was never measured, and
+DDA itself only reached ~38–40 frames/sec on a 144Hz display in every run, so
+neither path was ever stressed. NvFBC also grabs in 0.15ms where DDA's
+`AcquireNextFrame` plus copy has no number at all.
+
+So **NvFBC is retained as an opt-in backend complementing DDA and WGC**, and
+moves into Phase 3 where the `Capture` trait is built. It is never the default —
+it needs an undocumented private-data key and is deprecated below this project's
+OS floor — but DDA goes black on DRM-protected content and dies on the secure
+desktop, so a second GPU-resident path is resilience as much as speed. What
+decides its real worth is the present→capture latency harness that follows Phase
+0, not the throughput numbers above.
 
 That it took seven runs to get a number worth trusting is the more useful lesson,
 and `HARDWARE_TESTING.md` §1 keeps the wrong turns alongside the answer: an idle
@@ -47,7 +65,7 @@ probe mid-measurement.
 table seeded.
 
 Two of the three are done: the codec matrix is measured, and the NvFBC decision
-is made and negative. The quirks table is half-seeded — the Shield is enumerated,
+is made — available, GPU-resident, retained as an opt-in backend. The quirks table is half-seeded — the Shield is enumerated,
 the Homatics is not — so **0.2 and 0.3 are all that stand between here and Phase
 0 closing**, and both need the Homatics rather than the server.
 
@@ -121,8 +139,11 @@ the actual TVs.
 - **DDA** backend: blocking `AcquireNextFrame` on a dedicated thread, release
   immediately after taking the texture reference.
 - **WGC** backend: free-threaded frame pool, `R16G16B16A16Float` for HDR.
+- **NvFBC** backend, opt-in: promoted out of `spikes/probe-windows`, keyed
+  `CreateEx` → `NvFBCToCuda` → `cuGraphicsD3D11RegisterResource` so the trait
+  still yields a D3D11 texture. Never selected automatically.
 - Backend selection: WGC on Win11, DDA on Win10, fall back to the other on
-  `AccessLost` or repeated black-frame detection.
+  `AccessLost` or repeated black-frame detection. NvFBC only when asked for.
 - scRGB→P010 compute shader.
 - NVENC init: HEVC Main10 and AV1 Main10, P1–P4, `TUNING_INFO_ULTRA_LOW_LATENCY`,
   CBR, no lookahead, no B-frames, infinite GOP.
@@ -206,10 +227,10 @@ Ordered by value, not difficulty.
   Solves resolution matching and HDR mode control cleanly. Requires an EV-signed
   WDDM driver; strongly consider consuming an existing VDD (Parsec VDD, Virtual
   Display Driver) rather than authoring one.
-- ~~**NvFBC**~~ — **struck on evidence.** Phase 0.1 unlocked it, made it
-  GPU-resident via ToCuda, and measured 0.86–0.94x DDA in every controlled run.
-  Left visible rather than deleted so it is not re-proposed as free latency; the
-  numbers are in `HARDWARE_TESTING.md` §1.
+- ~~**NvFBC**~~ — **moved to Phase 3** as an opt-in backend. Phase 0.1 unlocked
+  it, made it GPU-resident via ToCuda and measured 0.86–0.94x DDA, which settles
+  throughput and nothing else. It belongs beside the other backends rather than
+  in the optional-polish phase; see `HARDWARE_TESTING.md` §1.
 - **Swapchain hooking** — opt-in, with an explicit anti-cheat warning. Hook
   `IDXGISwapChain::Present`/`Present1`/`ResizeBuffers`, `vkQueuePresentKHR`,
   `wglSwapBuffers`, and D3D9 `EndScene`/`Present`. D3D9Ex can share surfaces to
@@ -320,7 +341,7 @@ Ranked by latency. Full detail in CLAUDE.md traps.
 |---|---|---|
 | Swapchain hook | Pre-composition, saves ~1 frame, uncapped fps | Phase 7, opt-in |
 | IDD | Very good; solves headless + resolution matching | Phase 7 |
-| ~~NvFBC~~ | Assumed lowest; measured **0.86–0.94x DDA**, GPU-resident | **Ruled out by Phase 0.1** |
+| NvFBC | GPU-resident via ToCuda; **0.86–0.94x DDA** on throughput, latency unmeasured | Phase 3, opt-in |
 | WGC | Post-composition, refresh-capped | Phase 3, Win11 default |
 | DDA | Post-composition, refresh-capped | Phase 3, Win10 default |
 
