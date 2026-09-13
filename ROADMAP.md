@@ -11,7 +11,7 @@ phase's acceptance criteria pass.
 Throwaway code. The point is to resolve architecture-invalidating unknowns before
 committing to any of them.
 
-### 0.1 NvFBC availability — **unlocked and measurable; verdict still open**
+### 0.1 NvFBC availability — **closed: available, GPU-resident, and no faster than DDA**
 NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
 developers to Desktop Duplication. The instruction was to assume it unavailable
 until proven otherwise on this exact driver, and the first probe run appeared to
@@ -28,63 +28,28 @@ And the third possibility turned out to be the real one: not "available" or
 "absent" but **present and switched off**. Keyed `CreateEx` succeeds where unkeyed
 fails, on this exact driver, for a 3840x2160 session.
 
-Then it was measured, and the answer **depends on the desktop's colour mode**, so
-the branch is not taken yet. In SDR, NvFBC ToSys delivers 0.68x Desktop
-Duplication with a 21ms p99 tail. In HDR — which is the actual workload — the
-8-bit path freezes entirely and ARGB10 looks competitive, but that run had no
-controlled DDA comparison beside it. The probe now measures both formats with
-their own control; until that lands, no verdict.
+Then it was measured properly — GPU-resident via `NvFBCToCuda`, against a
+same-window Desktop Duplication control, in both colour modes — and **the second
+branch is taken: delete the backend from the plan.** NvFBC came in at 0.86–0.94×
+DDA every time, and never once above it. The frame genuinely stays on the GPU
+(0.15–0.19ms per grab against ToSys's 3.6ms), so this is not a badly built test;
+there is just nothing to win.
 
-That it has taken five runs to get here is the more useful lesson, and
-`HARDWARE_TESTING.md` §1 records the wrong turns as well as the findings: an idle
+That it took seven runs to get a number worth trusting is the more useful lesson,
+and `HARDWARE_TESTING.md` §1 keeps the wrong turns alongside the answer: an idle
 desktop that made both paths look identical, a polling loop that measured our own
 asking rate, a status bit that had drifted meaning between SDK versions, a setup
-struct whose *generation* — not layout — was what the driver rejected, and a
-conclusion drawn in SDR that HDR promptly undercut.
-
-The other half of 0.1 — the encoder capability matrix — is answered, with AV1 at
-parity with HEVC on reference invalidation and subframe readback. That is the
-answer Phase 4 was waiting on.
-
-### 0.2 Decoder enumeration on both boxes
-Dump full `MediaCodecList` on Shield and Homatics. For each HEVC/AV1 decoder
-record: name, `isHardwareAccelerated`, supported profiles/levels, max resolution,
-`FEATURE_LowLatency`, and whether `KEY_LOW_LATENCY` is accepted.
-
-Seeds the quirks table with real data instead of assumptions.
-
-### 0.3 Homatics network PHY
-Confirm the box negotiates 1000Mbps, not 100. A 100Mbit PHY caps usable
-throughput around 80 Mbps and makes AV1's efficiency load-bearing rather than
-nice-to-have.
-
-### 0.4 Homatics HEVC bug characterisation — **dropped, do not reinstate**
-This asked whether the Homatics HEVC decoder is genuinely broken or merely
-misconfigured. It is broken; its low-latency HEVC decoder is known bad, and there
-is nothing left to characterise. Recorded here rather than deleted so a later
-session does not helpfully propose the experiment again.
-
-Two consequences, which are constraints on Phase 3 onward rather than risks to
-manage later:
-
-- **AV1 is the Homatics path with no fallback behind it.** The AV1 reference
-  state machine and the av1C record carry the whole device, and the av1C record
-  is the known silent-failure point — wrong record, decoder configures cleanly
-  and outputs nothing.
-- **0.1's AV1 capability queries are load-bearing** — and have now come back.
-  The risk was that an AV1 encoder without `SUPPORT_REF_PIC_INVALIDATION` would
-  leave the Homatics with no HEVC path to fall back to, degrading NACK recovery
-  there to `RequestIdr`. The probe reports it supported, so Phase 4 keeps its
-  design on both codecs. See `HARDWARE_TESTING.md` §1.
+struct whose *generation* rather than layout was rejected, an SDR conclusion that
+HDR undercut, and a `cuCtxDestroy` on a context we did not own that killed the
+probe mid-measurement.
 
 **Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
 table seeded.
 
-One of the three is done: the codec matrix is measured. The NvFBC decision needs
-one more run — the controlled HDR comparison. The quirks table is half-seeded:
-the Shield is enumerated, the Homatics is not. So **that NvFBC run, 0.2 and 0.3
-stand between here and Phase 0 closing** — one needs the server, two the
-Homatics.
+Two of the three are done: the codec matrix is measured, and the NvFBC decision
+is made and negative. The quirks table is half-seeded — the Shield is enumerated,
+the Homatics is not — so **0.2 and 0.3 are all that stand between here and Phase
+0 closing**, and both need the Homatics rather than the server.
 
 ---
 
@@ -241,10 +206,10 @@ Ordered by value, not difficulty.
   Solves resolution matching and HDR mode control cleanly. Requires an EV-signed
   WDDM driver; strongly consider consuming an existing VDD (Parsec VDD, Virtual
   Display Driver) rather than authoring one.
-- **NvFBC** — still conditional on Phase 0.1, which now has numbers but not a
-  verdict: 0.68x DDA in SDR, undetermined in HDR. Even a win would not make it a
-  default backend — an undocumented key a driver update can invalidate is at most
-  an opt-in fast path behind DDA/WGC. See `HARDWARE_TESTING.md` §1.
+- ~~**NvFBC**~~ — **struck on evidence.** Phase 0.1 unlocked it, made it
+  GPU-resident via ToCuda, and measured 0.86–0.94x DDA in every controlled run.
+  Left visible rather than deleted so it is not re-proposed as free latency; the
+  numbers are in `HARDWARE_TESTING.md` §1.
 - **Swapchain hooking** — opt-in, with an explicit anti-cheat warning. Hook
   `IDXGISwapChain::Present`/`Present1`/`ResizeBuffers`, `vkQueuePresentKHR`,
   `wglSwapBuffers`, and D3D9 `EndScene`/`Present`. D3D9Ex can share surfaces to
@@ -355,7 +320,7 @@ Ranked by latency. Full detail in CLAUDE.md traps.
 |---|---|---|
 | Swapchain hook | Pre-composition, saves ~1 frame, uncapped fps | Phase 7, opt-in |
 | IDD | Very good; solves headless + resolution matching | Phase 7 |
-| NvFBC | Assumed lowest; **0.68x DDA in SDR**, HDR undetermined | Phase 0.1 — verdict pending |
+| ~~NvFBC~~ | Assumed lowest; measured **0.86–0.94x DDA**, GPU-resident | **Ruled out by Phase 0.1** |
 | WGC | Post-composition, refresh-capped | Phase 3, Win11 default |
 | DDA | Post-composition, refresh-capped | Phase 3, Win10 default |
 

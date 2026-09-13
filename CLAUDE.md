@@ -81,7 +81,7 @@ changes that look free — the point is to catch the ones that aren't.
 
 | Stage | Target | Notes |
 |---|---|---|
-| DWM composition | ~16.7ms | Only NvFBC/hooking avoids this — unverified |
+| DWM composition | ~16.7ms | Only swapchain hooking may avoid this; NvFBC does not |
 | Capture acquire | 0.5–2ms | |
 | scRGB→P010 shader | 0.8–1.5ms | |
 | NVENC HEVC P1 ULL | 5–9ms | Fixed floor; one NVENC, so no SFE |
@@ -95,10 +95,12 @@ changes that look free — the point is to catch the ones that aren't.
 Honest glass-to-glass: **60–100ms**. Sub-40ms claims elsewhere measure
 capture-to-wire, not what the eye sees. Do not chase them.
 
-The DWM row is an **assumption, never measured** — and it is the largest line in
-the table. NvFBC is being measured against it in `HARDWARE_TESTING.md` §1; in SDR
-it loses to DDA, in HDR it may not, and the question is open until the controlled
-HDR comparison is in.
+The DWM row is still an **assumption** — the largest line in the table, and never
+measured directly. What *is* measured is that **NvFBC does not remove it**:
+GPU-resident capture via `NvFBCToCuda` came in at 0.86–0.94× Desktop Duplication
+in every controlled run (`HARDWARE_TESTING.md` §1), so the backend is struck and
+swapchain hooking is the only remaining candidate. Pricing the row itself needs
+the latency rig, not a throughput probe.
 
 The two NVENC rows are **targets, not measurements** — they were written against
 the Blackwell encoder this project originally assumed and have not been measured

@@ -112,7 +112,7 @@ fn measure_cuda(cuda: &crate::cuda::Cuda, label: &str, ten_bit: bool, hdr: bool)
     drop(session);
 
     if polled.grabs > 0 {
-        interpret_capture(&polled, &blocked);
+        interpret_capture("ToCuda", &polled, &blocked);
     }
 }
 
@@ -143,7 +143,7 @@ fn measure_sys(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: 
     drop(session);
 
     if polled.grabs > 0 {
-        interpret_capture(&polled, &blocked);
+        interpret_capture("ToSys", &polled, &blocked);
     }
 }
 
@@ -152,7 +152,7 @@ fn measure_sys(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: 
 /// Deliberately comparative. An NvFBC frame rate on its own says nothing, since
 /// a static desktop produces few unique frames however fast the calls return —
 /// so this runs DDA over the same wall-clock window and compares.
-fn interpret_capture(polled: &crate::capture::Capture, blocked: &crate::capture::Capture) {
+fn interpret_capture(iface: &str, polled: &crate::capture::Capture, blocked: &crate::capture::Capture) {
     // A static desktop yields few unique frames however fast the calls return,
     // so unique-per-second is the honest rate, not raw call rate.
     let unique_fps = blocked.unique as f64 * 1e9 / blocked.elapsed_ns.max(1) as f64;
@@ -209,19 +209,19 @@ fn interpret_capture(polled: &crate::capture::Capture, blocked: &crate::capture:
 
     let ratio = unique_fps / dda.fps().max(0.001);
     if ratio >= 1.5 {
-        println!("      -> NvFBC delivered {ratio:.1}x DDA's frames, blocking against blocking.");
+        println!("      -> NvFBC {iface} delivered {ratio:.1}x DDA, blocking against blocking.");
         println!("         It is not refresh-capped, so it is not composition-bound, and");
         println!("         CLAUDE.md's ~16.7ms DWM composition line is REAL for this path.");
     } else {
-        println!("      -> NvFBC delivered {ratio:.2}x DDA over the same window, with both");
-        println!("         producing enough frames for that to mean something. NvFBC ToSys");
-        println!("         does not beat DDA here.");
+        println!("      -> NvFBC {iface} delivered {ratio:.2}x DDA over the same window, with");
+        println!("         both producing enough frames for that to mean something. It does");
+        println!("         not beat DDA here.");
     }
     println!();
-    println!("         Scope: this measures NVFBC_TO_SYS only, which copies every frame to");
-    println!("         system memory. It does NOT settle whether NvFBC escapes composition --");
-    println!("         NvFBCToDx9Vid and NvFBCToCuda keep the frame on the GPU and were not");
-    println!("         tested. Read against the display's real refresh rate before acting.");
+    println!("         Scope: a throughput comparison, not a latency one. It settles whether");
+    println!("         NvFBC delivers more frames than DDA. It does NOT settle what DWM");
+    println!("         composition costs -- and if DDA's own rate is well under the display's");
+    println!("         refresh, the content was the limit and neither path was stressed.");
 }
 
 fn report_nvfbc(attempt_enable: bool) {

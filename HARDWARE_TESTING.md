@@ -160,34 +160,43 @@ never reachable with one encoder either way.
       **Superseded as the thing to measure.** ToSys is ruled out by its *shape*,
       not its rate — see the readback row below — so the comparison that decides
       Phase 0.1 is the ToCuda one.
-- [ ] **`NvFBCToCuda` — the measurement that decides Phase 0.1.** Now the probe's
-      default: the frame is grabbed straight into a CUDA device buffer and never
-      comes back, so the per-grab number is the capture itself rather than a 33MB
-      readback.
+- [x] **`NvFBCToCuda` — measured, controlled, and it does not beat DDA.**
+      Four same-window comparisons, both colour modes, both pixel formats:
 
-      `NvFBCToDx9Vid` also gained ARGB10 at 0x70 and would equally avoid the
-      copy, but ToCuda is the one worth having: **NVENC accepts CUDA device
-      pointers directly**, so a real pipeline could run capture → convert →
-      encode without crossing an API boundary, where ToDx9Vid needs a D3D9Ex
-      device and a shared-surface handoff into D3D11.
+      | desktop | format | NvFBC blocking | DDA control | ratio |
+      |---|---|---|---|---|
+      | HDR on | ARGB | 37.3 /s | 39.5 /s | 0.94× |
+      | HDR on | ARGB10 | 33.0 /s | 38.5 /s | 0.86× |
+      | HDR off | ARGB | 34.2 /s | 39.9 /s | 0.86× |
+      | HDR off | ARGB10 | 34.1 /s | 38.3 /s | 0.89× |
 
-      Sanity check on the result: if ToCuda reports anything near ToSys's ~3.6ms
-      per grab, the frame is *not* staying on the GPU and the setup is wrong
-      rather than NvFBC being slow.
+      **Per-grab 0.15–0.19ms p50**, against ToSys's 3.6ms — a twentyfold
+      difference that confirms the frame really is staying on the GPU, and the
+      sanity check this run was designed around. GPU residency works exactly as
+      advertised. It just buys nothing.
 
-      Three details that cost time on the ToSys path and are pre-empted here: the
-      interface id is **0x1007** at 0x70 where the older header says `0x1006`;
-      `NvFBCCudaSetup` is **vtable slot 1**, not 0, since slot 0 is
-      `GetMaxBufferSize` and that is how you learn what to allocate; and
-      `bHDRRequest` is bit 1, **read from the header** rather than inferred.
+      **Read the DDA column before the ratio.** DDA itself only managed ~38–40
+      frames/sec on a **144Hz** display, so the content was producing about 40fps
+      and *neither path was stressed*. What these numbers establish is that NvFBC
+      sees nothing DDA misses; they do not establish behaviour under content that
+      outruns the refresh rate.
 
-      No new build dependency: `nvcuda.dll` is the CUDA *driver* API, ships with
-      the driver, and is `LoadLibrary`d at runtime exactly as NVENC already is.
-      Its exports carry `_v2` suffixes (`cuMemAlloc` really resolves to
-      `cuMemAlloc_v2`), so the loader tries `_v2` first and **prints which
-      spelling answered** — a bare-name miss would look like CUDA being absent,
-      which is the same trap as `NvFBCCreateInstance`.
+      That gap is the honest limit of this experiment, and it is not worth
+      closing: the composition question needs content rendering *above* 144Hz to
+      answer by throughput at all, and what it would really need is the latency
+      rig in §5. Meanwhile NvFBC has never once been measured above DDA.
 
+      Setup notes worth keeping: the interface id is **0x1007** at 0x70 where the
+      older header says `0x1006`; `NvFBCCudaSetup` is **vtable slot 1** (slot 0 is
+      `GetMaxBufferSize`, which is how you learn what to allocate); `bHDRRequest`
+      is bit 1, read from the header. **Teardown order is load-bearing** — free
+      the device buffer *before* releasing the session, and never call
+      `cuCtxDestroy` on the context NvFBC created for you. Doing the latter took
+      the probe out mid-run.
+
+      `nvcuda.dll` costs no build dependency, but its exports carry `_v2`
+      suffixes: `cuInit` resolved bare, everything else via `_v2`. A bare-name
+      loader would have reported CUDA missing.
 - [x] **10-bit and HDR capture works.** With Windows HDR on, `NVFBC_TOSYS_ARGB10`
       captures and **`bIsHDR` comes back set**. The inferred V2 bit position for
       `bHDRRequest` was therefore right — bit 3, the same slot it occupies in the
@@ -197,10 +206,16 @@ never reachable with one encoder either way.
       linear FP16 CLAUDE.md's HDR notes assume. If this path is ever used, the
       shader's input stage changes: no 80-nit normalise from linear, and the
       transfer and primaries of that buffer still need establishing.
-- [x] **In HDR mode, 8-bit ARGB capture silently freezes.** One unique frame
-      across 800 grabs while DDA saw 80.4 new frames/sec over the same window —
-      so the screen was moving and the capture path was not. It does not fail, it
-      does not error, it returns one stale frame forever.
+- [x] **In HDR mode, ToSys's 8-bit ARGB capture silently freezes.** One unique
+      frame across 800 grabs while DDA saw 80.4 new frames/sec over the same
+      window — so the screen was moving and the capture path was not. It does not
+      fail, it does not error, it returns one stale frame forever.
+
+      **This is `NVFBC_TO_SYS`-specific, and the first record of it here was too
+      general.** ToCuda's 8-bit path captures an HDR desktop perfectly well —
+      37.3 unique frames/sec against DDA's 39.5, 287 unique frames in 300 grabs.
+      The lesson survives the correction, because the failure mode is the point
+      rather than the interface:
 
       This is the same shape as the av1C trap in CLAUDE.md: configures cleanly,
       produces nothing usable. Any capture backend must pick its pixel format
@@ -260,22 +275,26 @@ more. Encode time stays a fixed 5–10ms floor, which is what makes the line abo
 load-bearing rather than an optimisation. Note the floor itself is still the
 inherited Blackwell-era *estimate*; §4 is where Ada's real number goes.
 
-**NvFBC is unlocked, working, and not yet judged.** The key works, a 4K session
-opens, capture runs, and HDR capture works. What it is *worth* turns on a
-comparison that has been got wrong three times and is now, finally, set up
-properly: both pixel formats, each against its own DDA control, in the colour
-mode the workload actually uses.
+**NvFBC is unlocked, working, GPU-resident — and closed. It does not beat DDA.**
 
-What is already firm: ToSys charges **~3.6ms of readback per frame** and copies
-whether or not the frame is new, so pixels leave the GPU only to need
-re-uploading for the scRGB→P010 shader and NVENC. **That rules ToSys out on
-shape rather than on speed**, and it is why the remaining measurement goes
-through `NvFBCToCuda`, where the frame never leaves the GPU at all.
+Across every controlled comparison, in both colour modes and both pixel formats,
+`NvFBCToCuda` delivered **0.86–0.94× Desktop Duplication** over the same window.
+It has never once measured above DDA. The GPU-resident path works exactly as
+intended — 0.15–0.19ms per grab against ToSys's 3.6ms — so this is not a
+question of having tested it badly. There is simply no throughput to win.
 
-Also firm: **DDA sustains 111 new frames/sec at 4K in SDR, 80.4 in HDR** — both
-comfortably past the 60 this project needs. Whatever NvFBC turns out to be worth,
-capture throughput is not currently a bottleneck, which caps how much any of this
-is worth chasing.
+So the ~16.7ms DWM line is not something NvFBC removes, and **swapchain hooking
+is the only remaining candidate for a pre-composition frame** — which does not
+promote it: per-process, a poor fit for Big Picture launching each game into a
+new window, and an anti-cheat warning attached.
+
+**What this does not prove.** It is a throughput result, not a latency one, and
+in every run DDA itself sat at ~38–40 frames/sec on a 144Hz display — the content
+was the limit, so neither path was near its ceiling. Content rendering *above*
+the refresh rate would be needed to answer the composition question by throughput
+at all, and the real answer needs the latency rig in §5. That work is worth doing
+for the budget's sake; it is not worth doing for NvFBC's sake, because the
+three reasons below apply whatever it would have shown.
 
 **Why this was never going to be a backend even if it had been fast.** Three
 reasons, all independent of the measurement, and worth keeping because they are
