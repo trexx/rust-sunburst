@@ -15,6 +15,8 @@
 //! Run on the 4070 box and paste the output into HARDWARE_TESTING.md §1.
 
 #[cfg(windows)]
+mod dda;
+#[cfg(windows)]
 mod nvenc;
 #[cfg(windows)]
 mod nvfbc;
@@ -22,6 +24,8 @@ mod nvfbc;
 mod nvml;
 #[cfg(windows)]
 mod probe;
+#[cfg(windows)]
+mod tosys;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {

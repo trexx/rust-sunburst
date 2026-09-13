@@ -82,24 +82,57 @@ never reachable with one encoder either way.
       version and not the driver version string; if the driver number itself is
       ever wanted, that is a line to add to the probe rather than a fact to infer
       from this.
-- [!] **NvFBC: the first answer was wrong, and the question is reopened.** The
-      probe reported "no `NvFBCCreateInstance`, treat as unavailable". That was
-      a **false negative from asking the wrong entry point**: there are two
-      generations of NvFBC, `NvFBCCreateInstance` belongs to the 7.x/Linux one,
-      and the Windows API the driver still exports is the legacy
-      `NvFBC_CreateEx` / `NvFBC_GetStatusEx` / `NvFBC_Enable` set. A missing
-      modern export is a *version detection*, not a verdict.
+- [x] **NvFBC unlocks. Proven, with the A/B that makes it evidence.** The first
+      answer — "no `NvFBCCreateInstance`, treat as unavailable" — was a **false
+      negative from the wrong entry point**. There are two generations:
+      `NvFBCCreateInstance` is the 7.x/Linux API, and the one this driver
+      exports is the legacy Windows set. A missing modern export is a *version
+      detection*, not a verdict.
 
-      The probe now walks the legacy path, and legacy NvFBC is gated to
-      professional cards by a private-data key. It asks **both ways** and prints
-      the pair, because a keyed success only means something next to an unkeyed
-      failure — a keyed-only run proves nothing, since a Quadro passes either
-      way. Re-run and record the four lines it prints (`GetStatusEx` and
-      `CreateEx`, unkeyed and keyed).
+      Legacy NvFBC is gated to professional cards by a private-data key, so the
+      probe asks unkeyed and keyed and prints the pair:
+
+      ```
+      CreateEx unkeyed: ERROR_DRIVER_FAILURE -- object 0, max 0x0
+      CreateEx keyed  : NVFBC_SUCCESS        -- object 1, max 3840x2160
+      ```
+
+      A keyed-only run would prove nothing — a Quadro passes either way. The
+      unkeyed failure beside it is what makes the key the cause.
+
+      **Two traps for anyone re-testing.** `GetStatusEx` reported
+      `capture_possible 1` *both ways*: status is not the gate, `CreateEx` is, so
+      a status-only check gives the wrong answer. And the probe's original
+      `multi_client` label was wrong — at `NVFBC_DLL_VERSION 0x70` that bit is
+      `bSupportConfigurableDiffMap`, with `bSupportImageClassification` new at
+      bit 5. Same struct size, so nothing errored; it simply printed a real bit
+      under a stale name.
+- [ ] **Capture throughput vs DDA — the measurement that matters, not yet run.**
+      The probe now drives `INvFBCToSys_v4` properly and reports unique frames/sec
+      against a DDA control over the same wall-clock window.
+
+      This is what settles CLAUDE.md's **~16.7ms DWM composition** line, the
+      largest in the latency budget and currently an *assumption*. Clearly above
+      DDA means NvFBC is not composition-bound and the line is real; level with
+      DDA means it is wrong and comes out — which also removes the main argument
+      for the Phase 7 swapchain hook.
+
+      **Run it with something animating on screen.** On a static desktop both
+      paths produce almost no unique frames and the result says nothing; the
+      probe detects that case and tells you so rather than printing a number.
+- [ ] **10-bit and HDR capture.** `NVFBC_TOSYS_ARGB10` (= 6) with `bHDRRequest`,
+      checking `NvFBCFrameGrabInfo::bIsHDR`. **Turn Windows HDR on first**, or a
+      clear `bIsHDR` means "not in HDR mode", not "cannot do HDR".
+
+      Note the format is **A2B10G10R10** — a 10-bit integer buffer, *not* the
+      scRGB linear FP16 the HDR notes in CLAUDE.md assume. If this path were ever
+      used the shader's input stage changes, so record what the transfer and
+      primaries actually are; the header does not say.
 - [ ] **`--enable-nvfbc`, only if `CreateEx` refuses while status says capture is
       possible.** `NvFBC_Enable` needs elevation and **resets the display driver**,
       which on a box someone is watching is indistinguishable from a crash — so
-      the probe never calls it unless asked by name.
+      the probe never calls it unless asked by name. Not needed so far: `CreateEx`
+      succeeded without it.
 - [x] **HEVC caps.** Reference invalidation, intra refresh, subframe readback,
       10-bit and dynamic bitrate change all supported.
 - [x] **AV1 caps — parity holds on everything load-bearing.** Reference
@@ -147,11 +180,11 @@ more. Encode time stays a fixed 5–10ms floor, which is what makes the line abo
 load-bearing rather than an optimisation. Note the floor itself is still the
 inherited Blackwell-era *estimate*; §4 is where Ada's real number goes.
 
-**NvFBC is undecided, and that is the one open item from 0.1.** DWM composition
-is ~16.7ms in CLAUDE.md's budget — the largest single line in the table, larger
-than encode — and NvFBC and swapchain hooking are the only two ways past it. So
-which way this lands matters more here than it would on a Ti, and it is worth
-the re-run rather than the assumption.
+**NvFBC is half-decided: it unlocks, and what it is worth is still unmeasured.**
+DWM composition is ~16.7ms in CLAUDE.md's budget — the largest single line in the
+table, larger than encode — and NvFBC and swapchain hooking are the only two ways
+past it. That the key works settles *access*. It does not settle *value*, and the
+capture run above is what does.
 
 **What a keyed success would and would not license.** It would not make NvFBC a
 priority-1 backend, for three reasons that are all independent of whether the
@@ -160,9 +193,12 @@ call succeeds:
 - The key is undocumented and can stop working on any driver update. A capture
   backend that can vanish in a driver release is not a default; at most it is an
   opt-in fast path behind one that always works.
-- NVIDIA deprecated NvFBC on Windows from the Windows 10 October 2019 update
-  onward, and CLAUDE.md's floor is Windows 10 1903+ — so essentially the whole
-  supported OS range is past the deprecation.
+- NVIDIA deprecated NvFBC on Windows, and states the **last supported Windows 10
+  version is 1803, build 17134**. CLAUDE.md's floor is 1903+, so the *entire*
+  supported OS range is past it. Deprecated is not removed — it demonstrably
+  works here — but nothing obliges it to keep doing so.
+  *(An earlier draft of this file said "from the October 2019 update", taken from
+  a search snippet rather than NVIDIA's own wording. 1803 is the real number.)*
 - Phase 3 still needs DDA and WGC regardless, because they are what works on an
   unpatched machine.
 

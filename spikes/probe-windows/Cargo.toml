@@ -11,6 +11,10 @@ publish = false
 workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# For the QPC clock. The capture loop times grabs, and there is no reason to
+# grow a second tick source next to the one the whole project measures with.
+sunburst-core.workspace = true
+
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

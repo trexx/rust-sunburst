@@ -24,12 +24,15 @@ probe now walks that path, and because legacy NvFBC is gated to professional
 cards by a private-data key, it asks **unkeyed and keyed and reports the pair** —
 a keyed success means nothing except beside an unkeyed failure.
 
-So the branch is not taken yet. What has changed is that the third possibility is
-now visible and testable: not "available" or "absent" but **present and switched
-off**. `HARDWARE_TESTING.md` §1 records what a keyed success would license, which
-is a *measurement* of what skipping DWM composition actually recovers — enough to
-price the Phase 7 swapchain-hook work — rather than a priority-1 backend that can
-vanish in a driver update.
+And the third possibility turned out to be the real one: not "available" or
+"absent" but **present and switched off**. Keyed `CreateEx` succeeds where unkeyed
+fails, on this exact driver, for a 3840x2160 session.
+
+That settles *access*, not *value*. Neither branch above is taken yet, because
+the question the branches turn on — what skipping DWM composition actually
+recovers — is now a measurement the probe can take rather than a claim to accept.
+`HARDWARE_TESTING.md` §1 carries the result and the two traps found on the way
+(status is not the gate; a status bit had drifted meaning between SDK versions).
 
 The other half of 0.1 — the encoder capability matrix — is answered, with AV1 at
 parity with HEVC on reference invalidation and subframe readback. That is the

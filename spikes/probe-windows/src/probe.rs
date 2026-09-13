@@ -64,11 +64,67 @@ fn describe_adapter() -> Result<String, String> {
     ))
 }
 
+/// Enough grabs for a stable p99 without making the probe slow.
+const GRAB_COUNT: u32 = 200;
+
+/// The question the capture run exists to answer.
+///
+/// Deliberately comparative. An NvFBC frame rate on its own says nothing, since
+/// a static desktop produces few unique frames however fast the calls return —
+/// so this runs DDA over the same wall-clock window and compares.
+fn interpret_capture(c: &crate::tosys::Capture) {
+    // A static desktop yields few unique frames however fast the calls return,
+    // so unique-per-second is the honest rate, not raw call rate.
+    let unique_fps = c.unique as f64 * 1e9 / c.elapsed_ns.max(1) as f64;
+    println!(
+        "      -> {unique_fps:.1} unique frames/sec at {:.1} grabs/sec.",
+        c.fps()
+    );
+
+    println!();
+    println!("  DDA over the same window, as the control:");
+    let dda = match crate::dda::run(c.elapsed_ns) {
+        Ok(dda) => dda,
+        Err(e) => {
+            println!("      unavailable -- {e}");
+            println!("      Without the control the NvFBC number above is not interpretable.");
+            return;
+        }
+    };
+    println!(
+        "      {:.1} new frames/sec over {} acquire attempts",
+        dda.fps(),
+        dda.attempts
+    );
+
+    if c.unique <= 1 {
+        println!();
+        println!("      -> Only {} unique NvFBC frame(s). The desktop was static, so neither", c.unique);
+        println!("         number is a throughput result. Re-run with something animating");
+        println!("         on screen -- a video, or Big Picture moving -- or this says nothing.");
+        return;
+    }
+
+    println!();
+    let ratio = unique_fps / dda.fps().max(0.001);
+    if ratio >= 1.5 {
+        println!("      -> NvFBC produced {ratio:.1}x DDA's unique frames over the same window.");
+        println!("         It is not refresh-capped, so it is not composition-bound, and");
+        println!("         CLAUDE.md's ~16.7ms DWM composition line is REAL.");
+    } else {
+        println!("      -> NvFBC is within {ratio:.1}x of DDA. Both look refresh-capped, so");
+        println!("         NvFBC does NOT escape composition on this setup. CLAUDE.md's");
+        println!("         'only NvFBC/hooking avoids this' should be corrected, which also");
+        println!("         removes the main argument for the Phase 7 swapchain hook.");
+    }
+    println!("         Read this against the display's actual refresh rate before acting.");
+}
+
 fn report_nvfbc(attempt_enable: bool) {
     use crate::nvfbc::{Generation, result_name};
 
     println!("== NvFBC (ROADMAP 0.1) ==");
-    let report = crate::nvfbc::probe(attempt_enable);
+    let mut report = crate::nvfbc::probe(attempt_enable);
 
     let Some(dll) = report.dll else {
         println!("  UNAVAILABLE -- no NvFBC runtime found.");
@@ -113,12 +169,13 @@ fn report_nvfbc(attempt_enable: bool) {
         if let Some(s) = status {
             println!(
                 "  GetStatusEx {label}: {} -- capture_possible {}, capturing {}, \
-multi_head {}, multi_client {}, iface v{}",
+multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
                 result_name(s.result),
                 s.capture_possible as u8,
                 s.currently_capturing as u8,
                 s.multi_head as u8,
-                s.multi_client as u8,
+                s.configurable_diffmap as u8,
+                s.image_classification as u8,
                 s.nvfbc_version,
             );
         }
@@ -132,7 +189,7 @@ multi_head {}, multi_client {}, iface v{}",
             println!(
                 "  CreateEx    {label}: {} -- object {}, max {}x{}",
                 result_name(c.result),
-                c.got_object as u8,
+                c.got_object() as u8,
                 c.max_width,
                 c.max_height,
             );
@@ -140,8 +197,53 @@ multi_head {}, multi_client {}, iface v{}",
     }
 
     let worked = |c: &Option<crate::nvfbc::Create>| {
-        c.as_ref().is_some_and(|c| c.result == 0 && c.got_object)
+        c.as_ref().is_some_and(|c| c.result == 0 && c.got_object())
     };
+    // The session that succeeded is the one to drive. Nothing else in this
+    // block needs it, so it is taken rather than borrowed.
+    let session = [report.create_keyed.take(), report.create_plain.take()]
+        .into_iter()
+        .flatten()
+        .find(|c| c.result == 0 && c.got_object());
+    let mut captured = false;
+    if let Some(c) = &session {
+        println!();
+        println!("== NvFBC capture ==");
+        // SAFETY: `c.object` is a live INvFBCToSys from a successful
+        // NvFBC_CreateEx, and this is the only ToSys wrapping it.
+        let mut tosys = unsafe { crate::tosys::ToSys::new(c.object) };
+
+        let argb = crate::tosys::run(&mut tosys, false, false, GRAB_COUNT);
+        crate::tosys::report("ARGB   8-bit", &argb);
+        captured = argb.setup_result == 0 && argb.grabs > 0;
+
+        if captured {
+            interpret_capture(&argb);
+        }
+    }
+
+    // A second session, because SetUp is not re-enterable on a live one: the
+    // 10-bit run needs its own object.
+    if captured
+        && let Some(second) = crate::nvfbc::create_session()
+    {
+        // SAFETY: as above -- a fresh live object, wrapped once.
+        let mut tosys = unsafe { crate::tosys::ToSys::new(second.object) };
+        let hdr = crate::tosys::run(&mut tosys, true, true, GRAB_COUNT);
+        crate::tosys::report("ARGB10 + HDR", &hdr);
+        if hdr.setup_result == 0 {
+            if hdr.is_hdr {
+                println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");
+                println!("      Note the buffer is A2B10G10R10, NOT the scRGB FP16 CLAUDE.md's");
+                println!("      shader notes assume. The shader's input stage would change.");
+            } else {
+                println!("      bIsHDR clear. Either the display is not in HDR mode right now,");
+                println!("      or the driver declined the request -- check Windows HDR is on");
+                println!("      before reading this as a capability answer.");
+            }
+        }
+    }
+
     println!();
     if worked(&report.create_plain) {
         println!("  -> NvFBC works with no key at all, so this card is not gated.");

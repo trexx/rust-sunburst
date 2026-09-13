@@ -51,10 +51,16 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 use windows::core::PCSTR;
 
 /// `NVFBC_DLL_VERSION` from `nvFBC.h`.
-const NVFBC_DLL_VERSION: u32 = 0x50;
+///
+/// Capture SDK 7.x, which is the generation the box reports: `GetSDKVersion`
+/// comes back `0x70`. An earlier transcription used `0x50` and worked, because
+/// the two structs it declared happen to be byte-identical across the two SDKs
+/// and the driver accepts the older word. The ToSys structs below are *not*
+/// identical across them, so matching the runtime is no longer optional.
+const NVFBC_DLL_VERSION: u32 = 0x70;
 
 /// `NVFBC_STRUCT_VERSION(typeName, ver)`: `sizeof | ver<<16 | DLL_VERSION<<24`.
-const fn struct_version(size: usize, ver: u32) -> u32 {
+pub(crate) const fn struct_version(size: usize, ver: u32) -> u32 {
     (size as u32) | (ver << 16) | (NVFBC_DLL_VERSION << 24)
 }
 
@@ -83,7 +89,13 @@ const MAGIC: [u32; 4] = [0xAEF5_7AC5, 0x401D_1A39, 0x1B85_6BBE, 0x9ED0_CEBA];
 struct NvFbcStatusEx {
     version: u32,
     /// `bIsCapturePossible:1`, `bCurrentlyCapturing:1`, `bCanCreateNow:1`,
-    /// `bSupportMultiHead:1`, `bSupportMultiClient:1`, then 27 reserved.
+    /// `bSupportMultiHead:1`, `bSupportConfigurableDiffMap:1`,
+    /// `bSupportImageClassification:1`, then 26 reserved.
+    ///
+    /// Bits 4 and 5 differ from the 0x50 header: what was `bSupportMultiClient`
+    /// is now `bSupportConfigurableDiffMap`, and bit 5 is new. The struct is the
+    /// same size either way, so nothing errored — the earlier run simply printed
+    /// bit 4 under the wrong name.
     flags: u32,
     nvfbc_version: u32,
     adapter_idx: u32,
@@ -197,7 +209,8 @@ pub struct Status {
     pub capture_possible: bool,
     pub currently_capturing: bool,
     pub multi_head: bool,
-    pub multi_client: bool,
+    pub configurable_diffmap: bool,
+    pub image_classification: bool,
     pub nvfbc_version: u32,
 }
 
@@ -205,9 +218,17 @@ pub struct Status {
 #[derive(Debug)]
 pub struct Create {
     pub result: i32,
-    pub got_object: bool,
+    /// The `INvFBCToSys` instance, for [`crate::tosys`] to drive. Null on
+    /// failure.
+    pub object: *mut c_void,
     pub max_width: u32,
     pub max_height: u32,
+}
+
+impl Create {
+    pub fn got_object(&self) -> bool {
+        !self.object.is_null()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -252,13 +273,13 @@ fn symbol(module: HMODULE, name: &str) -> Option<*const c_void> {
     unsafe { GetProcAddress(module, PCSTR(cname.as_ptr().cast())) }.map(|p| p as *const c_void)
 }
 
-/// Reinterpret an export as a function pointer.
+/// Reinterpret an export or vtable slot as a function pointer.
 ///
 /// # Safety
 ///
 /// `T` must be the exact signature the DLL exports under `name`. Every call
 /// site below is transcribed from `nvFBC.h`.
-unsafe fn cast_fn<T: Copy>(ptr: *const c_void) -> T {
+pub(crate) unsafe fn cast_fn<T: Copy>(ptr: *const c_void) -> T {
     debug_assert_eq!(size_of::<T>(), size_of::<*const c_void>());
     // SAFETY: the caller guarantees the signature; a code pointer and a data
     // pointer are the same width on every target this runs on.
@@ -272,8 +293,9 @@ impl Status {
             capture_possible: raw.flags & 0b0_0001 != 0,
             currently_capturing: raw.flags & 0b0_0010 != 0,
             // bit 2 is `bCanCreateNow`, which the header marks deprecated.
-            multi_head: raw.flags & 0b0_1000 != 0,
-            multi_client: raw.flags & 0b1_0000 != 0,
+            multi_head: raw.flags & 0b00_1000 != 0,
+            configurable_diffmap: raw.flags & 0b01_0000 != 0,
+            image_classification: raw.flags & 0b10_0000 != 0,
             nvfbc_version: raw.nvfbc_version,
         }
     }
@@ -297,10 +319,10 @@ fn get_status(f: PfnGetStatusEx, keyed: bool) -> Status {
 
 /// Try to create a `NVFBC_TO_SYS` session, optionally carrying the key.
 ///
-/// The returned object is deliberately **not** released. It is a C++ interface
-/// whose `Release` lives at an index in a vtable this probe has no header for,
-/// and guessing that index is a worse bug than leaking in a process that is
-/// about to exit and unload the DLL anyway.
+/// The object comes back in [`Create::object`] rather than being dropped on the
+/// floor. An earlier version leaked it deliberately, because releasing means
+/// calling a C++ vtable slot and the index was not known from any header on
+/// hand; with the real SDK read, [`crate::tosys::ToSys`] owns and releases it.
 fn try_create(f: PfnCreateEx, keyed: bool) -> Create {
     let mut params = NvFbcCreateParams {
         version: struct_version(CREATE_SIZE, 2),
@@ -317,7 +339,7 @@ fn try_create(f: PfnCreateEx, keyed: bool) -> Create {
     let result = unsafe { f((&raw mut params).cast()) };
     Create {
         result,
-        got_object: !params.nvfbc.is_null(),
+        object: params.nvfbc,
         max_width: params.max_display_width,
         max_height: params.max_display_height,
     }
@@ -396,7 +418,7 @@ pub fn probe(attempt_enable: bool) -> Report {
         let plain = try_create(f, false);
         // Only reach for the key if it is actually needed. A plain success
         // means this card was never gated and the key is a red herring.
-        let needed = plain.result != 0 || !plain.got_object;
+        let needed = plain.result != 0 || !plain.got_object();
         report.create_plain = Some(plain);
         if needed {
             report.create_keyed = Some(try_create(f, true));
@@ -404,6 +426,19 @@ pub fn probe(attempt_enable: bool) -> Report {
     }
 
     report
+}
+
+/// Create one more keyed session, for a second capture configuration.
+///
+/// `NvFBCToSysSetUp` configures a session once; a run at a different pixel
+/// format needs its own object rather than a second setup call on a live one.
+pub fn create_session() -> Option<Create> {
+    let module = CANDIDATES.into_iter().find_map(load)?;
+    let p = symbol(module, "NvFBC_CreateEx")?;
+    // SAFETY: signature transcribed from nvFBC.h.
+    let f: PfnCreateEx = unsafe { cast_fn(p) };
+    let created = try_create(f, true);
+    (created.result == 0 && created.got_object()).then_some(created)
 }
 
 /// `NVFBCRESULT` names, from `nvFBC.h`.
