@@ -258,6 +258,33 @@ fn describe(signal: &Signal) -> Option<(u32, u32)> {
         "  window: ({},{})-({},{}), visible {}, read point ({},{})",
         rect[0], rect[1], rect[2], rect[3], visible, read.0, read.1
     );
+
+    // Is the presenter actually painting? A window that never presents shows
+    // whatever is behind it, which is indistinguishable from no window at all --
+    // and that is exactly what the first run of this looked like.
+    let before = signal.presents.load(Relaxed);
+    let settle = clock::now() + clock::ticks_per_sec() / 3;
+    while clock::now() < settle {
+        std::hint::spin_loop();
+    }
+    let presents = signal.presents.load(Relaxed) - before;
+    let render_errors = signal.render_errors.load(Relaxed);
+    let present_errors = signal.present_errors.load(Relaxed);
+    println!(
+        "  presenting: {presents} frames in 333ms ({render_errors} render errors, \
+{present_errors} present errors)"
+    );
+    if presents == 0 {
+        let hr = signal.first_hr.load(Relaxed);
+        println!("  -> The presenter is NOT painting, so there is no signal to capture and");
+        println!("     nothing below would mean anything.");
+        if hr != 0 {
+            println!("     First failure: HRESULT 0x{:08X}.", hr as u32);
+        }
+        println!("     An unpainted window shows whatever is behind it, which is why this");
+        println!("     looks like no window rather than a blank one.");
+        return None;
+    }
     if rect[2] <= rect[0] || rect[3] <= rect[1] {
         println!("  -> The window has no area. Nothing can be measured; this is a setup");
         println!("     failure, not a result.");

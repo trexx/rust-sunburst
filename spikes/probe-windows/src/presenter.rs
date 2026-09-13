@@ -56,7 +56,8 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetWindowRect, IsWindowVisible, MSG,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowRect,
+    IsWindowVisible, MSG,
     PM_REMOVE, PeekMessageW, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage, WNDCLASSW,
     WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
@@ -98,6 +99,14 @@ pub struct Signal {
     pub flip_qpc: AtomicU64,
     /// Presents issued, for the stress comparison.
     pub presents: AtomicU64,
+    /// Frames where acquiring the back buffer or its view failed. A non-zero
+    /// count here means the window is never painted — which looks exactly like
+    /// no window at all, because an unpainted popup shows whatever is behind it.
+    pub render_errors: AtomicU64,
+    /// Frames where `Present` itself failed.
+    pub present_errors: AtomicU64,
+    /// HRESULT of the first failure of either kind, so the cause is nameable.
+    pub first_hr: AtomicI32,
     /// Set by the capture side to bring the presenter down.
     pub stop: AtomicBool,
     /// Whether tearing was available, so the stress figure can be read honestly.
@@ -319,13 +328,13 @@ fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<
     let built = create_window().and_then(|hwnd| {
         let sc = create_swapchain(hwnd, mode == Mode::Stress)?;
         publish_geometry(hwnd, signal);
-        Ok(sc)
+        Ok((hwnd, sc))
     });
-    let sc = match built {
-        Ok(sc) => {
+    let (hwnd, sc) = match built {
+        Ok((hwnd, sc)) => {
             signal.tearing.store(sc.tearing, Ordering::Relaxed);
             let _ = ready.send(Ok(()));
-            sc
+            (hwnd, sc)
         }
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -385,7 +394,14 @@ fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<
                     Ok(())
                 })
         };
-        if rendered.is_err() {
+        if let Err(e) = rendered {
+            // Skipping the Present is right — there is nothing to show — but the
+            // first version also skipped it silently, and silently not painting
+            // is indistinguishable from having no window.
+            signal.render_errors.fetch_add(1, Ordering::Relaxed);
+            let _ = signal
+                .first_hr
+                .compare_exchange(0, e.code().0, Ordering::Relaxed, Ordering::Relaxed);
             continue;
         }
 
@@ -398,7 +414,7 @@ fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<
 
         // SAFETY: the swapchain is live; tearing is only requested when the
         // adapter reported support and the swapchain was created with the flag.
-        let _ = unsafe {
+        let presented = unsafe {
             sc.swapchain.Present(
                 0,
                 if sc.tearing {
@@ -408,6 +424,22 @@ fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<
                 },
             )
         };
-        signal.presents.fetch_add(1, Ordering::Relaxed);
+        if presented.is_ok() {
+            signal.presents.fetch_add(1, Ordering::Relaxed);
+        } else {
+            signal.present_errors.fetch_add(1, Ordering::Relaxed);
+            let _ = signal.first_hr.compare_exchange(
+                0,
+                presented.0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
     }
+
+    // Tidy up between the two phases rather than leaving a stale window on
+    // screen. Thread exit would destroy it anyway; being explicit means the
+    // stress phase's window is unambiguously a new one.
+    // SAFETY: `hwnd` belongs to this thread and is destroyed exactly once.
+    unsafe { let _ = DestroyWindow(hwnd); }
 }
