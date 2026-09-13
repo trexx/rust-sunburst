@@ -124,7 +124,7 @@ fn report_nvfbc(attempt_enable: bool) {
     use crate::nvfbc::{Generation, result_name};
 
     println!("== NvFBC (ROADMAP 0.1) ==");
-    let mut report = crate::nvfbc::probe(attempt_enable);
+    let report = crate::nvfbc::probe(attempt_enable);
 
     let Some(dll) = report.dll else {
         println!("  UNAVAILABLE -- no NvFBC runtime found.");
@@ -199,66 +199,62 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
     let worked = |c: &Option<crate::nvfbc::Create>| {
         c.as_ref().is_some_and(|c| c.result == 0 && c.got_object())
     };
-    // The session that succeeded is the one to drive. Nothing else in this
-    // block needs it, so it is taken rather than borrowed.
-    let session = [report.create_keyed.take(), report.create_plain.take()]
-        .into_iter()
-        .flatten()
-        .find(|c| c.result == 0 && c.got_object());
+    // Decide the verdict from the create results *before* anything consumes
+    // them. An earlier version took them first and then tested the emptied
+    // Options, which reported "CreateEx refused" directly under a line saying it
+    // succeeded.
+    let created_unkeyed = worked(&report.create_plain);
+    let created_keyed = worked(&report.create_keyed);
+    let status_says_possible = report
+        .status_keyed
+        .as_ref()
+        .is_some_and(|s| s.capture_possible);
+
     let mut captured = false;
-    if let Some(c) = &session {
+    if created_unkeyed || created_keyed {
         println!();
         println!("== NvFBC capture ==");
-        // SAFETY: `c.object` is a live INvFBCToSys from a successful
-        // NvFBC_CreateEx, and this is the only ToSys wrapping it.
-        let mut tosys = unsafe { crate::tosys::ToSys::new(c.object) };
-
-        let argb = crate::tosys::run(&mut tosys, false, false, GRAB_COUNT);
-        crate::tosys::report("ARGB   8-bit", &argb);
-        captured = argb.setup_result == 0 && argb.grabs > 0;
-
-        if captured {
-            interpret_capture(&argb);
+        // Each variant needs its own session, so the sessions created during
+        // detection are not reused here; they are released on drop.
+        if let Some((mut session, variant)) = crate::tosys::probe_variants(false, false) {
+            println!("  SetUp accepted with: {}", variant.name().trim());
+            let argb = crate::tosys::run(&mut session, GRAB_COUNT);
+            crate::tosys::report("ARGB   8-bit", &argb);
+            captured = argb.grabs > 0;
+            if captured {
+                interpret_capture(&argb);
+            }
+        } else {
+            println!("  No setup shape was accepted. The capture question stays open;");
+            println!("  the vtable dump above says whether the calls even reached NvFBC.");
         }
     }
 
-    // A second session, because SetUp is not re-enterable on a live one: the
-    // 10-bit run needs its own object.
-    if captured
-        && let Some(second) = crate::nvfbc::create_session()
-    {
-        // SAFETY: as above -- a fresh live object, wrapped once.
-        let mut tosys = unsafe { crate::tosys::ToSys::new(second.object) };
-        let hdr = crate::tosys::run(&mut tosys, true, true, GRAB_COUNT);
+    if captured && let Some((mut session, _)) = crate::tosys::probe_variants(true, true) {
+        let hdr = crate::tosys::run(&mut session, GRAB_COUNT);
         crate::tosys::report("ARGB10 + HDR", &hdr);
-        if hdr.setup_result == 0 {
-            if hdr.is_hdr {
-                println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");
-                println!("      Note the buffer is A2B10G10R10, NOT the scRGB FP16 CLAUDE.md's");
-                println!("      shader notes assume. The shader's input stage would change.");
-            } else {
-                println!("      bIsHDR clear. Either the display is not in HDR mode right now,");
-                println!("      or the driver declined the request -- check Windows HDR is on");
-                println!("      before reading this as a capability answer.");
-            }
+        if hdr.is_hdr {
+            println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");
+            println!("      Note the buffer is A2B10G10R10, NOT the scRGB FP16 CLAUDE.md's");
+            println!("      shader notes assume. The shader's input stage would change.");
+        } else {
+            println!("      bIsHDR clear. Either the display is not in HDR mode right now,");
+            println!("      or the driver declined the request -- check Windows HDR is on");
+            println!("      before reading this as a capability answer.");
         }
     }
 
     println!();
-    if worked(&report.create_plain) {
+    if created_unkeyed {
         println!("  -> NvFBC works with no key at all, so this card is not gated.");
         println!("     It becomes a candidate priority-1 backend on its own merits.");
-    } else if worked(&report.create_keyed) {
+    } else if created_keyed {
         println!("  -> NvFBC is present and switched OFF, not absent: the same call that");
         println!("     fails unkeyed succeeds carrying the private-data key. That is the");
         println!("     evidence the key is what mattered -- a keyed-only run proves nothing.");
         println!("     What it licenses is a measurement, not a backend. See");
         println!("     HARDWARE_TESTING.md section 1 before building on it.");
-    } else if report
-        .status_keyed
-        .as_ref()
-        .is_some_and(|s| s.capture_possible)
-    {
+    } else if status_says_possible {
         println!("  -> Status says capture is possible but CreateEx still refused. Worth a");
         println!("     re-run with --enable-nvfbc, which is the step that needs elevation.");
     } else {

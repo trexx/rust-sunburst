@@ -72,6 +72,51 @@ const NVFBC_TOSYS_NOWAIT: u32 = 0x1;
 /// `bDiffMap` and `bEnableSeparateCursorCapture`.
 const SETUP_FLAG_HDR_REQUEST: u32 = 1 << 3;
 
+/// Which shape of setup call to try.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    Baseline,
+    NonNullOutPtrs,
+    WithHwCursor,
+    LegacyV2,
+}
+
+impl Variant {
+    pub const ALL: [Variant; 4] = [
+        Variant::Baseline,
+        Variant::NonNullOutPtrs,
+        Variant::WithHwCursor,
+        Variant::LegacyV2,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Variant::Baseline => "baseline      ",
+            Variant::NonNullOutPtrs => "non-null outs ",
+            Variant::WithHwCursor => "with HW cursor",
+            Variant::LegacyV2 => "legacy V2     ",
+        }
+    }
+}
+
+/// `NVFBC_TOSYS_SETUP_PARAMS_V2`, the 0x50-era shape.
+///
+/// Same 504 bytes as V3 but a different field order, so a version mismatch here
+/// reads pointers from the wrong offsets rather than failing a size check.
+#[repr(C)]
+struct LegacyV2Params {
+    version: u32,
+    flags: u32,
+    mode: u32,
+    reserved1: u32,
+    pp_buffer: *mut *mut c_void,
+    pp_diffmap: *mut *mut c_void,
+    cursor_capture_event: *mut c_void,
+    reserved: [u32; 58],
+    reserved_ptrs: [*const c_void; 29],
+}
+const _: () = assert!(size_of::<LegacyV2Params>() == 504);
+
 /// `NvFBCFrameGrabInfo`, 0x70 layout.
 ///
 /// Differs from the 0x50 one: `bIsHDR`, `bReservedBit1`, `bReservedBits:30` and
@@ -205,6 +250,10 @@ pub struct ToSys {
     /// NvFBC allocates the frame buffer and writes its address here during
     /// setup; it stays valid for the life of the session.
     buffer: *mut c_void,
+    /// Landing slots for [`Variant::NonNullOutPtrs`], so the driver has
+    /// somewhere real to write even though the matching features are off.
+    spare_diffmap: *mut c_void,
+    spare_classification: *mut c_void,
 }
 
 impl ToSys {
@@ -216,6 +265,8 @@ impl ToSys {
         ToSys {
             object,
             buffer: std::ptr::null_mut(),
+            spare_diffmap: std::ptr::null_mut(),
+            spare_classification: std::ptr::null_mut(),
         }
     }
 
@@ -233,7 +284,14 @@ impl ToSys {
         }
     }
 
-    fn setup(&mut self, ten_bit: bool, hdr: bool) -> i32 {
+    /// One setup attempt, shaped by `variant`.
+    ///
+    /// The variants exist because the first run came back `ERROR_INVALID_PTR`
+    /// from a call whose parameters match NVIDIA's own ToSys sample field for
+    /// field, with struct sizes and offsets independently confirmed against the
+    /// MSVC ABI. When the obvious reading is exhausted, asking the driver which
+    /// shape it accepts beats guessing again.
+    fn setup_with(&mut self, variant: Variant, ten_bit: bool, hdr: bool) -> i32 {
         let mut params = SetupParams {
             version: nvfbc::struct_version(SETUP_SIZE, 3),
             mode: if ten_bit {
@@ -246,6 +304,37 @@ impl ToSys {
         };
         if hdr {
             params.flags |= SETUP_FLAG_HDR_REQUEST;
+        }
+        match variant {
+            Variant::Baseline => {}
+            // In case the driver dereferences these regardless of the flags
+            // that are supposed to gate them.
+            Variant::NonNullOutPtrs => {
+                params.pp_diffmap = &raw mut self.spare_diffmap;
+                params.pp_classification_map = &raw mut self.spare_classification;
+            }
+            Variant::WithHwCursor => params.flags |= 1,
+            // The 0x50-era struct is a different shape at the same 504 bytes, so
+            // a driver expecting it would read our pointers from the wrong
+            // offsets -- which would present as exactly this error.
+            Variant::LegacyV2 => {
+                params = SetupParams {
+                    version: nvfbc::struct_version(SETUP_SIZE, 2),
+                    ..Default::default()
+                };
+                let v2 = (&raw mut params).cast::<LegacyV2Params>();
+                // SAFETY: `params` is 504 bytes of zeroed, writable storage, and
+                // LegacyV2Params is the same size -- asserted below.
+                unsafe {
+                    (*v2).version = nvfbc::struct_version(SETUP_SIZE, 2);
+                    (*v2).mode = if ten_bit {
+                        NVFBC_TOSYS_ARGB10
+                    } else {
+                        NVFBC_TOSYS_ARGB
+                    };
+                    (*v2).pp_buffer = &raw mut self.buffer;
+                }
+            }
         }
 
         // SAFETY: slot 0 is NvFBCToSysSetUp(NVFBC_TOSYS_SETUP_PARAMS_V3*), and
@@ -282,6 +371,76 @@ impl Drop for ToSys {
         unsafe { f(self.object) };
         self.object = std::ptr::null_mut();
     }
+}
+
+/// Report where each vtable slot actually points.
+///
+/// If slot 0 is not inside `NvFBC64.dll`, the vtable read is wrong and every
+/// conclusion drawn from a call through it is worthless. Cheap to check, and it
+/// separates "our pointer arithmetic is wrong" from "the driver refused".
+pub fn report_vtable(session: &ToSys) {
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameA, GetModuleHandleExA,
+    };
+
+    println!("  vtable at {:p}:", session.object);
+    for index in 0..5usize {
+        // SAFETY: the object's first word is its vtable pointer; slots 0..5 are
+        // the five virtuals INvFBCToSys_v4 declares.
+        let entry = unsafe {
+            let vtable = *(session.object as *const *const *const c_void);
+            *vtable.add(index)
+        };
+
+        let mut module = HMODULE::default();
+        // SAFETY: `entry` is only used as an address to attribute, never called.
+        let owner = unsafe {
+            GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                windows::core::PCSTR(entry.cast()),
+                &mut module,
+            )
+        };
+
+        let mut name = [0u8; 260];
+        let owner = if owner.is_ok() {
+            // SAFETY: `module` is a live handle and `name` is a valid buffer.
+            let len = unsafe { GetModuleFileNameA(Some(module), &mut name) } as usize;
+            String::from_utf8_lossy(&name[..len.min(name.len())])
+                .rsplit('\\')
+                .next()
+                .unwrap_or("?")
+                .to_string()
+        } else {
+            "NOT IN ANY LOADED MODULE".to_string()
+        };
+        println!("    slot {index}: {entry:p}  {owner}");
+    }
+}
+
+/// Try each setup shape until one is accepted, reporting every result.
+pub fn probe_variants(ten_bit: bool, hdr: bool) -> Option<(ToSys, Variant)> {
+    let mut accepted = None;
+    for variant in Variant::ALL {
+        let Some(created) = nvfbc::create_session() else {
+            println!("    {}: no session to try it on", variant.name());
+            continue;
+        };
+        // SAFETY: a fresh live object from NvFBC_CreateEx, wrapped once.
+        let mut session = unsafe { ToSys::new(created.object) };
+        if accepted.is_none() {
+            report_vtable(&session);
+        }
+        let status = session.setup_with(variant, ten_bit, hdr);
+        println!("    {}: {}", variant.name(), result_name(status));
+        if status == 0 && accepted.is_none() {
+            accepted = Some((session, variant));
+        }
+    }
+    accepted
 }
 
 /// One capture run's results.
@@ -333,10 +492,10 @@ fn sample_hash(buffer: *const u8, len: usize) -> u64 {
     hash
 }
 
-/// Set up and grab `count` frames, timing each grab.
-pub fn run(session: &mut ToSys, ten_bit: bool, hdr: bool, count: u32) -> Capture {
+/// Grab `count` frames from an already-set-up session, timing each grab.
+pub fn run(session: &mut ToSys, count: u32) -> Capture {
     let mut result = Capture {
-        setup_result: session.setup(ten_bit, hdr),
+        setup_result: 0,
         grabs: 0,
         failures: 0,
         unique: 0,
