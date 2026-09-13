@@ -11,7 +11,7 @@ phase's acceptance criteria pass.
 Throwaway code. The point is to resolve architecture-invalidating unknowns before
 committing to any of them.
 
-### 0.1 NvFBC availability — **still open, and for an instructive reason**
+### 0.1 NvFBC availability — **unlocked and measurable; verdict still open**
 NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
 developers to Desktop Duplication. The instruction was to assume it unavailable
 until proven otherwise on this exact driver, and the first probe run appeared to
@@ -28,11 +28,19 @@ And the third possibility turned out to be the real one: not "available" or
 "absent" but **present and switched off**. Keyed `CreateEx` succeeds where unkeyed
 fails, on this exact driver, for a 3840x2160 session.
 
-That settles *access*, not *value*. Neither branch above is taken yet, because
-the question the branches turn on — what skipping DWM composition actually
-recovers — is now a measurement the probe can take rather than a claim to accept.
-`HARDWARE_TESTING.md` §1 carries the result and the two traps found on the way
-(status is not the gate; a status bit had drifted meaning between SDK versions).
+Then it was measured, and the answer **depends on the desktop's colour mode**, so
+the branch is not taken yet. In SDR, NvFBC ToSys delivers 0.68x Desktop
+Duplication with a 21ms p99 tail. In HDR — which is the actual workload — the
+8-bit path freezes entirely and ARGB10 looks competitive, but that run had no
+controlled DDA comparison beside it. The probe now measures both formats with
+their own control; until that lands, no verdict.
+
+That it has taken five runs to get here is the more useful lesson, and
+`HARDWARE_TESTING.md` §1 records the wrong turns as well as the findings: an idle
+desktop that made both paths look identical, a polling loop that measured our own
+asking rate, a status bit that had drifted meaning between SDK versions, a setup
+struct whose *generation* — not layout — was what the driver rejected, and a
+conclusion drawn in SDR that HDR promptly undercut.
 
 The other half of 0.1 — the encoder capability matrix — is answered, with AV1 at
 parity with HEVC on reference invalidation and subframe readback. That is the
@@ -72,11 +80,10 @@ manage later:
 **Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
 table seeded.
 
-One of the three is done: the codec matrix is measured. The NvFBC decision is
-**not** made — the first answer was a wrong-entry-point false negative and the
-keyed legacy path has not been run yet. The quirks table is half-seeded: the
-Shield is enumerated, the Homatics is not. So **the NvFBC re-run, 0.2 and 0.3 all
-stand between here and Phase 0 closing** — one needs the server, two need the
+One of the three is done: the codec matrix is measured. The NvFBC decision needs
+one more run — the controlled HDR comparison. The quirks table is half-seeded:
+the Shield is enumerated, the Homatics is not. So **that NvFBC run, 0.2 and 0.3
+stand between here and Phase 0 closing** — one needs the server, two the
 Homatics.
 
 ---
@@ -234,11 +241,10 @@ Ordered by value, not difficulty.
   Solves resolution matching and HDR mode control cleanly. Requires an EV-signed
   WDDM driver; strongly consider consuming an existing VDD (Parsec VDD, Virtual
   Display Driver) rather than authoring one.
-- **NvFBC** — still conditional on Phase 0.1, which is not settled: the legacy
-  Windows API is present and the keyed probe has not been run. Note that even a
-  positive result does not make this a default backend — an undocumented key that
-  a driver update can invalidate is at most an opt-in fast path behind DDA/WGC.
-  Its first use is to *price* the swapchain-hook item below.
+- **NvFBC** — still conditional on Phase 0.1, which now has numbers but not a
+  verdict: 0.68x DDA in SDR, undetermined in HDR. Even a win would not make it a
+  default backend — an undocumented key a driver update can invalidate is at most
+  an opt-in fast path behind DDA/WGC. See `HARDWARE_TESTING.md` §1.
 - **Swapchain hooking** — opt-in, with an explicit anti-cheat warning. Hook
   `IDXGISwapChain::Present`/`Present1`/`ResizeBuffers`, `vkQueuePresentKHR`,
   `wglSwapBuffers`, and D3D9 `EndScene`/`Present`. D3D9Ex can share surfaces to
@@ -349,7 +355,7 @@ Ranked by latency. Full detail in CLAUDE.md traps.
 |---|---|---|
 | Swapchain hook | Pre-composition, saves ~1 frame, uncapped fps | Phase 7, opt-in |
 | IDD | Very good; solves headless + resolution matching | Phase 7 |
-| NvFBC | Lowest official; feeds NVENC directly | Phase 0 probe — **legacy API present, keyed run pending** |
+| NvFBC | Assumed lowest; **0.68x DDA in SDR**, HDR undetermined | Phase 0.1 — verdict pending |
 | WGC | Post-composition, refresh-capped | Phase 3, Win11 default |
 | DDA | Post-composition, refresh-capped | Phase 3, Win10 default |
 

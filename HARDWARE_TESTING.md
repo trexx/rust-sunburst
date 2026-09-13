@@ -125,45 +125,53 @@ never reachable with one encoder either way.
       refusing. Worth keeping: the driver reports `0x70` from `GetSDKVersion`
       while rejecting that generation's setup struct, so **the reported version
       does not tell you which struct generation to send.**
-- [ ] **Capture throughput vs DDA — ran, and came back INCONCLUSIVE.**
-      First attempt: NvFBC 2.4 unique frames/sec, DDA 2.4 new frames/sec. Those
-      are equal, and they are equal because **the desktop was idle** — two unique
-      frames in the whole window. Both numbers measure how often the screen
-      changed, not how fast either path can capture.
+- [~] **Capture throughput vs DDA — measured in SDR, undetermined in HDR.**
 
-      The probe printed a confident verdict off that anyway, because its
-      static-desktop guard only triggered at ≤1 unique frame. The guard is now 20
-      and it reports inconclusive instead. **CLAUDE.md's ~16.7ms DWM line stands
-      as written — neither confirmed nor refuted.**
+      | path | delivery rate | per-grab cost |
+      |---|---|---|
+      | DDA (SDR) | **111.0 new frames/sec** | ~0 to poll |
+      | NvFBC ToSys, blocking | **75.1 unique frames/sec** | 7.20ms p50 / 21.06ms p99 |
+      | NvFBC ToSys, polling | 70.4 unique frames/sec | 3.61ms p50 / 4.21ms p99 |
 
-      **Re-run with something animating full-screen**, a video or a game in Big
-      Picture. That is the whole experiment; an idle desktop cannot answer it.
-- [x] **ToSys costs ~4ms per grab at 4K, idle or not.** p50 4.08ms, p99 4.77ms
-      with nothing moving on screen, which is the **sysmem readback** — ToSys
-      copies whether or not the frame is new.
+      **0.68x DDA in SDR**, at 4K with motion on screen, and a 21ms p99 tail
+      against a 16.7ms frame.
 
-      That is a large fraction of the frame budget spent moving pixels *off* the
-      GPU, and this pipeline then needs them back on it for the scRGB→P010 shader
-      and NVENC. It is an argument against `NVFBC_TO_SYS` specifically, separate
-      from and unaffected by how the composition question lands: if NvFBC is ever
-      pursued, `NvFBCToDx9Vid` or `NvFBCToCuda` are the interfaces to measure,
-      since both hand back something already on the GPU.
-- [ ] **10-bit and HDR capture — first attempt did not actually ask.**
-      `ARGB10` captured fine, but `bIsHDR` came back clear because the V2 code
-      path rebuilt the setup params and dropped the HDR request flag on the way.
-      That result meant nothing and has been discarded.
+      **That verdict does not survive turning HDR on**, which is the actual
+      workload. The next run showed ARGB10 taking 174 unique frames in a shorter
+      window — roughly 96 unique/sec against DDA's 80.4 — so NvFBC may well win
+      in the mode that matters. It is not a result yet: the two figures came from
+      different windows with no control beside the ARGB10 run. The probe now
+      measures **both formats with their own DDA control**, and the verdict waits
+      for that.
 
-      Two cautions for the re-run. **Turn Windows HDR on first**, or a clear
-      `bIsHDR` still only means "not in HDR mode". And `bHDRRequest`'s bit
-      position in the **V2** struct is *inferred*, not read — it is bit 3 in V3,
-      which this driver rejects, and the SDK 6.0 header that would confirm it for
-      V2 is not on hand. `bIsHDR` sits in the same newer generation, so a clear
-      result may mean the bit was never asked for rather than refused.
+      Three earlier attempts at this number were wrong, recorded so the mistakes
+      are not repeated: the first compared against an *idle* desktop; the second
+      polled with `NOWAIT`, where 447 of 500 grabs re-copied a frame already seen
+      at full cost; the third drew an SDR conclusion about an HDR workload. Only
+      a blocking figure against a same-window control is comparable, because
+      DDA's `AcquireNextFrame` returns free when nothing is ready — approaching a
+      million attempts per window — while ToSys pays a full copy every time.
 
-      Note the format is **A2B10G10R10** — a 10-bit integer buffer, *not* the
-      scRGB linear FP16 the HDR notes in CLAUDE.md assume. If this path were ever
-      used the shader's input stage changes, so record what the transfer and
-      primaries actually are; the header does not say.
+- [x] **10-bit and HDR capture works.** With Windows HDR on, `NVFBC_TOSYS_ARGB10`
+      captures and **`bIsHDR` comes back set**. The inferred V2 bit position for
+      `bHDRRequest` was therefore right — bit 3, the same slot it occupies in the
+      V3 struct this driver rejects.
+
+      The buffer is **A2B10G10R10**, a 10-bit integer format — *not* the scRGB
+      linear FP16 CLAUDE.md's HDR notes assume. If this path is ever used, the
+      shader's input stage changes: no 80-nit normalise from linear, and the
+      transfer and primaries of that buffer still need establishing.
+- [x] **In HDR mode, 8-bit ARGB capture silently freezes.** One unique frame
+      across 800 grabs while DDA saw 80.4 new frames/sec over the same window —
+      so the screen was moving and the capture path was not. It does not fail, it
+      does not error, it returns one stale frame forever.
+
+      This is the same shape as the av1C trap in CLAUDE.md: configures cleanly,
+      produces nothing usable. Any capture backend must pick its pixel format
+      from the desktop's colour mode, and **must re-pick when that mode changes**
+      — Windows 10's HDR toggle is global and flips under a running session. The
+      probe now names this case explicitly rather than reporting it as a static
+      desktop.
 - [ ] **`--enable-nvfbc`, only if `CreateEx` refuses while status says capture is
       possible.** `NvFBC_Enable` needs elevation and **resets the display driver**,
       which on a box someone is watching is indistinguishable from a crash — so
@@ -216,15 +224,26 @@ more. Encode time stays a fixed 5–10ms floor, which is what makes the line abo
 load-bearing rather than an optimisation. Note the floor itself is still the
 inherited Blackwell-era *estimate*; §4 is where Ada's real number goes.
 
-**NvFBC is half-decided: it unlocks, and what it is worth is still unmeasured.**
-DWM composition is ~16.7ms in CLAUDE.md's budget — the largest single line in the
-table, larger than encode — and NvFBC and swapchain hooking are the only two ways
-past it. That the key works settles *access*. It does not settle *value*, and the
-capture run above is what does.
+**NvFBC is unlocked, working, and not yet judged.** The key works, a 4K session
+opens, capture runs, and HDR capture works. What it is *worth* turns on a
+comparison that has been got wrong three times and is now, finally, set up
+properly: both pixel formats, each against its own DDA control, in the colour
+mode the workload actually uses.
 
-**What a keyed success would and would not license.** It would not make NvFBC a
-priority-1 backend, for three reasons that are all independent of whether the
-call succeeds:
+What is already firm: ToSys charges **~3.6ms of readback per frame** and copies
+whether or not the frame is new, so pixels leave the GPU only to need
+re-uploading for the scRGB→P010 shader and NVENC. If NvFBC is pursued after the
+HDR numbers land, `NvFBCToDx9Vid` or `NvFBCToCuda` are the interfaces to measure,
+since both keep the frame on the GPU.
+
+Also firm: **DDA sustains 111 new frames/sec at 4K in SDR, 80.4 in HDR** — both
+comfortably past the 60 this project needs. Whatever NvFBC turns out to be worth,
+capture throughput is not currently a bottleneck, which caps how much any of this
+is worth chasing.
+
+**Why this was never going to be a backend even if it had been fast.** Three
+reasons, all independent of the measurement, and worth keeping because they are
+why the result was not a disappointment:
 
 - The key is undocumented and can stop working on any driver update. A capture
   backend that can vanish in a driver release is not a default; at most it is an

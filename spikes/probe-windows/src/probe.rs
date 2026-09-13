@@ -81,6 +81,37 @@ const BLOCKING_COUNT: u32 = 300;
 /// that should have stopped it.
 const MIN_UNIQUE_FOR_VERDICT: usize = 20;
 
+/// Poll, block, and compare against DDA, for one pixel format.
+fn measure(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: bool) {
+    println!();
+    let Some(mut session) = crate::tosys::open(variant, ten_bit, hdr) else {
+        return;
+    };
+    let polled = crate::tosys::run(&mut session, GRAB_COUNT, false);
+    crate::tosys::report(&format!("{label} poll "), &polled);
+    let blocked = crate::tosys::run(&mut session, BLOCKING_COUNT, true);
+    crate::tosys::report(&format!("{label} block"), &blocked);
+
+    if ten_bit {
+        if blocked.is_hdr || polled.is_hdr {
+            println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");
+            println!("      The buffer is A2B10G10R10, NOT the scRGB FP16 CLAUDE.md's shader");
+            println!("      notes assume, so the shader's input stage would change.");
+        } else {
+            println!("      bIsHDR clear -- either the desktop is not in HDR mode, or the");
+            println!("      request never landed (the V2 bit position is inferred).");
+        }
+    }
+
+    // Release before measuring DDA: holding a live NvFBC session while timing
+    // the control would be measuring them together, not against each other.
+    drop(session);
+
+    if polled.grabs > 0 {
+        interpret_capture(&polled, &blocked);
+    }
+}
+
 /// The question the capture run exists to answer.
 ///
 /// Deliberately comparative. An NvFBC frame rate on its own says nothing, since
@@ -128,9 +159,16 @@ fn interpret_capture(polled: &crate::tosys::Capture, blocked: &crate::tosys::Cap
         println!("         numbers measure how often the screen changed, not how fast either");
         println!("         path can capture. No verdict is drawn from this.");
         println!();
-        println!("         Re-run with something animating full-screen -- a video, or a game");
-        println!("         in Big Picture. Until then CLAUDE.md's ~16.7ms DWM line stands as");
-        println!("         written, neither confirmed nor refuted.");
+        if blocked.unique <= 2 && dda.fps() > 10.0 {
+            println!("         NOTE: DDA saw {:.0} new frames/sec over the same window, so the", dda.fps());
+            println!("         screen was NOT static -- this capture path is frozen while the");
+            println!("         desktop moves. On an HDR desktop that is what 8-bit ARGB does:");
+            println!("         it returns one stale frame forever rather than failing. Use");
+            println!("         ARGB10 when the desktop is in HDR.");
+        } else {
+            println!("         Re-run with something animating full-screen -- a video, or a game");
+            println!("         in Big Picture. An idle desktop cannot answer this.");
+        }
         return;
     }
 
@@ -241,49 +279,29 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
         .as_ref()
         .is_some_and(|s| s.capture_possible);
 
-    let mut captured = false;
     let mut shape = None;
     if created_unkeyed || created_keyed {
         println!();
         println!("== NvFBC capture ==");
         // Detection released its own sessions, because NvFBC hands out one at a
         // time; each attempt below likewise lives only as long as it is needed.
-        if let Some((mut session, variant)) = crate::tosys::probe_variants(false, false) {
+        if let Some((session, variant)) = crate::tosys::probe_variants(false, false) {
             println!("  SetUp accepted with: {}", variant.name().trim());
-            // Polling first, which exposes the per-grab copy cost, then blocking,
-            // which is the only fair basis for a delivery-rate comparison.
-            let polled = crate::tosys::run(&mut session, GRAB_COUNT, false);
-            crate::tosys::report("ARGB poll  ", &polled);
-            let blocked = crate::tosys::run(&mut session, BLOCKING_COUNT, true);
-            crate::tosys::report("ARGB block ", &blocked);
-            captured = polled.grabs > 0;
+            drop(session);
             shape = Some(variant);
-            if captured {
-                interpret_capture(&polled, &blocked);
-            }
-            // Dropped here, before the 10-bit session is asked for.
         } else {
             println!("  No setup shape was accepted. The capture question stays open;");
             println!("  the vtable dump above says whether the calls even reached NvFBC.");
         }
     }
 
-    // Reuse the shape already known to work rather than re-running the matrix.
-    if captured
-        && let Some(variant) = shape
-        && let Some(mut session) = crate::tosys::open(variant, true, true)
-    {
-        let hdr = crate::tosys::run(&mut session, GRAB_COUNT, false);
-        crate::tosys::report("ARGB10 + HDR", &hdr);
-        if hdr.is_hdr {
-            println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");
-            println!("      Note the buffer is A2B10G10R10, NOT the scRGB FP16 CLAUDE.md's");
-            println!("      shader notes assume. The shader's input stage would change.");
-        } else {
-            println!("      bIsHDR clear. Either the display is not in HDR mode right now,");
-            println!("      or the driver declined the request -- check Windows HDR is on");
-            println!("      before reading this as a capability answer.");
-        }
+    // Both formats get the full treatment, because which one is meaningful
+    // depends on a desktop state the probe does not control. With HDR on, the
+    // 8-bit path returns a single frozen frame; with it off, ARGB10 is the odd
+    // one out. Measuring only one would silently measure the wrong one.
+    if let Some(variant) = shape {
+        measure("ARGB  ", variant, false, false);
+        measure("ARGB10", variant, true, true);
     }
 
     println!();
