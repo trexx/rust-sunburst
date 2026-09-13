@@ -66,7 +66,11 @@ pub(crate) const fn struct_version(size: usize, ver: u32) -> u32 {
 
 /// `NVFBC_TO_SYS`, from `nvFBCToSys.h`. The cheapest interface to ask for: it
 /// needs no D3D device, so a failure is the driver's answer and not ours.
-const NVFBC_TO_SYS: u32 = 0x1204;
+///
+/// Detection uses it for exactly that reason. It is **not** the interface worth
+/// capturing through — see [`crate::tocuda`] for why the sysmem copy rules it
+/// out — but "can a session be created at all" is answered most cheaply here.
+pub(crate) const NVFBC_TO_SYS: u32 = 0x1204;
 
 /// `NVFBC_STATE_ENABLE`.
 const NVFBC_STATE_ENABLE: i32 = 1;
@@ -324,10 +328,10 @@ fn get_status(f: PfnGetStatusEx, keyed: bool) -> Status {
 /// floor. An earlier version leaked it deliberately, because releasing means
 /// calling a C++ vtable slot and the index was not known from any header on
 /// hand; with the real SDK read, [`crate::tosys::ToSys`] owns and releases it.
-fn try_create(f: PfnCreateEx, keyed: bool) -> Create {
+fn try_create(f: PfnCreateEx, keyed: bool, interface_type: u32) -> Create {
     let mut params = NvFbcCreateParams {
         version: struct_version(CREATE_SIZE, 2),
-        interface_type: NVFBC_TO_SYS,
+        interface_type,
         ..Default::default()
     };
     if keyed {
@@ -417,7 +421,7 @@ pub fn probe(attempt_enable: bool) -> Report {
     if let Some(p) = symbol(module, "NvFBC_CreateEx") {
         // SAFETY: signature transcribed from nvFBC.h.
         let f: PfnCreateEx = unsafe { cast_fn(p) };
-        let mut plain = try_create(f, false);
+        let mut plain = try_create(f, false, NVFBC_TO_SYS);
         // Only reach for the key if it is actually needed. A plain success
         // means this card was never gated and the key is a red herring.
         let needed = !plain.succeeded;
@@ -426,7 +430,7 @@ pub fn probe(attempt_enable: bool) -> Report {
         release(&mut plain);
         report.create_plain = Some(plain);
         if needed {
-            let mut keyed = try_create(f, true);
+            let mut keyed = try_create(f, true, NVFBC_TO_SYS);
             release(&mut keyed);
             report.create_keyed = Some(keyed);
         }
@@ -449,11 +453,16 @@ fn release(created: &mut Create) {
     created.object = std::ptr::null_mut();
 }
 
-/// Create one keyed session for the caller to own and release.
+/// Create one keyed `NVFBC_TO_SYS` session for the caller to own and release.
+pub fn create_session() -> Create {
+    create_interface(NVFBC_TO_SYS)
+}
+
+/// Create one keyed session of any interface type.
 ///
 /// Returns the attempt either way, so a failure can be reported with its actual
 /// result code rather than as a bare absence.
-pub fn create_session() -> Create {
+pub fn create_interface(interface_type: u32) -> Create {
     let failed = || Create {
         result: -1,
         object: std::ptr::null_mut(),
@@ -469,7 +478,7 @@ pub fn create_session() -> Create {
     };
     // SAFETY: signature transcribed from nvFBC.h.
     let f: PfnCreateEx = unsafe { cast_fn(p) };
-    try_create(f, true)
+    try_create(f, true, interface_type)
 }
 
 /// `NVFBCRESULT` names, from `nvFBC.h`.

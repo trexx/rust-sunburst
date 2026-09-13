@@ -58,9 +58,14 @@ enumeration tool below writes a file for exactly this reason.
 ## 1. Phase 0.1 — Encoder and capture capabilities (env S)
 
 ```
-probe-windows                  # everything, no side effects
-probe-windows --enable-nvfbc   # adds NvFBC_Enable: needs elevation, resets the driver
+probe-windows                  # NvFBC via ToCuda, the GPU-resident path
+probe-windows --tosys          # also the sysmem path, which copies every frame
+probe-windows --enable-nvfbc   # NvFBC_Enable: needs elevation, resets the driver
 ```
+
+**Run the capture section with something animating full-screen**, and once with
+Windows HDR off and once on. An idle desktop has produced two wrong conclusions
+in this investigation already; the probe now refuses to draw one instead.
 
 Run `spikes/probe-windows`. It answers more than the roadmap asked for, because
 the extra questions cost nothing once the encoder session is open and each one
@@ -152,6 +157,37 @@ never reachable with one encoder either way.
       DDA's `AcquireNextFrame` returns free when nothing is ready — approaching a
       million attempts per window — while ToSys pays a full copy every time.
 
+      **Superseded as the thing to measure.** ToSys is ruled out by its *shape*,
+      not its rate — see the readback row below — so the comparison that decides
+      Phase 0.1 is the ToCuda one.
+- [ ] **`NvFBCToCuda` — the measurement that decides Phase 0.1.** Now the probe's
+      default: the frame is grabbed straight into a CUDA device buffer and never
+      comes back, so the per-grab number is the capture itself rather than a 33MB
+      readback.
+
+      `NvFBCToDx9Vid` also gained ARGB10 at 0x70 and would equally avoid the
+      copy, but ToCuda is the one worth having: **NVENC accepts CUDA device
+      pointers directly**, so a real pipeline could run capture → convert →
+      encode without crossing an API boundary, where ToDx9Vid needs a D3D9Ex
+      device and a shared-surface handoff into D3D11.
+
+      Sanity check on the result: if ToCuda reports anything near ToSys's ~3.6ms
+      per grab, the frame is *not* staying on the GPU and the setup is wrong
+      rather than NvFBC being slow.
+
+      Three details that cost time on the ToSys path and are pre-empted here: the
+      interface id is **0x1007** at 0x70 where the older header says `0x1006`;
+      `NvFBCCudaSetup` is **vtable slot 1**, not 0, since slot 0 is
+      `GetMaxBufferSize` and that is how you learn what to allocate; and
+      `bHDRRequest` is bit 1, **read from the header** rather than inferred.
+
+      No new build dependency: `nvcuda.dll` is the CUDA *driver* API, ships with
+      the driver, and is `LoadLibrary`d at runtime exactly as NVENC already is.
+      Its exports carry `_v2` suffixes (`cuMemAlloc` really resolves to
+      `cuMemAlloc_v2`), so the loader tries `_v2` first and **prints which
+      spelling answered** — a bare-name miss would look like CUDA being absent,
+      which is the same trap as `NvFBCCreateInstance`.
+
 - [x] **10-bit and HDR capture works.** With Windows HDR on, `NVFBC_TOSYS_ARGB10`
       captures and **`bIsHDR` comes back set**. The inferred V2 bit position for
       `bHDRRequest` was therefore right — bit 3, the same slot it occupies in the
@@ -232,9 +268,9 @@ mode the workload actually uses.
 
 What is already firm: ToSys charges **~3.6ms of readback per frame** and copies
 whether or not the frame is new, so pixels leave the GPU only to need
-re-uploading for the scRGB→P010 shader and NVENC. If NvFBC is pursued after the
-HDR numbers land, `NvFBCToDx9Vid` or `NvFBCToCuda` are the interfaces to measure,
-since both keep the frame on the GPU.
+re-uploading for the scRGB→P010 shader and NVENC. **That rules ToSys out on
+shape rather than on speed**, and it is why the remaining measurement goes
+through `NvFBCToCuda`, where the frame never leaves the GPU at all.
 
 Also firm: **DDA sustains 111 new frames/sec at 4K in SDR, 80.4 in HDR** — both
 comfortably past the 60 this project needs. Whatever NvFBC turns out to be worth,

@@ -81,16 +81,51 @@ const BLOCKING_COUNT: u32 = 300;
 /// that should have stopped it.
 const MIN_UNIQUE_FOR_VERDICT: usize = 20;
 
-/// Poll, block, and compare against DDA, for one pixel format.
-fn measure(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: bool) {
+/// Poll, block, and compare against DDA, for one pixel format, through ToCuda.
+///
+/// This is the interface that matters: the frame stays on the GPU, so the number
+/// is not dominated by a sysmem copy the real pipeline would never want.
+fn measure_cuda(cuda: &crate::cuda::Cuda, label: &str, ten_bit: bool, hdr: bool) {
+    println!();
+    let Some(mut session) = crate::tocuda::open(cuda, ten_bit, hdr) else {
+        return;
+    };
+    let polled = crate::tocuda::run(&mut session, GRAB_COUNT, false);
+    crate::capture::report(&format!("{label} poll "), &polled);
+    let blocked = crate::tocuda::run(&mut session, BLOCKING_COUNT, true);
+    crate::capture::report(&format!("{label} block"), &blocked);
+
+    if ten_bit {
+        if blocked.is_hdr || polled.is_hdr {
+            println!("      bIsHDR set: the desktop is in HDR and NvFBC captured it.");
+            println!("      The buffer is A2B10G10R10, NOT the scRGB FP16 CLAUDE.md's shader");
+            println!("      notes assume, so the shader's input stage would change.");
+        } else {
+            println!("      bIsHDR clear -- the desktop is most likely not in HDR mode. The");
+            println!("      ToCuda bit position is read from the header, not inferred, so");
+            println!("      unlike the ToSys path that is not a candidate explanation.");
+        }
+    }
+
+    // Release before measuring DDA: holding a live NvFBC session while timing
+    // the control would be measuring them together, not against each other.
+    drop(session);
+
+    if polled.grabs > 0 {
+        interpret_capture(&polled, &blocked);
+    }
+}
+
+/// The same, through ToSys. Kept for the record; not run unless asked.
+fn measure_sys(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: bool) {
     println!();
     let Some(mut session) = crate::tosys::open(variant, ten_bit, hdr) else {
         return;
     };
     let polled = crate::tosys::run(&mut session, GRAB_COUNT, false);
-    crate::tosys::report(&format!("{label} poll "), &polled);
+    crate::capture::report(&format!("{label} poll "), &polled);
     let blocked = crate::tosys::run(&mut session, BLOCKING_COUNT, true);
-    crate::tosys::report(&format!("{label} block"), &blocked);
+    crate::capture::report(&format!("{label} block"), &blocked);
 
     if ten_bit {
         if blocked.is_hdr || polled.is_hdr {
@@ -117,7 +152,7 @@ fn measure(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: bool
 /// Deliberately comparative. An NvFBC frame rate on its own says nothing, since
 /// a static desktop produces few unique frames however fast the calls return —
 /// so this runs DDA over the same wall-clock window and compares.
-fn interpret_capture(polled: &crate::tosys::Capture, blocked: &crate::tosys::Capture) {
+fn interpret_capture(polled: &crate::capture::Capture, blocked: &crate::capture::Capture) {
     // A static desktop yields few unique frames however fast the calls return,
     // so unique-per-second is the honest rate, not raw call rate.
     let unique_fps = blocked.unique as f64 * 1e9 / blocked.elapsed_ns.max(1) as f64;
@@ -299,9 +334,36 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
     // depends on a desktop state the probe does not control. With HDR on, the
     // 8-bit path returns a single frozen frame; with it off, ARGB10 is the odd
     // one out. Measuring only one would silently measure the wrong one.
-    if let Some(variant) = shape {
-        measure("ARGB  ", variant, false, false);
-        measure("ARGB10", variant, true, true);
+    if shape.is_some() {
+        println!();
+        println!("== NvFBC capture: ToCuda (frame stays on the GPU) ==");
+        match crate::cuda::Cuda::load() {
+            Ok(cuda) => {
+                for (name, how) in &cuda.resolved {
+                    println!("    {name}: resolved via {how}");
+                }
+                let status = cuda.init();
+                if status == crate::cuda::CUDA_SUCCESS {
+                    measure_cuda(&cuda, "ARGB  ", false, false);
+                    measure_cuda(&cuda, "ARGB10", true, true);
+                } else {
+                    println!("    cuInit failed with {status}; no CUDA capture possible.");
+                }
+            }
+            Err(e) => println!("    {e}"),
+        }
+    }
+
+    // ToSys is the path with the 3.6ms sysmem copy. Its numbers are already
+    // recorded in HARDWARE_TESTING.md section 1 and it is not what any pipeline
+    // would use, so it costs nothing on a normal run.
+    if let Some(variant) = shape
+        && std::env::args().any(|a| a == "--tosys")
+    {
+        println!();
+        println!("== NvFBC capture: ToSys (copies to system memory) ==");
+        measure_sys("ARGB  ", variant, false, false);
+        measure_sys("ARGB10", variant, true, true);
     }
 
     println!();

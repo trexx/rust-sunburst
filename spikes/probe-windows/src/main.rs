@@ -13,7 +13,21 @@
 //! now than then.
 //!
 //! Run on the 4070 box and paste the output into HARDWARE_TESTING.md §1.
+//!
+//! ```text
+//! probe-windows                  # NvFBC via ToCuda, the GPU-resident path
+//! probe-windows --tosys          # also the sysmem path, which copies every frame
+//! probe-windows --enable-nvfbc   # NvFBC_Enable: needs elevation, resets the driver
+//! ```
+//!
+//! Run it with something animating full-screen. An idle desktop has already
+//! produced two wrong conclusions in this investigation, so the capture section
+//! now refuses to draw one rather than repeat that.
 
+#[cfg(windows)]
+mod capture;
+#[cfg(windows)]
+mod cuda;
 #[cfg(windows)]
 mod dda;
 #[cfg(windows)]
@@ -24,6 +38,8 @@ mod nvfbc;
 mod nvml;
 #[cfg(windows)]
 mod probe;
+#[cfg(windows)]
+mod tocuda;
 #[cfg(windows)]
 mod tosys;
 
