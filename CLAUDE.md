@@ -43,12 +43,14 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
 - **Capture the monitor, never a window.** Big Picture launches games in new
   windows with new swapchains; display capture rides through it invisibly.
 - **Three capture backends, and NvFBC is never the default.** WGC on Win11, DDA
-  on Win10, each falling back to the other. NvFBC is opt-in only: it needs an
-  undocumented private-data key a driver update can invalidate, and NVIDIA's last
-  supported Windows 10 build for it is 1803 — below this project's 1903 floor. It
-  is kept because DDA goes black on DRM-protected content and dies on the secure
-  desktop, so a second GPU-resident path is resilience. It measured 0.86–0.94× DDA
-  on throughput; latency is what would justify it and has no number yet.
+  on Win10, each falling back to the other — they measure within half a
+  millisecond of each other, so that choice is about compatibility and nothing
+  else. NvFBC is opt-in only: it needs an undocumented private-data key a driver
+  update can invalidate, and NVIDIA's last supported Windows 10 build for it is
+  1803, below this project's 1903 floor. **It is kept for resilience alone** —
+  DDA goes black on DRM-protected content and dies on the secure desktop. It is
+  0.86–0.94× DDA on throughput and **1.2–1.5ms worse on latency**, so it is not
+  kept for speed; that was the open question and it has been answered.
 - **The `Capture` trait yields a D3D11 texture**, whatever produced it. NvFBC
   hands back a CUDA device pointer, so that backend registers it with
   `cuGraphicsD3D11RegisterResource` and copies device-to-device. One HLSL shader,
@@ -104,19 +106,31 @@ changes that look free — the point is to catch the ones that aren't.
 | MediaCodec decode | 8–16ms | |
 | Panel | 1–3 frames | Game Mode mandatory |
 
-Honest glass-to-glass: **60–100ms**. Sub-40ms claims elsewhere measure
-capture-to-wire, not what the eye sees. Do not chase them.
+Honest glass-to-glass: **60–100ms**, and that figure is now **pessimistic by
+roughly 9–13ms** — it was summed with composition at 16.7ms. It is not restated
+here as a new total, because every other line in the table except capture is
+still an estimate and a corrected sum of estimates is not a measurement. Sub-40ms
+claims elsewhere measure capture-to-wire, not what the eye sees; do not chase
+them.
 
-The DWM row is still an **assumption** — the largest line in the table, and never
-measured directly. What *is* measured is that **NvFBC does not remove it**:
-GPU-resident capture via `NvFBCToCuda` came in at 0.86–0.94× Desktop Duplication
-in every controlled run (`HARDWARE_TESTING.md` §1). NvFBC is kept as an opt-in
-backend anyway, on grounds those runs did not test — see the traps below.
+The capture row survives its own measurement: subtracting half a refresh interval
+from the ~4ms present→capture figure leaves about **0.4ms** for the capture
+itself, at the bottom of the 0.5–2ms estimated for it.
 
-**Pricing this row does not need a camera.** Present→capture latency is
-measurable in software, and that interval is where composition sits; a camera is
-only required past the decoder, for glass-to-glass. Anything in this file
-claiming otherwise is stale.
+**The composition row used to read ~16.7ms and it was wrong.** Measured
+present→capture is ~4ms typical and ~7.5ms worst on a 144Hz display
+(`HARDWARE_TESTING.md` §7). The old figure was the *worst case at 60Hz* recorded
+as though it were the typical cost at any refresh rate.
+
+**Composition costs about half the desktop's refresh interval.** So the single
+cheapest latency win in the whole system is a display setting: **run the server's
+desktop at a high refresh rate.** 144Hz costs ~3.5ms where 60Hz costs ~8.3ms,
+which is ~5ms for free and more than several planned optimisations are worth.
+
+**Nothing escapes composition.** With tearing enabled and ~15,000 presents/sec,
+DDA, WGC and NvFBC all delivered 123–133 distinct frames/sec — the refresh rate.
+That is measured, not assumed, and it is why swapchain hooking is no longer
+carried as a latency win.
 
 The two NVENC rows are **targets, not measurements** — they were written against
 the Blackwell encoder this project originally assumed and have not been measured

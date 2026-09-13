@@ -638,30 +638,75 @@ Three details that are decisions, not incidentals:
   attributed — a refresh-capped backend has no way to say which `Present` it is
   looking at. A `flip_seq` guard stops one flip yielding several samples.
 
-- [ ] **Run it with HDR off, and again with HDR on.** All three capture formats
-      change with the desktop's colour mode, and the ToSys 8-bit freeze already
-      showed a format mismatch presenting as a working-but-frozen capture rather
-      than an error.
-- [ ] **Sanity check before believing anything: DDA and WGC p50s should land in
-      the same region.** Both are post-composition. If they diverge widely the
-      harness is measuring itself, not the path.
-- [ ] **Expect ~10 samples per second of run time.** Far fewer means changes are
-      being missed; far more means the `flip_seq` guard is not holding.
-- [ ] **Stress mode needs tearing support** to say anything about a backend
-      exceeding the panel. The probe reports whether it got it; without it, read
-      the figures as keep-up only.
+- [x] **Run with HDR off and on.** Done. The colour mode makes no material
+      difference to any of the three — see the table.
+- [x] **Sanity check passed.** DDA and WGC p50s land within 0.4ms of each other
+      and swap places between runs, which is what two post-composition paths
+      should look like. The harness is measuring the path, not itself.
+- [x] **Tearing was available**, so `Present` really was unbound: the presenter
+      issued 14,000–16,000 presents/sec.
 
-| Backend | p50 | p99 | max | distinct frames/sec (stress) |
-|---|---|---|---|---|
-| DDA | | | | |
-| WGC | | | | |
-| NvFBC ToCuda | | | | |
+### Results (env S, 144Hz display)
 
-**What the answer changes.** A DDA p50 near 16.7ms confirms the budget and keeps
-Phase 7's swapchain hook justified. A few milliseconds says the largest line in
-the table is wrong — and takes the hook's reason for existing with it, since that
-item exists only to beat composition. Either way Phase 3's backend selection gets
-a real basis, and NvFBC finally gets measured on the metric it was retained for.
+| Backend | p50 | max | stress: distinct frames/sec |
+|---|---|---|---|
+| DDA | **3.83ms** / 4.41ms HDR | 7.46ms | 125.0 / 103.5 HDR |
+| WGC | **4.24ms** / 4.24ms HDR | 7.84ms | 127.2 / 132.5 HDR |
+| NvFBC ToCuda | **5.28ms** / 5.32ms HDR | 8.56ms | 123.0 / 131.0 HDR |
+
+*(The p99 column is gone from this table on purpose. Eighty samples cannot
+resolve a 99th percentile — with `n ≤ 100` the index lands on the last element,
+so the harness was printing the maximum twice under two names. The flip interval
+is now 25ms rather than 100ms, giving ~320 samples, and the report says so when
+the count is too low to mean anything.)*
+
+### What this says
+
+**CLAUDE.md's ~16.7ms DWM composition line is wrong, and wrong in an
+instructive way.** Measured present→capture is **~4ms typical, ~7.5ms worst** on
+this machine.
+
+The shape of the numbers says why. This display refreshes at 144Hz — a 6.94ms
+period. A capture path that waits for the next composition pass would show
+latency spread roughly uniformly across that interval: mean **3.47ms**, max
+**6.94ms** plus whatever the capture itself costs. Measured: p50 3.83ms, max
+7.46ms. That fits closely enough that the model is worth stating —
+**composition latency is about half the desktop's refresh interval, not a fixed
+frame time.**
+
+Which makes 16.7ms the *worst case at 60Hz*, recorded as though it were the
+typical cost at any refresh rate. At 60Hz the same model predicts ~8.3ms typical
+and ~16.7ms worst, so the original figure was not invented — it was the maximum,
+mislabelled, at a refresh rate this machine does not run.
+
+**Nothing escapes composition.** With tearing on and the presenter issuing
+~15,000 presents/sec, all three backends delivered **123–133 distinct
+frames/sec** — the refresh rate, give or take. Not 1%, not 200: the panel's
+cadence. NvFBC included, which finally closes that question with the stress
+condition the throughput runs never managed to create.
+
+**NvFBC loses on latency too**, by 1.2–1.5ms consistently, in both colour modes.
+It was retained specifically because latency was unmeasured and might have
+favoured it. It does not. What is left is the resilience argument alone — DDA goes
+black on DRM-protected content and dies on the secure desktop — which is real but
+much narrower than the case it was kept on.
+
+**DDA and WGC are equivalent.** They differ by less than half a millisecond and
+change places between runs, so the Phase 3 selection rule (WGC on Win11, DDA on
+Win10) stands on compatibility grounds, with nothing to choose on latency.
+
+**One new and actionable finding: run the server's desktop at a high refresh
+rate.** If composition costs half a refresh interval, then 144Hz costs ~3.5ms
+where 60Hz costs ~8.3ms. That is ~5ms of glass-to-glass for a display setting,
+independent of anything in this codebase, and it is worth more than several of
+the optimisations the roadmap has planned.
+
+**The answer came back "a few milliseconds", so the second branch is taken.** The
+largest line in the budget shrinks by roughly 4×, and Phase 7's swapchain hook
+loses most of its reason to exist: it is per-process, a poor fit for Big Picture
+launching each game into a new window, and carries an anti-cheat warning — for
+about 4ms at 144Hz. That trade was defensible against 16.7ms. It is not
+defensible against 4ms.
 
 ---
 

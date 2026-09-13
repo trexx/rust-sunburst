@@ -72,7 +72,15 @@ pub const WINDOW_SIZE: i32 = 256;
 // `GetWindowRect` and published in `Signal` — see the note there.
 
 /// How long a colour holds before flipping.
-const FLIP_INTERVAL_MS: u64 = 100;
+///
+/// 100ms was the first choice and it produced 80 samples in an eight-second run,
+/// which cannot resolve a p99 at all: with 80 samples the 99th percentile *is*
+/// the maximum, so the harness reported the same number twice under two names.
+///
+/// 25ms gives ~320 samples instead, and stays unambiguous: measured
+/// present→capture latency is 4–9ms, so a flip is always detected well inside
+/// its own interval and can only be attributed to the flip that caused it.
+const FLIP_INTERVAL_MS: u64 = 25;
 
 /// What the capture side reads, published by the presenter.
 ///

@@ -34,8 +34,9 @@ use crate::watch::Watcher;
 
 /// Long enough for ~80 flips at the presenter's 100ms cadence.
 const LATENCY_SECS: u64 = 8;
-/// Flips per second the presenter produces in latency mode.
-const FLIPS_PER_SEC: u64 = 10;
+/// Flips per second the presenter produces in latency mode. Must track
+/// `presenter::FLIP_INTERVAL_MS`.
+const FLIPS_PER_SEC: u64 = 40;
 /// Spent confirming a backend can see the signal at all, before timing anything.
 const VALIDATE_SECS: u64 = 2;
 /// Shorter: the stress figure is a rate, and it stabilises quickly.
@@ -202,14 +203,19 @@ fn report(name: &str, l: &Latency) {
         println!("          covered, or this backend is not capturing the monitor it is on.");
         return;
     }
+    let n = l.samples.len();
     println!(
-        "  {name}: p50 {:.2}ms  p99 {:.2}ms  max {:.2}ms   ({} samples, {} frames)",
+        "  {name}: p50 {:.2}ms  p99 {:.2}ms  max {:.2}ms   ({n} samples, {} frames)",
         l.percentile(50) as f64 / 1e6,
         l.percentile(99) as f64 / 1e6,
-        l.samples[l.samples.len() - 1] as f64 / 1e6,
-        l.samples.len(),
+        l.samples[n - 1] as f64 / 1e6,
         l.frames,
     );
+    // Below ~100 samples the 99th percentile lands on the last element, so the
+    // p99 column would just be the max wearing a different label.
+    if n < 100 {
+        println!("          (only {n} samples -- p99 is the max here, not a percentile)");
+    }
     if l.errors > 0 {
         println!("          {} poll errors along the way", l.errors);
     }

@@ -243,12 +243,20 @@ Ordered by value, not difficulty.
   it, made it GPU-resident via ToCuda and measured 0.86–0.94x DDA, which settles
   throughput and nothing else. It belongs beside the other backends rather than
   in the optional-polish phase; see `HARDWARE_TESTING.md` §1.
-- **Swapchain hooking** — opt-in, with an explicit anti-cheat warning. Hook
-  `IDXGISwapChain::Present`/`Present1`/`ResizeBuffers`, `vkQueuePresentKHR`,
-  `wglSwapBuffers`, and D3D9 `EndScene`/`Present`. D3D9Ex can share surfaces to
-  D3D11; plain D3D9 cannot and needs a `StretchRect`→sysmem→upload path that is
-  meaningfully slower. Poor fit for Big Picture (per-process, must chase each
-  launch) but the only way to beat DWM composition if NvFBC is unavailable.
+- ~~**Swapchain hooking**~~ — **struck on measurement.** This existed to get a
+  pre-composition frame, and composition has now been priced: **~4ms at 144Hz,
+  ~8ms at 60Hz** — about half the desktop's refresh interval, not the 16.7ms the
+  budget claimed (`HARDWARE_TESTING.md` §7). Hooking is per-process, must chase
+  each Big Picture launch into a new window, needs separate paths for
+  `IDXGISwapChain::Present`, `vkQueuePresentKHR`, `wglSwapBuffers` and D3D9
+  `EndScene`/`Present` — where plain D3D9 cannot share surfaces and needs a
+  `StretchRect`→sysmem→upload path — and carries an anti-cheat warning. That was
+  arguable against 16.7ms. It is not arguable against 4ms.
+
+  Left visible rather than deleted, because the reasoning is the point: the item
+  was never wrong to plan, it was wrong to plan *unmeasured*. **The cheaper win is
+  a display setting** — running the server's desktop at a high refresh rate buys
+  ~5ms with no code at all.
 - **Non-Steam game launching.**
 
 ---
