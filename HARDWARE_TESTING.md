@@ -350,11 +350,20 @@ adb pull /sdcard/Android/data/com.trexx.sunburst/files/decoders.json
 - [x] **Shield: HEVC Main10 at 4K60 is present**, and there is no AV1 decoder at
       all — as CLAUDE.md says. *(Verified on SHIELD Android TV, `mdarcy`,
       Android 11 / API 30.)*
-- [ ] **Homatics: AV1 Main10 at 4K60 is present.** Its only path, since the HEVC
-      decoder is broken.
-- [ ] **Vendor low-latency keys** on the Amlogic. Errata #16/#17: some Amlogic
-      decoders produce no output at all without an undocumented `MediaFormat`
-      option, which reads as a broken stream rather than a missing flag.
+- [x] **Homatics: AV1 Main10 at 4K60 is present.** `c2.amlogic.av1.decoder`,
+      hardware, `FEATURE_LowLatency` **true**, `supports4k60` **true**, 9
+      instances. Profiles cover Main8, **Main10**, Main10HDR10 and
+      Main10HDR10Plus at **level 5.1** — which is what 4K60 needs. The box's only
+      path exists and looks right. *(Verified on SEI Robotics Box R 4K Plus,
+      `YYJ`, Amlogic, Android 14 / API 34, `armeabi-v7a`.)*
+- [x] **Vendor low-latency keys** on the Amlogic: **none survived**, on any
+      decoder. Read that as *no evidence*, not *unsupported* — the probe's own
+      documentation says so, because a key can take effect without appearing in
+      `getInputFormat()`. Errata #16/#17 can only be settled by decoding a real
+      stream and seeing whether frames come out, which is Phase 5.
+
+      `FEATURE_LowLatency` is **true** on the AV1 decoder, so the documented
+      mechanism is available and the undocumented ones may not be needed at all.
 
 ### Shield results (verified)
 
@@ -366,6 +375,50 @@ adb pull /sdcard/Android/data/com.trexx.sunburst/files/decoders.json
 
 `OMX.Nvidia.h265.decode` is the target. Profile list includes `4096`
 (`HEVCProfileMain10`). The software decoder cannot do 4K60 and is not a fallback.
+
+### Homatics results (verified)
+
+| Decoder | MIME | HW | FEATURE_LowLatency | 4K60 | Max res | Inst |
+|---|---|---|---|---|---|---|
+| `c2.amlogic.av1.decoder` | av01 | yes | **yes** | **yes** | 3840×3840 | 9 |
+| `c2.amlogic.av1.decoder.secure` | av01 | yes | yes | yes | 3840×3840 | 2 |
+| `c2.amlogic.hevc.decoder` | hevc | yes | yes | yes | 4096×4096 | 9 |
+| `c2.amlogic.hevc.decoder.secure` | hevc | yes | no | yes | 4096×4096 | 2 |
+| `c2.android.av1.decoder` | av01 | no | no | no | 1280×1280 | 32 |
+| `c2.android.hevc.decoder` | hevc | no | no | no | 2048×2048 | 32 |
+| `OMX.google.hevc.decoder` | hevc | no | no | no | 2048×2048 | 32 |
+
+`c2.amlogic.av1.decoder` is the target. AV1 `profileLevels` decode to Main8,
+Main10, Main10HDR10 and Main10HDR10Plus, all at level 5.1. **Max width is 3840,
+not 4096** — exactly 4K and not a pixel more, so anything that rounds a width up
+will fail on this box and not on the Shield.
+
+Neither software decoder reaches 4K, so there is no fallback behind the Amlogic
+one. `maxInstances` 9 is ample for a single session.
+
+### Quirks seeded from this, and what enumeration cannot seed
+
+CLAUDE.md's `DecoderQuirks` is keyed on `getName()` + `Build.MODEL`, so the
+Homatics entry keys on `c2.amlogic.av1.decoder` + `Box R 4K Plus`. Enumeration
+fills in almost none of the fields, and it is worth being explicit about which:
+
+| Field | Value | Basis |
+|---|---|---|
+| `ref_invalidation` | **false** | Not observable by enumeration. CLAUDE.md: Amlogic decoders are known to mishandle it. Default off until a real stream says otherwise. |
+| `intra_refresh` | **false** | As above, same trap, same default. |
+| `slice_output` | unknown | Needs a decode test; `FEATURE_LowLatency` is not the same question. |
+| `needs_annexb_startcodes` | n/a for AV1 | AV1 is OBUs; the field exists for the HEVC path this box does not use. |
+| `max_bitrate_hint` | unset | No enumeration source. Phase 0.3 would bound it from the link — and 0.3 is not answered. |
+
+So the table is **seeded with decoder identity and capability, not with quirks**.
+The quirks themselves land in Phase 5, when there is a stream to feed it.
+
+> **The HEVC rows are a trap, and enumeration cannot see it.**
+> `c2.amlogic.hevc.decoder` reports hardware, `FEATURE_LowLatency` true and 4K60
+> true — it looks *better* on paper than the AV1 decoder, and ROADMAP 0.4 struck
+> it permanently because its low-latency path is known broken in practice.
+> Enumeration is not capable of detecting that. Anyone reading this table without
+> reading that decision would pick HEVC for this box.
 
 **Read `KEY_LOW_LATENCY` as three-state, not a boolean.** `silent` means
 configure accepted the key without echoing it back, which proves nothing either
@@ -388,11 +441,35 @@ spikes/check-phy.sh [adb-serial]
 
 - [x] **Shield: link is gigabit.** 216 Mbps measured, well past a 100Mbit PHY's
       ~94 Mbps ceiling. *(Verified over adb-over-TCP.)*
-- [ ] **Homatics: link is gigabit, not 100 Mbit.** This is the one Phase 0.3
-      actually asks about. A 100Mbit PHY caps usable throughput around 80 Mbps,
-      below the 70–100 Mbps AV1 target rather than merely tightening it.
+- [!] **Homatics: still unanswered — the box is on Wi-Fi.** `eth0` exists and the
+      Ethernet service is enabled, but the active network is `wlan0`: SSID
+      "House LANister", 5240 MHz, Wi-Fi 6, RSSI −61, 1200 Mbps PHY rate. **The
+      gigabit port is present and unused.**
+
+      The script measured 494 / 119 / 136 Mbps across three attempts and its own
+      warning fired first — *"no ethernet interface… the number below is a wi-fi
+      measurement and does not answer Phase 0.3"*. That warning earned its place:
+      494 Mbps is comfortably past a 100Mbit ceiling and would have read as a
+      clean pass. The 4× spread across attempts is the giveaway a wired link
+      would not produce.
+
+      **Plug it in and re-run.** A gigabit port on the spec sheet is not the
+      question 0.3 asks — the question is what the link actually negotiates, and
+      the failure mode it exists to catch is a bad pair negotiating 100 on
+      gigabit-capable hardware at both ends.
 - [ ] Confirm the switch port agrees, not just the box — a single bad pair
       negotiates 100 and looks exactly like a hardware limit.
+- [ ] **If the Homatics is meant to run on Wi-Fi in production, that is a
+      different and worse question than 0.3.** 5GHz Wi-Fi 6 at RSSI −61 has the
+      *bandwidth* for a 70–100 Mbps AV1 stream. What it does not have is bounded
+      delivery: this project's rate controller works to a frame deadline, and
+      airtime contention produces exactly the jitter a deadline cannot absorb.
+      CLAUDE.md assumes wired for both clients. Worth settling deliberately
+      rather than by whatever happens to be plugged in.
+
+**Confirmed again on the Homatics:** `/sys/class/net/eth0/{speed,carrier,operstate}`
+are all `Permission denied` there too, so the link state cannot be read even to
+distinguish "no cable" from "cable, link down".
 
 **The obvious check does not work, and the obvious substitute lies.**
 `/sys/class/net/eth0/speed` is `Permission denied` for the shell user under
@@ -405,8 +482,8 @@ rate meter: adb tops out around 200 Mbps.
 
 | Device | Measured | Verdict |
 |---|---|---|
-| Shield | 216 Mbps | gigabit |
-| Homatics | | |
+| Shield | 216 Mbps | gigabit, wired |
+| Homatics | 494 Mbps peak, over **Wi-Fi** | **does not answer 0.3** — wire it and re-run |
 
 ---
 
@@ -530,6 +607,7 @@ UIPI), `reattached` and `attach_failed`.
 | Needed for | Hardware |
 |---|---|
 | §1's NvFBC row | The 4070 box; `--enable-nvfbc` needs elevation |
+| §3 Homatics | **An Ethernet cable.** The port is there and unused; the box is on Wi-Fi |
 | §2 | Both Android boxes, adb reachable |
 | §4 client rows | Phase 5 client, so not yet |
 | Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads |

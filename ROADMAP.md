@@ -64,10 +64,16 @@ probe mid-measurement.
 **Exit criteria:** codec matrix confirmed by evidence, NvFBC decision made, quirks
 table seeded.
 
-Two of the three are done: the codec matrix is measured, and the NvFBC decision
-is made — available, GPU-resident, retained as an opt-in backend. The quirks table is half-seeded — the Shield is enumerated,
-the Homatics is not — so **0.2 and 0.3 are all that stand between here and Phase
-0 closing**, and both need the Homatics rather than the server.
+Two and a half of the three are done. The codec matrix is measured. The NvFBC
+decision is made — available, GPU-resident, retained as an opt-in backend. The
+quirks table is now **seeded on both boxes**: the Shield has HEVC Main10 at 4K60,
+and the Homatics has `c2.amlogic.av1.decoder` with AV1 Main10, HDR10, level 5.1,
+`FEATURE_LowLatency` true and 4K60 true — so 0.2 is closed and the box has the
+path it needed.
+
+**0.3 is the one thing left, and it needs a cable.** The Homatics is on Wi-Fi;
+its gigabit port is present and unused. The throughput script measured 494 Mbps
+and warned, correctly, that a wi-fi number does not answer a PHY question.
 
 ---
 
