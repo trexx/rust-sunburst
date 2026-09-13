@@ -30,7 +30,7 @@
 //! for a p99.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use sunburst_core::instr::clock;
 
@@ -50,10 +50,15 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGIFactory5,
     IDXGISwapChain1,
 };
+use windows::Win32::Foundation::RECT;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
-    SW_SHOWNOACTIVATE, ShowWindow, TranslateMessage, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetWindowRect, IsWindowVisible, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage, WNDCLASSW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{BOOL, Interface, w};
 
@@ -62,16 +67,30 @@ pub const WINDOW_X: i32 = 64;
 pub const WINDOW_Y: i32 = 64;
 pub const WINDOW_SIZE: i32 = 256;
 
-/// The desktop pixel every backend watches: the window's centre.
-pub const READ_X: u32 = (WINDOW_X + WINDOW_SIZE / 2) as u32;
-pub const READ_Y: u32 = (WINDOW_Y + WINDOW_SIZE / 2) as u32;
+// Where the window is *asked* to go. Where it ends up is read back from
+// `GetWindowRect` and published in `Signal` — see the note there.
 
 /// How long a colour holds before flipping.
 const FLIP_INTERVAL_MS: u64 = 100;
 
 /// What the capture side reads, published by the presenter.
+///
+/// The read point is published rather than computed from the constants below.
+/// The first version of this harness trusted the constants, and on a scaled
+/// display the window does not land where they say: Win32 placed it in one
+/// coordinate space while the capture backends read another. A transition
+/// detected somewhere else on the desktop still gets timed against the most
+/// recent flip, which is at most 100ms old — so it produces small,
+/// plausible-looking latencies out of nothing at all.
 #[derive(Default)]
 pub struct Signal {
+    /// Where the signal actually is, from `GetWindowRect` after creation.
+    pub read_x: AtomicU32,
+    pub read_y: AtomicU32,
+    /// The window's real rect, for the probe to print.
+    pub rect: [AtomicI32; 4],
+    /// Whether Windows agrees the window is on screen.
+    pub visible: AtomicBool,
     /// Increments on every colour change.
     pub flip_seq: AtomicU32,
     /// QPC taken immediately before the `Present` that carried the new colour,
@@ -146,15 +165,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 }
 
 fn create_window() -> Result<HWND, String> {
+    // CLAUDE.md's capture trap, and the harness is subject to it like anything
+    // else: without this, window coordinates are in a different space from the
+    // pixels the capture backends read, and the read point lands outside the
+    // window on any scaled display.
+    // SAFETY: takes a context handle by value and has no out parameters. It
+    // fails only if awareness was already set, which is not an error here.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+
+    // SAFETY: the current module's handle; passing None asks for the exe.
+    let instance = unsafe { GetModuleHandleW(None) }
+        .map_err(|e| format!("GetModuleHandleW: {e}"))?;
+
     let class = w!("sunburst_presenter");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wndproc),
         lpszClassName: class,
+        hInstance: instance.into(),
         ..Default::default()
     };
     // SAFETY: `wc` is fully initialised and `class` is a static wide string.
-    // Re-registering the same class returns 0, which is fine — the class from a
-    // previous run in this process is equally usable.
+    // Zero means the class is already registered from an earlier run in this
+    // process, which is equally usable — anything else is a real failure and
+    // CreateWindowExW below will report it.
     unsafe { RegisterClassW(&wc) };
 
     // SAFETY: standard window creation with a registered class. NOACTIVATE keeps
@@ -162,7 +195,7 @@ fn create_window() -> Result<HWND, String> {
     // point, which would silently stop the signal reaching any backend.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            WS_EX_TOPMOST,
             class,
             w!("sunburst latency"),
             WS_POPUP | WS_VISIBLE,
@@ -172,15 +205,38 @@ fn create_window() -> Result<HWND, String> {
             WINDOW_SIZE,
             None,
             None,
-            None,
+            Some(instance.into()),
             None,
         )
     }
     .map_err(|e| format!("CreateWindowExW: {e}"))?;
 
-    // SAFETY: `hwnd` is live; showing without activating.
-    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    // SAFETY: `hwnd` is live. SW_SHOW rather than SW_SHOWNOACTIVATE: a visible
+    // window is the whole point, and the first version of this produced no
+    // visible window at all.
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
     Ok(hwnd)
+}
+
+/// Read back where the window actually landed, and publish it.
+fn publish_geometry(hwnd: HWND, signal: &Signal) {
+    let mut rect = RECT::default();
+    // SAFETY: `hwnd` is live and `rect` is a valid out parameter.
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+        signal.rect[0].store(rect.left, Ordering::Relaxed);
+        signal.rect[1].store(rect.top, Ordering::Relaxed);
+        signal.rect[2].store(rect.right, Ordering::Relaxed);
+        signal.rect[3].store(rect.bottom, Ordering::Relaxed);
+        // The centre, so a capture-indicator border drawn at the edges cannot
+        // be what gets timed.
+        let x = (rect.left + (rect.right - rect.left) / 2).max(0) as u32;
+        let y = (rect.top + (rect.bottom - rect.top) / 2).max(0) as u32;
+        signal.read_x.store(x, Ordering::Relaxed);
+        signal.read_y.store(y, Ordering::Relaxed);
+    }
+    // SAFETY: `hwnd` is live; returns a plain bool.
+    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+    signal.visible.store(visible, Ordering::Relaxed);
 }
 
 struct Swapchain {
@@ -260,7 +316,11 @@ fn create_swapchain(hwnd: HWND, uncapped: bool) -> Result<Swapchain, String> {
 }
 
 fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<(), String>>) {
-    let built = create_window().and_then(|hwnd| create_swapchain(hwnd, mode == Mode::Stress));
+    let built = create_window().and_then(|hwnd| {
+        let sc = create_swapchain(hwnd, mode == Mode::Stress)?;
+        publish_geometry(hwnd, signal);
+        Ok(sc)
+    });
     let sc = match built {
         Ok(sc) => {
             signal.tearing.store(sc.tearing, Ordering::Relaxed);

@@ -28,6 +28,7 @@ windows = { version = "0.62", features = [
     # Capture, which is WinRT and needs both the projection and the Win32
     # interop shims that turn its surfaces back into D3D11 textures.
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
     "Graphics_Capture",
     "Graphics_DirectX_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
