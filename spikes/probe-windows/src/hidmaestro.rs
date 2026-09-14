@@ -210,23 +210,32 @@ impl Drop for Section {
 ///
 /// Odd while writing, even when settled, so the driver's reader can tell a torn
 /// frame from a complete one.
+///
+/// **The first version of this was wrong**, and wrong in a way its own output
+/// exposed: it computed the two values independently from the value it read, so
+/// reading an *odd* `SeqNo` — which happens constantly while another writer is
+/// mid-frame — made it jump forward and then move the counter *backwards*. A run
+/// of 400 writes reported a delta of 336 where its own arithmetic implied 800,
+/// and the verdict was printed anyway.
+///
+/// Rounding up to the next even value first makes the write monotonic, always
+/// ends the counter even, and advances by exactly two whenever we are the only
+/// writer — which is what makes the delta a usable check rather than noise.
 fn submit(input: &Section, report: &[u8]) -> bool {
-    let seq = input.read_u32(IN_SEQNO);
-    input.write_u32(IN_SEQNO, seq.wrapping_add(1) | 1);
+    let base = input.read_u32(IN_SEQNO);
+    let start = if base.is_multiple_of(2) { base } else { base.wrapping_add(1) };
 
+    input.write_u32(IN_SEQNO, start.wrapping_add(1));
     let len = report.len().min(IN_DATA_CAPACITY);
     input.write_bytes(IN_DATA, &report[..len]);
     input.write_u32(IN_DATA_SIZE, len as u32);
     // Nothing in this spike uses the GIP or extended regions; leaving them alone
     // rather than zeroing avoids disturbing whatever the owner put there.
+    input.write_u32(IN_SEQNO, start.wrapping_add(2));
 
-    // Settle to an even value one past where we started.
-    input.write_u32(IN_SEQNO, (seq | 1).wrapping_add(1));
-
-    // Read straight back. This is the only way to answer "can Rust drive it"
-    // without depending on what joy.cpl looks like: if the bytes are still ours
-    // the write reached the section, and if they are not, we are being raced —
-    // which is a different finding, not a failure to write.
+    // Read straight back. Note what this does and does not prove: that the
+    // memory is writable, not that anything consumed the frame. The delta check
+    // in the caller is what says whether we were the only writer.
     let mut echo = vec![0u8; len];
     input.read_bytes(IN_DATA, &mut echo);
     echo == report[..len]
@@ -543,18 +552,32 @@ pub fn run() {
 
     println!();
     println!("  read-back: {survived}/{FRAMES} of our writes were still ours when read");
-    if survived == 0 {
+    println!("  (that proves the memory is writable, not that anything consumed the frame)");
+    println!();
+
+    // Our writer advances by exactly two per frame when nothing else is writing,
+    // so the delta is the test for sole-writership -- and without that, neither
+    // the read-back nor joy.cpl can say whether the pad is really being driven.
+    let sole_writer = moved == ours;
+    if sole_writer && survived == FRAMES {
+        println!("  -> SOLE WRITER and every write survived: delta is exactly 2 per frame.");
+        println!("     Rust can drive the section. That is the question the spike existed");
+        println!("     for, and this is the evidence for it.");
+    } else if survived == 0 {
         println!("  -> Nothing we wrote survived. Either the section is not writable by this");
         println!("     process despite opening, or a co-writer overwrites within microseconds.");
-        println!("     Unbind the physical controller in PadForge and re-run: if writes then");
-        println!("     stick, Rust can drive it and the only issue was the race.");
-    } else if survived < FRAMES / 2 {
-        println!("  -> Writes land but are frequently overwritten. Rust CAN drive the section;");
-        println!("     a real integration would be the only writer, so this is the race and");
-        println!("     not a limit.");
+    } else if !sole_writer {
+        println!("  -> INCONCLUSIVE. The delta does not match our own writes, so PadForge is");
+        println!("     writing the same seqlock -- and a seqlock has one writer by design, so");
+        println!("     this is not a valid test of anything.");
+        println!();
+        println!("     >>> Unbind the physical controller from this pad in PadForge, leave");
+        println!("     >>> PadForge running, and run again. With us as the only writer the");
+        println!("     >>> delta should be exactly {ours} and joy.cpl should show the pattern");
+        println!("     >>> cleanly instead of fighting real input.");
     } else {
-        println!("  -> Rust can drive the section. This is the question the spike existed for,");
-        println!("     and the answer is yes.");
+        println!("  -> Writes land but not all survived. Worth a re-run with the physical");
+        println!("     controller unbound to separate the race from a real limit.");
     }
 
     if let Some(output) = &output {
