@@ -160,10 +160,12 @@ pub fn run() {
             pad.gaps.len(),
             pad.polls,
         );
+        // Microseconds: spinning reaches hundreds of kHz, where a millisecond
+        // figure just reads "0.00" and looks broken.
         println!(
-            "           poll rate {:.0}Hz, so resolution is ~{:.2}ms",
-            f64::from(u32::try_from(pad.polls).unwrap_or(u32::MAX)) / seconds,
-            seconds * 1e3 / pad.polls.max(1) as f64,
+            "           poll rate {:.0}kHz, so resolution is ~{:.1}us",
+            pad.polls as f64 / seconds / 1e3,
+            seconds * 1e6 / pad.polls.max(1) as f64,
         );
 
         // How much of the run was continuous. A stick held off-centre reports at
