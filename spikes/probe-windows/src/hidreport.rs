@@ -262,35 +262,46 @@ pub fn run() {
         return;
     }
 
-    // Select by VID:PID if asked, otherwise list and let the operator choose.
-    let wanted = std::env::args()
+    // Select by list index, not VID:PID. A single physical device commonly
+    // exposes several HID collections -- a keyboard here shows five under one
+    // VID:PID -- so selecting by identifier silently picks whichever came first,
+    // which may not be the one that carries input.
+    let wanted: Option<usize> = std::env::args()
         .skip_while(|a| a != "--hidreport")
         .nth(1)
-        .and_then(|a| {
-            let (v, p) = a.split_once(':')?;
-            Some((
-                u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()?,
-                u16::from_str_radix(p.trim_start_matches("0x"), 16).ok()?,
-            ))
-        });
+        .and_then(|a| a.parse().ok());
 
-    let Some((vid, pid)) = wanted else {
-        println!("  {} HID device(s). Pick one:", devices.len());
-        println!("    probe-windows --hidreport <vid>:<pid>   (hex, e.g. 045e:02e6)");
+    let Some(chosen) = wanted.and_then(|i| i.checked_sub(1)).filter(|i| *i < devices.len())
+    else {
+        println!("  {} HID device(s). Pick one by number:", devices.len());
+        println!("    probe-windows --hidreport <n>");
         println!();
-        for device in &devices {
+        for (index, device) in devices.iter().enumerate() {
+            let note = if device.input_len == 0 {
+                "  (no input report -- cannot be timed)"
+            } else {
+                ""
+            };
             println!(
-                "    {:04x}:{:04x}  input {:>3}B  {}",
-                device.vid, device.pid, device.input_len, device.product
+                "    {:>2}  {:04x}:{:04x}  input {:>4}B  {}{}",
+                index + 1,
+                device.vid,
+                device.pid,
+                device.input_len,
+                device.product,
+                note
             );
         }
+        println!();
+        println!("  Several entries sharing one VID:PID are separate collections of the same");
+        println!("  physical device, which is why this selects by number.");
+        println!();
+        println!("  Note the Xbox Wireless Adapter (045e:02e6) will NOT appear here: it is");
+        println!("  not a HID device but an MT7612U radio, so forward the adapter and time");
+        println!("  the pads that show up through it instead.");
         return;
     };
-
-    let Some(device) = devices.iter().find(|d| d.vid == vid && d.pid == pid) else {
-        println!("  {vid:04x}:{pid:04x} not present");
-        return;
-    };
+    let device = &devices[chosen];
 
     println!(
         "  {:04x}:{:04x} {} -- input report {}B",

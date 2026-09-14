@@ -21,7 +21,7 @@
 //! probe-windows --enable-nvfbc   # NvFBC_Enable: needs elevation, resets the driver
 //! probe-windows --hidmaestro     # can Rust drive HIDMaestro's shared memory?
 //! probe-windows --hidreport      # list HID devices
-//! probe-windows --hidreport 045e:02e6   # time one device's report intervals
+//! probe-windows --hidreport 3    # time device 3's report intervals
 //! ```
 //!
 //! `--latency` is the one that prices CLAUDE.md's DWM composition line. It opens
