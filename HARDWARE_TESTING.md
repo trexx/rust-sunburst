@@ -866,15 +866,44 @@ report layout we would also have to reimplement.
 > Neither changes the conclusion; both would have made a positive result
 > unreliable.
 
-**Verdict: ViGEmBus.** ~6 ioctls against an ABI frozen by archival, all Rust, no
-sidecar, no .NET, and its DS4 target remains the route to motion if the X360
-ceiling ever costs something. Investigation A is unaffected and still open.
+**Verdict for Phase 2: ViGEmBus.** ~6 ioctls against an ABI frozen by archival,
+all Rust, no sidecar, no .NET.
+
+**But "not drivable from Rust" was stated too absolutely.** The precise finding
+is *not drivable via its internals*; its supported surface is the .NET SDK, and
+that surface *can* be called from Rust by hosting .NET in-process — `netcorehost`
+(maintained, 0.22.0) to embed the runtime, or a NativeAOT-compiled shim with
+`[UnmanagedCallersOnly]` exports that Rust `LoadLibrary`s like any other DLL.
+Either route uses `SubmitState`, so the 53KB report builder and the 600KB
+orchestrator become the SDK's problem rather than ours, on the documented API
+instead of an internal layout that has already moved once.
+
+It is not free, and one cost is the reason it is a Phase 8 option rather than a
+Phase 2 one:
+
+- **Allocation on the input path.** The SDK reference describes `HMGamepadState`
+  as holding an *"axes dict"*. A per-frame dictionary is a managed allocation
+  per frame, which is GC, which is pauses on a path CLAUDE.md lists as hot under
+  a zero-allocation rule. NativeAOT removes the JIT, not the GC. **Measure this
+  before writing the shim.** ViGEm's 264-byte ioctl has no equivalent.
+- A C# shim (~150 lines plus a reverse callback for the managed `OutputDecoded`
+  rumble event): a new language in the repo.
+- NativeAOT does not cross-compile Linux→Windows, so the DLL needs a Windows
+  build step beside `cargo xwin`. `netcorehost` avoids AOT but needs .NET 10 at
+  runtime — which HIDMaestro already requires, so on any machine that has it the
+  dependency is already paid.
+
+**Where this lands:** with USB/IP dead on GIP and the DS4 target making games see
+a DualShock, a hosted HIDMaestro SDK is the one remaining route past the X360
+ceiling that keeps the pad presenting as what it is. Recorded against Phase 8 as
+the option, gated on the allocation measurement, not built.
 
 ### Where that leaves it — the spike is closed
 
-- **Investigation B is closed**: HIDMaestro is reachable but not supportable from
-  Rust. Its shared memory carries fully-formed profile-specific HID reports built
-  by 53KB of C#, and it documents no non-.NET consumer surface.
+- **Investigation B is closed for Phase 2**: HIDMaestro's internals are not a
+  contract, and its supported surface is .NET. Hosting that SDK in-process
+  (NativeAOT shim or `netcorehost`) is viable and is the Phase 8 option — gated
+  on measuring per-frame managed allocation first.
 - **Investigation A is closed**: USB/IP cannot carry the Xbox GIP protocol through
   `usbip-win2` 0.9.8.0 in either receive mode. The adapter is a strictly harder
   case than the wired pad that failed.

@@ -313,10 +313,14 @@ but `usbip-win2` 0.9.8.0 cannot carry the Xbox GIP protocol: a wired Xbox One
 pad fails the same way in both receive modes, with the Windows driver resetting
 the interrupt pipe until it gives up and resets the device. The adapter is a
 strictly harder case. Revisit only if upstream fixes GIP; it is not a plan.
-**HIDMaestro** reaches WGI/GameInput with byte-exact identity, but its shared
-memory carries profile-specific HID reports built by 53KB of C# and it documents
-no non-.NET surface, so it is not drivable from Rust. The 6,950 lines below stand,
-and so does the ceiling. The remaining route to motion is ViGEm's DS4 target. Battery can still be shown client-side. Pad
+**HIDMaestro** reaches WGI/GameInput with byte-exact identity. Its internals are
+not a contract, but its .NET SDK *is*, and that can be hosted from Rust — a
+NativeAOT shim with `[UnmanagedCallersOnly]` exports, or `netcorehost`. That is
+now the credible route past the ceiling with the pad still presenting as an Xbox
+pad; the DS4 target is the other, at the cost of games seeing a DualShock. The
+gate on the hosted route is measuring per-frame managed allocation
+(`HMGamepadState` carries an axes dictionary) before any shim is written. The
+6,950 lines below stand either way. Battery can still be shown client-side. Pad
 headphone audio depends on Phase 6 and is a separate decision.
 
 **Acceptance:** four pads pair and play simultaneously through Big Picture.
