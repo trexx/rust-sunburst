@@ -31,6 +31,8 @@
 
 use std::ffi::c_void;
 
+use sunburst_core::instr::clock;
+
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
     FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile,
@@ -285,6 +287,17 @@ const NAME_PATTERNS: [(&str, bool); 6] = [
 /// a remapper may not start at zero.
 const SURVEY_INDICES: u32 = 16;
 
+/// How long to wait for a section to appear once a pad is known to exist.
+///
+/// **The sections are created lazily.** `SharedMemoryIO.EnsureInputMapping`
+/// builds the input section and both its events together, on first call — and
+/// that call happens when something first submits state for the controller. A
+/// pad that exists but has never been fed has no section at all, which is what
+/// the first run of this found: `HIDMaestroCompanionInputEvent0` alone, because
+/// the XUSB companion's driver open-or-creates that name when its devnode comes
+/// up, independently of the SDK.
+const WAIT_SECS: u64 = 30;
+
 /// Report which of HIDMaestro's named objects actually exist.
 ///
 /// Hard-coding index 0 produced `ERROR_FILE_NOT_FOUND` and no information: the
@@ -373,15 +386,51 @@ pub fn run() {
     }
 
     // Drive the lowest index that has an input section, rather than assuming 0.
-    let index = (0..SURVEY_INDICES)
-        .find(|i| found.iter().any(|n| n == &format!("Global\\HIDMaestroInput{i}")));
-    let Some(index) = index else {
-        println!();
-        println!("  -> Objects exist but no input section among them, so there is nothing to");
-        println!("     write to. An event without its section means the pad is registered but");
-        println!("     its memory is not mapped -- which would make this approach unusable as");
-        println!("     it stands.");
-        return;
+    let input_index = |names: &[String]| {
+        (0..SURVEY_INDICES)
+            .find(|i| names.iter().any(|n| n == &format!("Global\\HIDMaestroInput{i}")))
+    };
+
+    let index = match input_index(&found) {
+        Some(index) => index,
+        None => {
+            // Not a dead end: the section is built on first submit, so a pad
+            // that exists but has never been fed simply has not got one yet.
+            println!();
+            println!("  No input section yet -- but a companion event without one is exactly");
+            println!("  what a pad that has never been fed looks like. The SDK builds the");
+            println!("  section on its first submit, so:");
+            println!();
+            println!("  >>> In PadForge, bind a physical controller to this virtual pad and");
+            println!("  >>> move a stick. Waiting up to {WAIT_SECS}s for the section to appear.");
+            println!();
+
+            let deadline = clock::now() + clock::ticks_per_sec() * WAIT_SECS;
+            let mut appeared = None;
+            while clock::now() < deadline {
+                let names = survey();
+                if let Some(index) = input_index(&names) {
+                    appeared = Some(index);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            match appeared {
+                Some(index) => {
+                    println!("  section appeared at index {index}");
+                    index
+                }
+                None => {
+                    println!("  Still nothing.");
+                    println!();
+                    println!("  -> Either no input reached the pad, or PadForge submits through a");
+                    println!("     path that does not use these sections at all. Both are real");
+                    println!("     answers; neither is 'the approach cannot work', which is what");
+                    println!("     this probe wrongly implied last run.");
+                    return;
+                }
+            }
+        }
     };
     println!();
     println!("  driving controller index {index}");
