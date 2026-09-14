@@ -166,6 +166,15 @@ impl Section {
         unsafe { std::ptr::read_volatile(self.base.add(offset).cast::<u32>()) }
     }
 
+    /// `DataSize` sits at slot+6, which is not 4-aligned, so this goes through a
+    /// byte copy rather than a wider volatile read — the latter is undefined
+    /// behaviour on an unaligned address even where x86 would tolerate it.
+    fn read_u16(&self, offset: usize) -> u16 {
+        let mut bytes = [0u8; 2];
+        self.read_bytes(offset, &mut bytes);
+        u16::from_le_bytes(bytes)
+    }
+
     fn write_u32(&self, offset: usize, value: u32) {
         debug_assert!(offset + 4 <= self.len);
         // SAFETY: as above, and the section was mapped writable.
@@ -201,7 +210,7 @@ impl Drop for Section {
 ///
 /// Odd while writing, even when settled, so the driver's reader can tell a torn
 /// frame from a complete one.
-fn submit(input: &Section, report: &[u8]) {
+fn submit(input: &Section, report: &[u8]) -> bool {
     let seq = input.read_u32(IN_SEQNO);
     input.write_u32(IN_SEQNO, seq.wrapping_add(1) | 1);
 
@@ -213,11 +222,24 @@ fn submit(input: &Section, report: &[u8]) {
 
     // Settle to an even value one past where we started.
     input.write_u32(IN_SEQNO, (seq | 1).wrapping_add(1));
+
+    // Read straight back. This is the only way to answer "can Rust drive it"
+    // without depending on what joy.cpl looks like: if the bytes are still ours
+    // the write reached the section, and if they are not, we are being raced —
+    // which is a different finding, not a failure to write.
+    let mut echo = vec![0u8; len];
+    input.read_bytes(IN_DATA, &mut echo);
+    echo == report[..len]
 }
 
 /// Drain whatever output reports the ring holds beyond `seen`, returning the new
 /// head.
-fn drain_output(output: &Section, seen: u32, found: &mut Vec<(u8, u8, Vec<u8>)>) -> u32 {
+fn drain_output(
+    output: &Section,
+    seen: u32,
+    found: &mut Vec<(u8, u8, Vec<u8>)>,
+    mismatched: &mut Vec<(u32, u32)>,
+) -> u32 {
     let head = output.read_u32(OUT_HEAD);
     if head == seen {
         return head;
@@ -228,7 +250,13 @@ fn drain_output(output: &Section, seen: u32, found: &mut Vec<(u8, u8, Vec<u8>)>)
     for seq in first..head {
         let slot = OUT_HEADER_SIZE + (seq as usize % OUT_RING_SLOTS) * OUT_SLOT_SIZE;
         // Re-check the slot's own sequence: a slot recycled mid-read is stale.
-        if output.read_u32(slot + OUT_SLOT_SEQNO) != seq {
+        let slot_seq = output.read_u32(slot + OUT_SLOT_SEQNO);
+        if slot_seq != seq {
+            // Report rather than skip. Head advanced 37 -> 41 on the first real
+            // run while this loop found nothing, which means the assumption that
+            // a slot's SeqNo equals its ring position is wrong — and silently
+            // `continue`ing hid exactly the evidence needed to fix it.
+            mismatched.push((seq, slot_seq));
             continue;
         }
         let mut meta = [0u8; 4];
@@ -236,8 +264,7 @@ fn drain_output(output: &Section, seen: u32, found: &mut Vec<(u8, u8, Vec<u8>)>)
         let source = meta[0];
         output.read_bytes(slot + OUT_SLOT_REPORT_ID, &mut meta[..1]);
         let report_id = meta[0];
-        let size = u32::from(output.read_u32(slot + OUT_SLOT_SIZE_OFF) as u16) as usize;
-        let size = size.min(256);
+        let size = usize::from(output.read_u16(slot + OUT_SLOT_SIZE_OFF)).min(256);
         let mut data = vec![0u8; size];
         output.read_bytes(slot + OUT_SLOT_DATA, &mut data);
         found.push((source, report_id, data));
@@ -470,39 +497,88 @@ pub fn run() {
     };
 
     println!();
-    println!("  Writing 40 frames over 4 seconds: stick to each extreme in turn, one");
-    println!("  button per phase. Watch joy.cpl.");
+    println!("  Writing 400 frames over 4 seconds. PadForge submits for this pad too,");
+    println!("  so ours are outnumbered -- every write is read straight back to see");
+    println!("  whether it reached the section at all. Watch joy.cpl as well.");
 
     let mut seen = output.as_ref().map_or(0, |s| s.read_u32(OUT_HEAD));
     let mut rumble = Vec::new();
+    let mut mismatched = Vec::new();
     let start_seq = input.read_u32(IN_SEQNO);
 
-    for step in 0..40u32 {
-        submit(&input, &pattern(step));
-        if let Some(output) = &output {
-            seen = drain_output(output, seen, &mut rumble);
+    // 400 at 10ms rather than 40 at 100ms: at ~60Hz of competing submissions a
+    // 10Hz pattern is invisible in joy.cpl, and the read-back needs to land
+    // before the next writer gets there.
+    const FRAMES: u32 = 400;
+    let mut survived = 0u32;
+    for step in 0..FRAMES {
+        if submit(&input, &pattern(step)) {
+            survived += 1;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(output) = &output {
+            seen = drain_output(output, seen, &mut rumble, &mut mismatched);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // One more: reports arriving in the final sleep would otherwise be missed,
+    // which is how the first run lost all four of them.
+    if let Some(output) = &output {
+        drain_output(output, seen, &mut rumble, &mut mismatched);
     }
 
     let end_seq = input.read_u32(IN_SEQNO);
+    let moved = end_seq.wrapping_sub(start_seq);
+    let ours = FRAMES * 2;
     println!();
-    println!("  SeqNo moved {start_seq} -> {end_seq}");
-    if end_seq == start_seq {
-        println!("  -> Our own writes did not stick, so the section is not writable by this");
-        println!("     process even though it opened. Elevation is the first thing to try.");
+    println!("  SeqNo moved {start_seq} -> {end_seq} (delta {moved})");
+    println!("  our {FRAMES} writes account for ~{ours} of that");
+    if moved > ours {
+        let others = moved - ours;
+        println!(
+            "  -> ~{others} increments came from elsewhere: PadForge is submitting for this",
+        );
+        println!("     pad too. Expected, and it is why the read-back below matters more than");
+        println!("     anything joy.cpl shows.");
+    }
+
+    println!();
+    println!("  read-back: {survived}/{FRAMES} of our writes were still ours when read");
+    if survived == 0 {
+        println!("  -> Nothing we wrote survived. Either the section is not writable by this");
+        println!("     process despite opening, or a co-writer overwrites within microseconds.");
+        println!("     Unbind the physical controller in PadForge and re-run: if writes then");
+        println!("     stick, Rust can drive it and the only issue was the race.");
+    } else if survived < FRAMES / 2 {
+        println!("  -> Writes land but are frequently overwritten. Rust CAN drive the section;");
+        println!("     a real integration would be the only writer, so this is the race and");
+        println!("     not a limit.");
+    } else {
+        println!("  -> Rust can drive the section. This is the question the spike existed for,");
+        println!("     and the answer is yes.");
     }
 
     if let Some(output) = &output {
+        println!();
         println!("  output Head now {}", output.read_u32(OUT_HEAD));
+        if !mismatched.is_empty() {
+            println!(
+                "  {} slot(s) whose SeqNo did not match their ring position, first few:",
+                mismatched.len()
+            );
+            for (expected, actual) in mismatched.iter().take(6) {
+                println!("    ring position {expected} holds SeqNo {actual}");
+            }
+            println!("  -> So a slot's SeqNo is not its ring position. Whatever Head counts, it");
+            println!("     is not what indexes the slots -- which is why the first run saw Head");
+            println!("     advance and reported nothing.");
+        }
         if rumble.is_empty() {
-            println!("  no output reports seen -- trigger vibration in a game while this runs");
-            println!("  to find out whether rumble is reachable without their C# event.");
+            println!("  no output reports decoded -- trigger vibration in a game while this");
+            println!("  runs to find out whether rumble is reachable without their C# event.");
         } else {
-            println!("  {} output report(s) seen:", rumble.len());
+            println!("  {} output report(s):", rumble.len());
             for (source, report_id, data) in rumble.iter().take(8) {
-                let head: Vec<String> =
-                    data.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                let head: Vec<String> = data.iter().take(8).map(|b| format!("{b:02x}")).collect();
                 println!(
                     "    source {source} report {report_id} len {} [{}]",
                     data.len(),
