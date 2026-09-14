@@ -82,7 +82,11 @@ pub fn run() {
         return;
     }
     println!("  pads in slots: {present:?}");
-    println!("  polling for 10s -- use the pad");
+    println!();
+    println!("  >>> Hold a stick OFF-CENTRE for the whole 10s, do not just press buttons.");
+    println!("  >>> An off-centre stick jitters in its analog values, so the pad reports");
+    println!("  >>> continuously at its full rate. A pad at rest reports nothing, and every");
+    println!("  >>> pause becomes a long gap that looks like link jitter but is just hands.");
 
     let mut pads: Vec<Pad> = present
         .iter()
@@ -123,9 +127,16 @@ pub fn run() {
             }
             last_change[slot] = Some(now);
         }
-        // ~1kHz. Faster would burn a core for resolution the pad cannot use.
-        std::thread::sleep(std::time::Duration::from_micros(1000));
+        // Spin rather than sleep. `sleep(1ms)` actually landed around 1.4ms on
+        // Windows' default timer granularity -- 733Hz against an 8ms signal, so
+        // every interval carried ~17% quantisation. A 10s probe can afford a
+        // core, and the achieved rate is reported so the resolution is visible
+        // rather than assumed.
+        std::hint::spin_loop();
     }
+
+    let elapsed = clock::ticks_to_ns(clock::now() - (deadline - clock::ticks_per_sec() * 10));
+    let seconds = elapsed as f64 / 1e9;
 
     println!();
     for pad in &mut pads {
@@ -137,15 +148,35 @@ pub fn run() {
             );
             continue;
         }
+        let p50 = percentile(&pad.gaps, 50);
+        let p99 = percentile(&pad.gaps, 99);
+        let max = pad.gaps[pad.gaps.len() - 1];
         println!(
             "  slot {}: p50 {:.2}ms  p99 {:.2}ms  max {:.2}ms   ({} changes over {} polls)",
             pad.index,
-            percentile(&pad.gaps, 50) as f64 / 1e6,
-            percentile(&pad.gaps, 99) as f64 / 1e6,
-            pad.gaps[pad.gaps.len() - 1] as f64 / 1e6,
+            p50 as f64 / 1e6,
+            p99 as f64 / 1e6,
+            max as f64 / 1e6,
             pad.gaps.len(),
             pad.polls,
         );
+        println!(
+            "           poll rate {:.0}Hz, so resolution is ~{:.2}ms",
+            f64::from(u32::try_from(pad.polls).unwrap_or(u32::MAX)) / seconds,
+            seconds * 1e3 / pad.polls.max(1) as f64,
+        );
+
+        // How much of the run was continuous. A stick held off-centre reports at
+        // the pad's full rate; every pause shows up as an outlier, and without
+        // this the tail reads as link jitter when it is just idle time.
+        let near = pad.gaps.iter().filter(|g| **g <= p50.saturating_mul(2)).count();
+        let continuity = near as f64 * 100.0 / pad.gaps.len() as f64;
+        println!("           {continuity:.0}% of gaps within 2x p50");
+        if continuity < 90.0 {
+            println!("           -> The pad was not moving continuously, so p99 and max are");
+            println!("              mostly pauses rather than the link. Only p50 is usable");
+            println!("              from this run; hold a stick off-centre and repeat.");
+        }
         if pad.gaps.len() < 100 {
             println!("           (under 100 samples -- p99 is the max here, not a percentile)");
         }
@@ -153,10 +184,9 @@ pub fn run() {
 
     println!();
     println!("  -> Compare direct against forwarded. p50 is the pad's own cadence and");
-    println!("     should not move; the tail is what USB/IP adds. A p50 that shifts means");
-    println!("     the transport is rate-limiting rather than jittering.");
+    println!("     should not move; the tail is what USB/IP adds -- but only if continuity");
+    println!("     is high in both runs, otherwise the tail is just idle time.");
     println!();
-    println!("     Resolution is bounded by the 1kHz poll, so this is arrival spacing and");
-    println!("     not absolute latency -- which is the right metric for the comparison");
-    println!("     anyway, since both runs pay the same polling cost.");
+    println!("     p50 near 8ms is the expected 125Hz for an Xbox pad, which doubles as a");
+    println!("     check that the measurement is sane before any comparison is drawn.");
 }

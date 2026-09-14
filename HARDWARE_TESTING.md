@@ -799,6 +799,15 @@ shim, and this cross-build contains no C++ at all. The installer ships
       rate-limiting rather than jittering.
 
       `--hidreport` stays for non-gamepad devices, where raw HID does work.
+
+      **First direct baseline (env S, wired Xbox One controller, slot 0):**
+      **p50 8.22ms** — that is 125Hz, the expected Xbox report rate, and it
+      doubles as proof the instrument is sane. p99 76ms and max 120ms from the
+      same run are **not** link behaviour: `dwPacketNumber` moves only on a state
+      change, so every pause in handling the pad becomes a long gap. Hold a stick
+      **off-centre** for the whole run — its analog jitter makes the pad report
+      continuously — and check the continuity figure the probe now prints. Below
+      90% of gaps within 2× p50, only p50 is usable.
 - [ ] **Only then** scope the Android userspace server.
 
 ### Investigation B — HIDMaestro from Rust: **answered, and it is no**
