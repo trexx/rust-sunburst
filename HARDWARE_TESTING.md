@@ -751,13 +751,43 @@ unrooted client would mean implementing the USB/IP server protocol over
 dev machine standing in as the server** — no Android code written until the
 numbers justify it.
 
-- [ ] **Attach gate.** `usbipd` on Linux (`sudo dnf install usbip`, plus
-      `kernel-modules-extra` if `usbip_host` is missing — it is not present on the
-      dev box now), `usbip attach` from Windows, device enumerates as itself.
-- [ ] **`probe-windows --hidreport` direct, then forwarded.** Same device, same
-      handling. **p50 is the device's poll interval; the tail is what the link
-      adds.** If p50 itself moves, the transport is rate-limiting rather than
-      jittering, which is a different and worse problem.
+**The Linux side is not ready yet.** `usbip` and `usbipd` are installed, but
+`usbip_host` cannot load: the module directory for the running kernel
+(`7.1.9-200.fc44`) is empty while the installed `kernel-modules-extra` is
+`7.2.5-200.fc44`. **Reboot into the newer kernel** so the two match. And the
+device to forward has to be plugged in *here* — this machine currently has only a
+webcam on its bus. On Windows: `usbip-win2` ≥ 0.9.8.0.
+
+**The C++ SDK in `../include/usbip` is not needed, and could not be used as it
+stands.** Its signatures pass `std::string`, `std::vector` and `std::optional`
+across the ABI — `std::optional<std::vector<imported_device>>
+get_imported_devices(HANDLE)` — so it is not callable from Rust without a C++
+shim, and this cross-build contains no C++ at all. The installer ships
+`usbip.exe`, so attaching is a command. The SDK only earns that cost if the
+*server* ever automates attach, which is Phase 8 work rather than a measurement.
+
+- [ ] **Attach gate.** Export from Linux, `usbip attach` from Windows, device
+      enumerates as itself. Ideally the **Xbox Wireless Adapter** (`045e:02e6`),
+      since that is the actual Phase 8 scenario.
+- [ ] **Attach with `low_latency`, not the default.** `usbip/vhci.h` documents two
+      reception modes and **defaults to the wrong one for us**:
+
+      > `zero_copy` — dedicated thread, blocking, written straight to
+      > `URB.TransferBuffer`. *"Should be used for storage devices, webcams etc."*
+      >
+      > `low_latency` — WSK event callbacks, no receive thread. *"Should be used
+      > for devices that generate small amounts of data but at a high frequency,
+      > such as HID keyboard/mouse, etc."*
+
+      `persistent_device.recv_mode` initialises to `zero_copy`. A gamepad is
+      squarely the second case, so **measuring the default would price the wrong
+      mode** and the number would look like a property of the transport. This is
+      what v0.9.8.0's WSK work was for.
+- [ ] **`probe-windows --hidreport <n>` direct, then forwarded.** Select by
+      number: one device commonly exposes several HID collections, and a keyboard
+      accounted for five entries under a single VID:PID on the first run.
+      **p50 is the device's poll interval; the tail is what the link adds.** If
+      p50 itself moves, the transport is rate-limiting rather than jittering.
 - [ ] **Only then** scope the Android userspace server.
 
 ### Investigation B — HIDMaestro from Rust: **answered, and it is no**
