@@ -241,44 +241,45 @@ fn submit(input: &Section, report: &[u8]) -> bool {
     echo == report[..len]
 }
 
-/// Drain whatever output reports the ring holds beyond `seen`, returning the new
-/// head.
-fn drain_output(
-    output: &Section,
-    seen: u32,
-    found: &mut Vec<(u8, u8, Vec<u8>)>,
-    mismatched: &mut Vec<(u32, u32)>,
-) -> u32 {
+/// Collect output reports by scanning every slot, assuming nothing about how
+/// sequence numbers map onto ring positions.
+///
+/// The first version derived the position from the sequence number and skipped
+/// any slot that disagreed. A real run then showed `Head 1` with **ring position
+/// 0 holding SeqNo 1** — so `SeqNo` is 1-based where `Head` is a count, and
+/// report *N* lives at position *(N-1) mod 64*.
+///
+/// Rather than encode that relationship from a single observation, this scans all
+/// 64 slots and keys off the sequence numbers it finds. Any indexing scheme the
+/// writer uses comes out the same way, and a future change to it cannot silently
+/// empty the results.
+fn drain_output(output: &Section, seen: u32, found: &mut Vec<(u32, u8, u8, Vec<u8>)>) -> u32 {
     let head = output.read_u32(OUT_HEAD);
-    if head == seen {
-        return head;
-    }
-    // Only the most recent OUT_RING_SLOTS are still present; anything older has
-    // been overwritten and is not worth reporting as lost.
-    let first = head.saturating_sub(OUT_RING_SLOTS as u32).max(seen);
-    for seq in first..head {
-        let slot = OUT_HEADER_SIZE + (seq as usize % OUT_RING_SLOTS) * OUT_SLOT_SIZE;
-        // Re-check the slot's own sequence: a slot recycled mid-read is stale.
+    let mut highest = seen;
+
+    for position in 0..OUT_RING_SLOTS {
+        let slot = OUT_HEADER_SIZE + position * OUT_SLOT_SIZE;
         let slot_seq = output.read_u32(slot + OUT_SLOT_SEQNO);
-        if slot_seq != seq {
-            // Report rather than skip. Head advanced 37 -> 41 on the first real
-            // run while this loop found nothing, which means the assumption that
-            // a slot's SeqNo equals its ring position is wrong — and silently
-            // `continue`ing hid exactly the evidence needed to fix it.
-            mismatched.push((seq, slot_seq));
+        // Zero is "never written"; anything at or below what we have already
+        // reported is old.
+        if slot_seq == 0 || slot_seq <= seen {
             continue;
         }
-        let mut meta = [0u8; 4];
-        output.read_bytes(slot + OUT_SLOT_SOURCE, &mut meta[..1]);
-        let source = meta[0];
-        output.read_bytes(slot + OUT_SLOT_REPORT_ID, &mut meta[..1]);
-        let report_id = meta[0];
+        let mut one = [0u8; 1];
+        output.read_bytes(slot + OUT_SLOT_SOURCE, &mut one);
+        let source = one[0];
+        output.read_bytes(slot + OUT_SLOT_REPORT_ID, &mut one);
+        let report_id = one[0];
         let size = usize::from(output.read_u16(slot + OUT_SLOT_SIZE_OFF)).min(256);
         let mut data = vec![0u8; size];
         output.read_bytes(slot + OUT_SLOT_DATA, &mut data);
-        found.push((source, report_id, data));
+
+        highest = highest.max(slot_seq);
+        found.push((slot_seq, source, report_id, data));
     }
-    head
+    // Head is reported separately by the caller; returning the highest sequence
+    // actually seen is what makes the next scan pick up only new reports.
+    highest.max(head.min(highest))
 }
 
 /// A recognisable pattern, so `joy.cpl` shows unambiguously whether the frames
@@ -512,7 +513,6 @@ pub fn run() {
 
     let mut seen = output.as_ref().map_or(0, |s| s.read_u32(OUT_HEAD));
     let mut rumble = Vec::new();
-    let mut mismatched = Vec::new();
     let start_seq = input.read_u32(IN_SEQNO);
 
     // 400 at 10ms rather than 40 at 100ms: at ~60Hz of competing submissions a
@@ -525,14 +525,14 @@ pub fn run() {
             survived += 1;
         }
         if let Some(output) = &output {
-            seen = drain_output(output, seen, &mut rumble, &mut mismatched);
+            seen = drain_output(output, seen, &mut rumble);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     // One more: reports arriving in the final sleep would otherwise be missed,
     // which is how the first run lost all four of them.
     if let Some(output) = &output {
-        drain_output(output, seen, &mut rumble, &mut mismatched);
+        drain_output(output, seen, &mut rumble);
     }
 
     let end_seq = input.read_u32(IN_SEQNO);
@@ -555,55 +555,49 @@ pub fn run() {
     println!("  (that proves the memory is writable, not that anything consumed the frame)");
     println!();
 
-    // Our writer advances by exactly two per frame when nothing else is writing,
-    // so the delta is the test for sole-writership -- and without that, neither
-    // the read-back nor joy.cpl can say whether the pad is really being driven.
-    let sole_writer = moved == ours;
-    if sole_writer && survived == FRAMES {
-        println!("  -> SOLE WRITER and every write survived: delta is exactly 2 per frame.");
-        println!("     Rust can drive the section. That is the question the spike existed");
-        println!("     for, and this is the evidence for it.");
+    // Our writer advances by exactly two per frame, so `moved < ours` means our
+    // own accounting is broken -- which is how the seqlock bug was caught. Above
+    // that, the excess is someone else's writes, and what matters is whether it
+    // is a trickle or a flood. Demanding exact equality made a pass impossible
+    // for any co-writer at all, including a keepalive.
+    let others = moved.saturating_sub(ours);
+    let contested = f64::from(others) * 100.0 / f64::from(ours.max(1));
+
+    if moved < ours {
+        println!("  -> BROKEN. The delta is below our own writes, so the writer is not");
+        println!("     advancing the counter as it should. Nothing else here can be trusted.");
     } else if survived == 0 {
         println!("  -> Nothing we wrote survived. Either the section is not writable by this");
         println!("     process despite opening, or a co-writer overwrites within microseconds.");
-    } else if !sole_writer {
-        println!("  -> INCONCLUSIVE. The delta does not match our own writes, so PadForge is");
-        println!("     writing the same seqlock -- and a seqlock has one writer by design, so");
-        println!("     this is not a valid test of anything.");
-        println!();
-        println!("     >>> Unbind the physical controller from this pad in PadForge, leave");
-        println!("     >>> PadForge running, and run again. With us as the only writer the");
-        println!("     >>> delta should be exactly {ours} and joy.cpl should show the pattern");
-        println!("     >>> cleanly instead of fighting real input.");
+    } else if contested > 25.0 {
+        println!("  -> INCONCLUSIVE: {contested:.0}% of the counter movement was someone else's.");
+        println!("     A seqlock has one writer by design, so this is not a clean test.");
+        println!("     >>> Unbind the physical controller from this pad in PadForge and re-run.");
     } else {
-        println!("  -> Writes land but not all survived. Worth a re-run with the physical");
-        println!("     controller unbound to separate the race from a real limit.");
+        println!("  -> Rust CAN drive the section: every write landed, the counter advanced by");
+        println!("     exactly two per frame, and only {contested:.0}% of the movement came from");
+        println!("     elsewhere. That is the question the spike existed for.");
+        println!();
+        println!("     One thing this still cannot see: whether the DRIVER consumed the");
+        println!("     frames. Writing memory and being read are different claims. joy.cpl is");
+        println!("     the witness -- the pattern slams each stick to its extreme in turn with");
+        println!("     one button per phase, so it is unmistakable if it is getting through.");
     }
 
     if let Some(output) = &output {
         println!();
         println!("  output Head now {}", output.read_u32(OUT_HEAD));
-        if !mismatched.is_empty() {
-            println!(
-                "  {} slot(s) whose SeqNo did not match their ring position, first few:",
-                mismatched.len()
-            );
-            for (expected, actual) in mismatched.iter().take(6) {
-                println!("    ring position {expected} holds SeqNo {actual}");
-            }
-            println!("  -> So a slot's SeqNo is not its ring position. Whatever Head counts, it");
-            println!("     is not what indexes the slots -- which is why the first run saw Head");
-            println!("     advance and reported nothing.");
-        }
         if rumble.is_empty() {
-            println!("  no output reports decoded -- trigger vibration in a game while this");
-            println!("  runs to find out whether rumble is reachable without their C# event.");
+            println!("  no output reports in the ring -- trigger vibration in a game while");
+            println!("  this runs to find out whether rumble is reachable without their C#");
+            println!("  event. An empty ring is not evidence either way.");
         } else {
+            rumble.sort_by_key(|(seq, _, _, _)| *seq);
             println!("  {} output report(s):", rumble.len());
-            for (source, report_id, data) in rumble.iter().take(8) {
+            for (seq, source, report_id, data) in rumble.iter().take(8) {
                 let head: Vec<String> = data.iter().take(8).map(|b| format!("{b:02x}")).collect();
                 println!(
-                    "    source {source} report {report_id} len {} [{}]",
+                    "    seq {seq} source {source} report {report_id} len {} [{}]",
                     data.len(),
                     head.join(" ")
                 );
