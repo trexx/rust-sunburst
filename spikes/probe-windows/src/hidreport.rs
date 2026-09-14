@@ -262,20 +262,17 @@ pub fn run() {
         return;
     }
 
-    // Select by list index, not VID:PID. A single physical device commonly
-    // exposes several HID collections -- a keyboard here shows five under one
-    // VID:PID -- so selecting by identifier silently picks whichever came first,
-    // which may not be the one that carries input.
-    let wanted: Option<usize> = std::env::args()
+    // Accept either a number or a vid:pid. Neither alone is enough: a single
+    // physical device commonly exposes several HID collections under one
+    // identifier -- a keyboard here shows five -- while enumeration order is not
+    // guaranteed stable between runs, so a number is only meaningful against the
+    // listing that produced it.
+    let arg = std::env::args()
         .skip_while(|a| a != "--hidreport")
-        .nth(1)
-        .and_then(|a| a.parse().ok());
+        .nth(1);
 
-    let Some(chosen) = wanted.and_then(|i| i.checked_sub(1)).filter(|i| *i < devices.len())
-    else {
-        println!("  {} HID device(s). Pick one by number:", devices.len());
-        println!("    probe-windows --hidreport <n>");
-        println!();
+    let timeable = |d: &&Device| d.input_len > 0;
+    let list = |devices: &[Device]| {
         for (index, device) in devices.iter().enumerate() {
             let note = if device.input_len == 0 {
                 "  (no input report -- cannot be timed)"
@@ -292,14 +289,68 @@ pub fn run() {
                 note
             );
         }
-        println!();
-        println!("  Several entries sharing one VID:PID are separate collections of the same");
-        println!("  physical device, which is why this selects by number.");
-        println!();
-        println!("  Note the Xbox Wireless Adapter (045e:02e6) will NOT appear here: it is");
-        println!("  not a HID device but an MT7612U radio, so forward the adapter and time");
-        println!("  the pads that show up through it instead.");
-        return;
+    };
+
+    let chosen = match arg.as_deref() {
+        // vid:pid -- unambiguous only when one collection under it can be timed.
+        Some(a) if a.contains(':') => {
+            let parsed = a.split_once(':').and_then(|(v, p)| {
+                Some((
+                    u16::from_str_radix(v.trim_start_matches("0x"), 16).ok()?,
+                    u16::from_str_radix(p.trim_start_matches("0x"), 16).ok()?,
+                ))
+            });
+            let Some((vid, pid)) = parsed else {
+                println!("  could not parse '{a}' as vid:pid (hex, e.g. 045e:02ff)");
+                return;
+            };
+            let matches: Vec<usize> = devices
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.vid == vid && d.pid == pid && timeable(d))
+                .map(|(i, _)| i)
+                .collect();
+            match matches.as_slice() {
+                [] => {
+                    println!("  {vid:04x}:{pid:04x} has no timeable collection. Present:");
+                    list(&devices);
+                    return;
+                }
+                [only] => *only,
+                several => {
+                    println!(
+                        "  {vid:04x}:{pid:04x} has {} timeable collections -- pick by number:",
+                        several.len()
+                    );
+                    list(&devices);
+                    return;
+                }
+            }
+        }
+        Some(a) => match a.parse::<usize>().ok().and_then(|n| n.checked_sub(1)) {
+            Some(index) if index < devices.len() => index,
+            _ => {
+                println!("  '{a}' is not a device number or a vid:pid.");
+                list(&devices);
+                return;
+            }
+        },
+        None => {
+            println!("  {} HID device(s). Pick one:", devices.len());
+            println!("    probe-windows --hidreport <n>         by number, from this listing");
+            println!("    probe-windows --hidreport 045e:02ff   by id, when it is unambiguous");
+            println!();
+            list(&devices);
+            println!();
+            println!("  Several entries sharing one VID:PID are separate collections of the");
+            println!("  same physical device. Enumeration order is not guaranteed stable");
+            println!("  between runs, so re-list rather than reusing an old number.");
+            println!();
+            println!("  The Xbox Wireless Adapter (045e:02e6) will NOT appear here: it is not");
+            println!("  a HID device but an MT7612U radio, so forward the adapter and time the");
+            println!("  pads that show up through it instead.");
+            return;
+        }
     };
     let device = &devices[chosen];
 
@@ -308,8 +359,18 @@ pub fn run() {
         device.vid, device.pid, device.product, device.input_len
     );
     if device.input_len == 0 {
-        println!("  -> No input report length; ReadFile cannot be sized and this device");
-        println!("     cannot be timed this way.");
+        println!("  -> No input report length, so ReadFile cannot be sized and this device");
+        println!("     cannot be timed. These can be:");
+        for (index, other) in devices.iter().enumerate().filter(|(_, d)| d.input_len > 0) {
+            println!(
+                "    {:>2}  {:04x}:{:04x}  input {:>4}B  {}",
+                index + 1,
+                other.vid,
+                other.pid,
+                other.input_len,
+                other.product
+            );
+        }
         return;
     }
 
