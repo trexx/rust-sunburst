@@ -35,7 +35,8 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
 };
 use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -48,6 +49,25 @@ struct Device {
     pid: u16,
     product: String,
     input_len: u16,
+}
+
+fn open_overlapped(path: &str) -> Result<HANDLE, String> {
+    // SAFETY: `path` is a NUL-terminated wide string for the call's lifetime.
+    // FILE_FLAG_OVERLAPPED is what makes a read cancellable: a synchronous
+    // ReadFile on a HID device blocks until a report arrives, so a device that
+    // never reports parks the caller forever and no deadline can fire.
+    unsafe {
+        CreateFileW(
+            &HSTRING::from(path),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            None,
+        )
+    }
+    .map_err(|e| format!("CreateFileW: {e}"))
 }
 
 fn open(path: &str) -> Result<HANDLE, String> {
@@ -206,10 +226,31 @@ fn enumerate() -> Vec<Device> {
 }
 
 /// Read input reports for `secs`, timing the gap between them.
+///
+/// Overlapped, with a bounded wait per read. The first version used a plain
+/// synchronous `ReadFile` inside a loop that checked a deadline between
+/// iterations — so a device that reported nothing blocked on the very first call
+/// and the timeout could never be reached. It froze rather than reporting that
+/// nothing arrived, which is the one outcome the caller most needs told.
 fn measure(device: &Device, secs: u64) -> Vec<u64> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_IO_PENDING, WAIT_OBJECT_0};
+    use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
     let mut gaps = Vec::new();
-    let Ok(handle) = open(&device.path) else {
+    let Ok(handle) = open_overlapped(&device.path) else {
         println!("  could not open for reading");
+        return gaps;
+    };
+
+    // Manual-reset event, reset explicitly before each read.
+    // SAFETY: no security attributes, no name; a valid event handle or an error.
+    let Ok(event) = (unsafe { CreateEventW(None, true, false, None) }) else {
+        println!("  could not create the completion event");
+        // SAFETY: ours, closed once.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
         return gaps;
     };
 
@@ -219,13 +260,48 @@ fn measure(device: &Device, secs: u64) -> Vec<u64> {
     let deadline = clock::now() + clock::ticks_per_sec() * secs;
 
     while clock::now() < deadline {
-        let mut read = 0u32;
-        // SAFETY: `buffer` is at least the input report length, which is what
-        // ReadFile on a HID device requires, and `read` is a valid out pointer.
-        let ok = unsafe { ReadFile(handle, Some(buffer.as_mut_slice()), Some(&mut read), None) };
-        if ok.is_err() {
+        // SAFETY: `event` is a live manual-reset event.
+        unsafe {
+            let _ = windows::Win32::System::Threading::ResetEvent(event);
+        }
+        let mut overlapped = OVERLAPPED {
+            hEvent: event,
+            ..Default::default()
+        };
+
+        // SAFETY: `buffer` is at least the input report length, `overlapped`
+        // outlives the operation, and the handle was opened overlapped.
+        let started = unsafe {
+            ReadFile(handle, Some(buffer.as_mut_slice()), None, Some(&mut overlapped))
+        };
+        if started.is_err() {
+            // SAFETY: reading a thread-local error code.
+            if unsafe { GetLastError() } != ERROR_IO_PENDING {
+                break;
+            }
+        }
+
+        // Wait only as long as is left, so the total honours `secs` even when
+        // the device is silent.
+        let remaining_ns = clock::ticks_to_ns(deadline.saturating_sub(clock::now()));
+        let wait_ms = u32::try_from(remaining_ns / 1_000_000).unwrap_or(u32::MAX).max(1);
+        // SAFETY: `event` is live; the wait is bounded.
+        let waited = unsafe { WaitForSingleObject(event, wait_ms) };
+        if waited != WAIT_OBJECT_0 {
+            // SAFETY: cancels the pending read on this handle before the
+            // OVERLAPPED goes out of scope, which it must.
+            unsafe {
+                let _ = CancelIo(handle);
+            }
             break;
         }
+
+        let mut read = 0u32;
+        // SAFETY: the operation completed; `read` is a valid out pointer.
+        if unsafe { GetOverlappedResult(handle, &overlapped, &mut read, false) }.is_err() {
+            break;
+        }
+
         let now = clock::now();
         if let Some(previous) = previous {
             gaps.push(clock::ticks_to_ns(now - previous));
@@ -233,8 +309,10 @@ fn measure(device: &Device, secs: u64) -> Vec<u64> {
         previous = Some(now);
     }
 
-    // SAFETY: ours, closed exactly once.
+    // SAFETY: both handles are ours and closed exactly once.
     unsafe {
+        let _ = CancelIo(handle);
+        let _ = windows::Win32::Foundation::CloseHandle(event);
         let _ = windows::Win32::Foundation::CloseHandle(handle);
     }
     gaps.sort_unstable();
@@ -377,7 +455,13 @@ pub fn run() {
     println!("  reading for 10s -- use the device");
     let gaps = measure(device, 10);
     if gaps.is_empty() {
-        println!("  no reports arrived. A device that reports only on input needs using.");
+        println!("  no reports arrived in {}s.", 10);
+        println!();
+        println!("  -> Two likely reasons. A device that reports only on input needs using");
+        println!("     while this runs. Or this is a *virtual* pad, in which case it emits");
+        println!("     nothing unless something is feeding it -- close PadForge and re-list:");
+        println!("     if 045e:02ff disappears it was virtual, and its intervals would have");
+        println!("     been PadForge's submit cadence rather than a controller's anyway.");
         return;
     }
     println!(
