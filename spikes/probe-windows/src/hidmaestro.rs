@@ -86,6 +86,44 @@ const _: () = assert!(OUT_SLOT_DATA == OUT_SLOT_SIZE_OFF + 2);
 const _: () = assert!(OUT_SLOT_SIZE == OUT_SLOT_DATA + 256);
 const _: () = assert!(OUTPUT_SIZE == 16904);
 
+/// Is this process elevated?
+///
+/// It matters more than it looks. PadForge — the app that creates these pads —
+/// **always runs elevated**, and installs HIDMaestro inside that elevated
+/// session. An object created at high integrity is not writable from a medium
+/// one, so a non-elevated probe can fail here for a reason that has nothing to
+/// do with whether the approach works.
+fn elevated() -> Option<bool> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess returns a pseudo-handle needing no close, and
+    // `token` is a valid out parameter.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: `elevation` is correctly sized for TokenElevation and `returned`
+    // is a valid out pointer.
+    let got = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut elevation).cast()),
+            u32::try_from(size_of::<TOKEN_ELEVATION>()).expect("fits"),
+            &mut returned,
+        )
+    };
+    // SAFETY: ours, closed exactly once.
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+    }
+    got.ok()?;
+    Some(elevation.TokenIsElevated != 0)
+}
+
 /// One mapped section.
 struct Section {
     handle: HANDLE,
@@ -232,19 +270,124 @@ fn pattern(step: u32) -> [u8; 14] {
     report
 }
 
+/// Every name the SDK builds, from `SharedMemoryIO.cs`. Indices are per
+/// controller, and nothing guarantees the first pad is index 0.
+const NAME_PATTERNS: [(&str, bool); 6] = [
+    ("Global\\HIDMaestroInput", true),
+    ("Global\\HIDMaestroOutput", true),
+    ("Global\\HIDMaestroPidState", true),
+    ("Global\\HIDMaestroInputEvent", false),
+    ("Global\\HIDMaestroOutputEvent", false),
+    ("Global\\HIDMaestroCompanionInputEvent", false),
+];
+
+/// How many controller indices to look at. The SDK numbers per controller and
+/// a remapper may not start at zero.
+const SURVEY_INDICES: u32 = 16;
+
+/// Report which of HIDMaestro's named objects actually exist.
+///
+/// Hard-coding index 0 produced `ERROR_FILE_NOT_FOUND` and no information: the
+/// name was right — `SharedMemoryIO.cs` builds exactly this — so "not found"
+/// meant either a different index or nothing there at all, and one name cannot
+/// tell those apart. Surveying can.
+///
+/// An event present without its section is especially diagnostic: it means a pad
+/// exists and something has not mapped its memory yet.
+fn survey() -> Vec<String> {
+    use windows::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE};
+
+    let mut found = Vec::new();
+    for (prefix, is_section) in NAME_PATTERNS {
+        for index in 0..SURVEY_INDICES {
+            let name = format!("{prefix}{index}");
+            let exists = if is_section {
+                // SAFETY: `name` is a NUL-terminated wide string for the call.
+                unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, &HSTRING::from(&name)) }
+                    .map(|h| {
+                        // SAFETY: ours, closed once; only existence was wanted.
+                        unsafe {
+                            let _ = windows::Win32::Foundation::CloseHandle(h);
+                        }
+                    })
+                    .is_ok()
+            } else {
+                // SAFETY: as above; SYNCHRONIZE is the least access that proves
+                // the object is there.
+                unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(&name)) }
+                    .map(|h| {
+                        // SAFETY: ours, closed once.
+                        unsafe {
+                            let _ = windows::Win32::Foundation::CloseHandle(h);
+                        }
+                    })
+                    .is_ok()
+            };
+            if exists {
+                found.push(name);
+            }
+        }
+    }
+    found
+}
+
 pub fn run() {
     println!("== HIDMaestro: can Rust drive it? ==");
     println!("  Creating a pad needs their C# orchestrator -- ~600KB including");
     println!("  Ghidra-derived Windows PnP workarounds -- so this only tests the half");
     println!("  that would be ours: writing reports and reading rumble back.");
     println!();
-    println!("  Create a pad with HIDMaestro's own tooling first, and leave joy.cpl open.");
+    println!("  Create a pad first -- PadForge is the app that does it -- and leave");
+    println!("  joy.cpl open.");
+    match elevated() {
+        Some(true) => println!("  this process: elevated"),
+        Some(false) => {
+            println!("  this process: NOT elevated");
+            println!("  PadForge runs elevated and creates the pad there, so if the sections");
+            println!("  below fail to open or writes do not stick, re-run this as Administrator");
+            println!("  before concluding anything about the approach.");
+        }
+        None => println!("  this process: elevation unknown"),
+    }
     println!();
 
-    // Index 0 only: if the first pad's sections are not there, a second will not
-    // be either, and reporting four identical failures is noise.
-    let input = Section::open("Global\\HIDMaestroInput0", true, INPUT_SIZE);
-    let output = Section::open("Global\\HIDMaestroOutput0", false, OUTPUT_SIZE);
+    // Survey before asserting. Index 0 is a guess, and a failed guess at one
+    // name carries no information about why.
+    let found = survey();
+    if found.is_empty() {
+        println!("  no HIDMaestro named objects found at indices 0..{SURVEY_INDICES}.");
+        println!();
+        println!("  -> Nothing is there to talk to. The name is not the problem: the SDK's");
+        println!("     SharedMemoryIO.cs builds exactly these names. So either no pad exists");
+        println!("     right now, or the app that made it has exited.");
+        println!();
+        println!("     PadForge creates these sections itself -- the driver cannot, it lacks");
+        println!("     SeCreateGlobalPrivilege -- so **PadForge has to still be running**.");
+        println!("     If it was closed after creating the pad, that is itself the answer to");
+        println!("     the lifetime question: a sidecar must stay resident.");
+        return;
+    }
+    println!("  found {} HIDMaestro object(s):", found.len());
+    for name in &found {
+        println!("    {name}");
+    }
+
+    // Drive the lowest index that has an input section, rather than assuming 0.
+    let index = (0..SURVEY_INDICES)
+        .find(|i| found.iter().any(|n| n == &format!("Global\\HIDMaestroInput{i}")));
+    let Some(index) = index else {
+        println!();
+        println!("  -> Objects exist but no input section among them, so there is nothing to");
+        println!("     write to. An event without its section means the pad is registered but");
+        println!("     its memory is not mapped -- which would make this approach unusable as");
+        println!("     it stands.");
+        return;
+    };
+    println!();
+    println!("  driving controller index {index}");
+
+    let input = Section::open(&format!("Global\\HIDMaestroInput{index}"), true, INPUT_SIZE);
+    let output = Section::open(&format!("Global\\HIDMaestroOutput{index}"), false, OUTPUT_SIZE);
 
     let input = match input {
         Ok(section) => {
@@ -254,10 +397,12 @@ pub fn run() {
         Err(e) => {
             println!("  input  section: {e}");
             println!();
-            println!("  -> No pad exists, or it is owned by another session. `Global\\` sections");
-            println!("     are per-session; a pad created by an elevated process may not be");
-            println!("     visible here. This is a different failure from one that opens and");
-            println!("     ignores writes, which is why it is reported separately.");
+            println!("  -> No pad exists, or this process cannot reach it. `Global\\` sections");
+            println!("     are per-session, and an object created at high integrity is not");
+            println!("     writable from a medium one -- PadForge creates the pad elevated.");
+            println!("     Re-run as Administrator before reading this as a real answer.");
+            println!("     Note this is a different failure from a section that opens and");
+            println!("     ignores writes, which is why the two are reported separately.");
             return;
         }
     };
@@ -295,8 +440,8 @@ pub fn run() {
     println!();
     println!("  SeqNo moved {start_seq} -> {end_seq}");
     if end_seq == start_seq {
-        println!("  -> Our own writes did not stick, which means the section is not writable");
-        println!("     by this process. Check whether the pad's owner is elevated.");
+        println!("  -> Our own writes did not stick, so the section is not writable by this");
+        println!("     process even though it opened. Elevation is the first thing to try.");
     }
 
     if let Some(output) = &output {
@@ -320,6 +465,6 @@ pub fn run() {
     }
 
     println!();
-    println!("  Then: does the pad survive HIDMaestro's tooling exiting? That decides");
-    println!("  whether this is 'run a helper at startup' or 'supervise a .NET service'.");
+    println!("  Then: does the pad survive PadForge exiting? That decides whether this");
+    println!("  is 'run a helper at startup' or 'supervise a .NET service'.");
 }
