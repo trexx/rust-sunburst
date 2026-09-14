@@ -126,6 +126,47 @@ fn elevated() -> Option<bool> {
     Some(elevation.TokenIsElevated != 0)
 }
 
+/// The doorbell the driver's worker waits on.
+///
+/// **Not signalling this was an omission**, and probably the reason the first
+/// working run moved nothing in `joy.cpl`. `SharedMemoryIO` creates
+/// `Global\\HIDMaestroInputEvent<N>` and the driver's per-device worker waits on
+/// it with a 50ms safety timeout — so a writer that never rings it is relying on
+/// that timeout while a 60Hz co-writer overwrites the section in between.
+struct Doorbell(HANDLE);
+
+impl Doorbell {
+    fn open(name: &str) -> Option<Doorbell> {
+        use windows::Win32::System::Threading::EVENT_MODIFY_STATE;
+        // SAFETY: `name` is a NUL-terminated wide string for the call.
+        unsafe {
+            windows::Win32::System::Threading::OpenEventW(
+                EVENT_MODIFY_STATE,
+                false,
+                &HSTRING::from(name),
+            )
+        }
+        .ok()
+        .map(Doorbell)
+    }
+
+    fn ring(&self) {
+        // SAFETY: a live auto-reset event handle opened with EVENT_MODIFY_STATE.
+        unsafe {
+            let _ = windows::Win32::System::Threading::SetEvent(self.0);
+        }
+    }
+}
+
+impl Drop for Doorbell {
+    fn drop(&mut self) {
+        // SAFETY: ours, closed exactly once.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// One mapped section.
 struct Section {
     handle: HANDLE,
@@ -221,7 +262,7 @@ impl Drop for Section {
 /// Rounding up to the next even value first makes the write monotonic, always
 /// ends the counter even, and advances by exactly two whenever we are the only
 /// writer — which is what makes the delta a usable check rather than noise.
-fn submit(input: &Section, report: &[u8]) -> bool {
+fn submit(input: &Section, doorbell: Option<&Doorbell>, report: &[u8]) -> bool {
     let base = input.read_u32(IN_SEQNO);
     let start = if base.is_multiple_of(2) { base } else { base.wrapping_add(1) };
 
@@ -232,6 +273,11 @@ fn submit(input: &Section, report: &[u8]) -> bool {
     // Nothing in this spike uses the GIP or extended regions; leaving them alone
     // rather than zeroing avoids disturbing whatever the owner put there.
     input.write_u32(IN_SEQNO, start.wrapping_add(2));
+
+    // Ring the doorbell, which is what the driver is actually waiting on.
+    if let Some(doorbell) = doorbell {
+        doorbell.ring();
+    }
 
     // Read straight back. Note what this does and does not prove: that the
     // memory is writable, not that anything consumed the frame. The delta check
@@ -506,6 +552,15 @@ pub fn run() {
         }
     };
 
+    let doorbell = Doorbell::open(&format!("Global\\HIDMaestroInputEvent{index}"));
+    match &doorbell {
+        Some(_) => println!("  doorbell: open, will be signalled after every write"),
+        None => println!("  doorbell: NOT open -- the driver will only see writes via its"),
+    }
+    if doorbell.is_none() {
+        println!("            50ms safety timeout, which a co-writer can overwrite inside");
+    }
+
     println!();
     println!("  Writing 400 frames over 4 seconds. PadForge submits for this pad too,");
     println!("  so ours are outnumbered -- every write is read straight back to see");
@@ -521,7 +576,7 @@ pub fn run() {
     const FRAMES: u32 = 400;
     let mut survived = 0u32;
     for step in 0..FRAMES {
-        if submit(&input, &pattern(step)) {
+        if submit(&input, doorbell.as_ref(), &pattern(step)) {
             survived += 1;
         }
         if let Some(output) = &output {
@@ -564,8 +619,16 @@ pub fn run() {
     let contested = f64::from(others) * 100.0 / f64::from(ours.max(1));
 
     if moved < ours {
-        println!("  -> BROKEN. The delta is below our own writes, so the writer is not");
-        println!("     advancing the counter as it should. Nothing else here can be trusted.");
+        // Two writers doing read-modify-write on one counter lose increments:
+        // both read N, both write N+2, and one increment disappears. So a delta
+        // below our own writes is the signature of contention, not of a broken
+        // writer -- and the delta cannot detect sole-writership while depending
+        // on it. That is why the closed-loop check below exists.
+        let lost = ours - moved;
+        println!("  -> CONTENDED: {lost} increments lost to a concurrent writer.");
+        println!("     Two writers read-modify-writing one counter lose updates, so this is");
+        println!("     contention rather than a writer fault -- and it means the counter");
+        println!("     cannot answer the question. Only the closed loop can.");
     } else if survived == 0 {
         println!("  -> Nothing we wrote survived. Either the section is not writable by this");
         println!("     process despite opening, or a co-writer overwrites within microseconds.");

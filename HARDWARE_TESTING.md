@@ -760,40 +760,75 @@ numbers justify it.
       jittering, which is a different and worse problem.
 - [ ] **Only then** scope the Android userspace server.
 
-### Investigation B — HIDMaestro from Rust
+### Investigation B — HIDMaestro from Rust: **answered, and it is no**
 
-Feeding reports is easy; **creating the device is not** — `Internal/` is ~600KB of
-C#, `DeviceOrchestrator.cs` alone 147KB, and `docs/INTERNALS.md` describes
-`SwDeviceCreate` with non-sentinel ContainerIDs, an `UpperFilters = "xinputhid"`
-registry tripwire found by **Ghidra-decompiling `Windows.Gaming.Input.dll`**, a
-slot-1-skip workaround from decompiling `xinput1_4.dll`, `BTHLEDEVICE` spoofing
-and per-profile driver generation. So the only viable shape is **their C# owning
-lifecycle, Rust writing reports** — and both directions turn out to be shared
-memory, so no .NET on the hot path.
+Everything mechanical works. What does not exist is a contract.
 
-- [ ] **Install gate.** Self-signed cert, **no test-signing, no EV**. The entire
-      attraction rests on this.
-- [ ] **Pad visible** in `joy.cpl` first — absent there means absent from games —
-      then XInput, then a real game.
-- [ ] **`probe-windows --hidmaestro` with `joy.cpl` open.** Create a pad with
-      HIDMaestro's own tooling first. The probe writes 40 frames over 4 seconds,
-      sticks to each extreme in turn, one button per phase — a wrong byte order
-      shows as the wrong axis moving rather than as a subtly wrong value. **This
-      is the question the spike exists for.**
-- [ ] **Rumble.** Trigger vibration in a game while the probe runs; it reads the
-      64-slot output ring. The layout says rumble is reachable without their C#
-      event — confirm rather than assume.
-- [ ] **Lifetime.** Does the pad survive the creating process exiting? That is
-      "run a helper at startup" versus "ship and supervise a .NET service".
+**What was established, in order:**
 
-### What each outcome means
+- [x] **Installs and runs.** PadForge (same author) creates the pads; it always
+      runs elevated and installs HIDMaestro in that session. No test-signing, no
+      EV cert.
+- [x] **The sections are created lazily.** A pad that has never been fed has *no*
+      section — only `HIDMaestroCompanionInputEvent<N>`, which the XUSB
+      companion's driver open-or-creates when its devnode appears.
+      `EnsureInputMapping` builds the section and both events together, on first
+      submit. Bind a controller and move a stick and all five objects appear.
+- [x] **Rust can open and write them.** From an elevated process, read-back was
+      400/400: the bytes are still ours immediately after writing.
+- [x] **The layout is as transcribed.** Input is `SeqNo`/`DataSize`/`Data[256]`/
+      `GipData[14]`/extended = 362 bytes. The output ring is 64 slots of 264, and
+      **`SeqNo` is 1-based while `Head` is a count** — report *N* sits at position
+      *(N−1) mod 64*, which one run showed directly as "position 0 holds SeqNo 1".
+- [!] **Nothing reached `joy.cpl`.** And the reason is not the mechanism.
 
-- **Both work** → USB/IP owns the adapter natively (Phase 8 sheds ~6,950 lines,
-  the ceiling lifts); HIDMaestro covers phone and Bluetooth pads, where a lower
-  fidelity bar is fine.
-- **HIDMaestro only** → it becomes the pad path; Phase 8's radio work stands.
-- **USB/IP only** → adapter native, virtual pad falls back to ViGEmBus.
-- **Neither** → ViGEmBus, the fallback all along.
+**Why it cannot be driven from Rust.** From the SDK reference:
+
+> *"SubmitState translates the abstract HMGamepadState into the active profile's
+> HID report layout and writes it to shared memory."*
+
+So the bytes in that section are a **fully-formed, profile-specific HID report**,
+not an abstract gamepad struct. Producing them is `HidReportBuilder.cs` — 53KB —
+across **231 profiles**. `SubmitRawReport` exists for raw bytes, but it does not
+remove the need to know the exact layout for the profile in play.
+
+And the interface itself is not promised to anyone: **the SDK reference documents
+no IPC, named pipe, C ABI or other non-.NET consumer surface**, and the shared
+memory appears only as internal SDK mechanics rather than a public contract. It
+has already moved once — the driver header notes the design "is now obsolete (the
+driver and SDK communicate via shared memory, not IOCTLs)" — in five months.
+
+**So using HIDMaestro means using its C# SDK**, which puts .NET, a second
+process, and our own IPC on the *input path* rather than just at startup. That is
+a materially heavier architecture than "Rust writes 278 bytes", and the lighter
+version is only available by binding to an undocumented internal interface whose
+report layout we would also have to reimplement.
+
+> Two of my own errors are worth recording, because both were caught by the
+> output contradicting the verdict rather than by review. A `SeqNo` delta of 336
+> against 800 expected was printed directly beneath "the answer is yes" — the
+> seqlock writer computed both values independently from the value it read, so an
+> odd reading made it move the counter *backwards*. And the driver's doorbell,
+> `HIDMaestroInputEvent<N>`, was never signalled at all, leaving the driver on its
+> 50ms safety timeout while a 60Hz co-writer overwrote the section in between.
+> Neither changes the conclusion; both would have made a positive result
+> unreliable.
+
+**Verdict: ViGEmBus.** ~6 ioctls against an ABI frozen by archival, all Rust, no
+sidecar, no .NET, and its DS4 target remains the route to motion if the X360
+ceiling ever costs something. Investigation A is unaffected and still open.
+
+### Where that leaves it
+
+- **Investigation B is closed**: HIDMaestro is reachable but not supportable from
+  Rust. Pads go through **ViGEmBus**.
+- **Investigation A is still open**: USB/IP could still let Windows' own driver
+  own the Xbox adapter, which is a Phase 8 question rather than a Phase 2 one.
+  The gate is `probe-windows --hidreport` direct versus forwarded, with the Linux
+  box as the server and no Android code written yet.
+- The X360 ceiling therefore stands for now — motion, trigger rumble and
+  battery-to-host — with two routes past it still unspent: ViGEm's DS4 target,
+  and USB/IP.
 
 ---
 

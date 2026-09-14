@@ -112,12 +112,15 @@ that out now is much cheaper than finding it out in Phase 5.
 - UDP socket, single port.
 - Authenticated input/control packets: keyed MAC + sequence number, replay rejection.
 - Minimal reliable channel (seq + ack + retransmit, ~150 lines) for control messages.
-- Gamepad: **driver choice is being spiked, not assumed.** The `vigem-client`
-  line here predates ViGEmBus's retirement (archived 2 November 2023, trademark
-  conflict). Two candidates are under measurement — HIDMaestro, and USB/IP for
-  the adapter case — with ViGEmBus as the fallback. See `HARDWARE_TESTING.md` §8;
-  `libvirtualhid` is ruled out on licence and `inputtino`/WinUHid do not apply.
-  Rumble callback → forward to client, whichever driver wins.
+- Gamepad: **ViGEmBus, chosen on evidence rather than inherited.** It was
+  archived on 2 November 2023 (trademark conflict), so five alternatives were
+  surveyed and HIDMaestro was probed on real hardware. HIDMaestro's shared memory
+  is reachable and writable from Rust, but its bytes are a fully-formed
+  profile-specific HID report built by 53KB of C# across 231 profiles, and it
+  documents no non-.NET consumer surface — so using it means .NET on the input
+  path. ViGEmBus is ~6 ioctls against an ABI frozen by archival. `libvirtualhid`
+  fails on licence; `inputtino` and WinUHid do not apply. See
+  `HARDWARE_TESTING.md` §8. Rumble callback → forward to client.
 - Keyboard via scancode `SendInput` (see CLAUDE.md traps).
 - Mouse: absolute mode (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`,
   normalised 0–65535) and relative mode. Wheel + horizontal wheel + XBUTTON1/2.
@@ -140,8 +143,8 @@ machine; ViGEm and `SendInput` are testable on none of it.
    reliable layer, the UDP endpoint, and the fake client.
 2. **Input injection** — scancode `SendInput`, mouse modes, desktop re-attach
    *(done)*. Attaches at the `on_input` seam in `sunburst_net::ControlHandler`.
-3. **Gamepad and rumble** — still open, and now gated on the driver spike in
-   `HARDWARE_TESTING.md` §8. `inject.rs` drops `InputEvent::Gamepad` today, and
+3. **Gamepad and rumble** — the driver question is settled (ViGEmBus, see
+   `HARDWARE_TESTING.md` §8); the code is not written. `inject.rs` drops `InputEvent::Gamepad` today, and
    `rumble.rs` defines `Rumble`/`RumbleTracker` that nothing references. Rumble
    also needs an outbound seam on `Endpoint` that does not exist — and should be
    designed for Phase 3's four reserved server→client messages too, not for
