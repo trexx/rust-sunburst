@@ -783,11 +783,22 @@ shim, and this cross-build contains no C++ at all. The installer ships
       squarely the second case, so **measuring the default would price the wrong
       mode** and the number would look like a property of the transport. This is
       what v0.9.8.0's WSK work was for.
-- [ ] **`probe-windows --hidreport <n>` direct, then forwarded.** Select by
-      number: one device commonly exposes several HID collections, and a keyboard
-      accounted for five entries under a single VID:PID on the first run.
-      **p50 is the device's poll interval; the tail is what the link adds.** If
-      p50 itself moves, the transport is rate-limiting rather than jittering.
+- [ ] **`probe-windows --xinput` direct, then forwarded.** Not `--hidreport`:
+      **an Xbox pad does not deliver input over raw HID on Windows.** The XUSB
+      driver claims the device and games read it through XInput, so a `ReadFile`
+      on its HID collection waits for reports that were never coming — a real
+      controller returned nothing in ten seconds, which is the device behaving
+      correctly and the instrument being wrong. PadForge's stack also includes
+      HidHide, whose purpose is hiding physical devices from other processes.
+
+      `XINPUT_STATE.dwPacketNumber` increments only on a state change, so polling
+      at 1kHz and watching it gives arrival times without needing the device to
+      be readable — and XInput is how a game sees the pad, so it is the layer
+      whose timing counts. **p50 is the pad's own cadence and should not move;
+      the tail is what the link adds.** A p50 that shifts means the transport is
+      rate-limiting rather than jittering.
+
+      `--hidreport` stays for non-gamepad devices, where raw HID does work.
 - [ ] **Only then** scope the Android userspace server.
 
 ### Investigation B — HIDMaestro from Rust: **answered, and it is no**

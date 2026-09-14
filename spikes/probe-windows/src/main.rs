@@ -22,6 +22,7 @@
 //! probe-windows --hidmaestro     # can Rust drive HIDMaestro's shared memory?
 //! probe-windows --hidreport      # list HID devices
 //! probe-windows --hidreport 3    # time device 3's report intervals
+//! probe-windows --xinput         # time gamepad state changes (Xbox pads)
 //! ```
 //!
 //! `--latency` is the one that prices CLAUDE.md's DWM composition line. It opens
@@ -61,6 +62,8 @@ mod tocuda;
 #[cfg(windows)]
 mod tosys;
 #[cfg(windows)]
+mod xinput;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
@@ -79,6 +82,10 @@ fn main() -> std::process::ExitCode {
     }
     if std::env::args().any(|a| a == "--hidreport") {
         hidreport::run();
+        return std::process::ExitCode::SUCCESS;
+    }
+    if std::env::args().any(|a| a == "--xinput") {
+        xinput::run();
         return std::process::ExitCode::SUCCESS;
     }
     probe::run(attempt_enable)
