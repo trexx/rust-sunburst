@@ -306,14 +306,17 @@ about 450.
 sticks, triggers, rumble. Motion, trigger rumble and battery-to-host are out —
 XInput has nowhere to put them.
 
-**That boundary may not have to exist.** Two routes past it are being measured in
-`HARDWARE_TESTING.md` §8. **USB/IP** would forward the adapter to Windows and let
-its own driver own it, deleting the radio and GIP work below entirely and lifting
-the ceiling — `usbip-win2` is attestation signed and actively tuned for HID
-latency, and the open question is whether an unrooted Android app can serve
-USB/IP from a `UsbDeviceConnection` fd. **HIDMaestro** reaches WGI/GameInput with
-byte-exact device identity, which lifts the ceiling without touching the radio
-work. Do not start the 6,950 lines below until §8 has reported. Battery can still be shown client-side. Pad
+**Two routes past that boundary were measured and both closed**
+(`HARDWARE_TESTING.md` §8). **USB/IP** would have forwarded the adapter to
+Windows and let its own driver own it, deleting the radio and GIP work below —
+but `usbip-win2` 0.9.8.0 cannot carry the Xbox GIP protocol: a wired Xbox One
+pad fails the same way in both receive modes, with the Windows driver resetting
+the interrupt pipe until it gives up and resets the device. The adapter is a
+strictly harder case. Revisit only if upstream fixes GIP; it is not a plan.
+**HIDMaestro** reaches WGI/GameInput with byte-exact identity, but its shared
+memory carries profile-specific HID reports built by 53KB of C# and it documents
+no non-.NET surface, so it is not drivable from Rust. The 6,950 lines below stand,
+and so does the ceiling. The remaining route to motion is ViGEm's DS4 target. Battery can still be shown client-side. Pad
 headphone audio depends on Phase 6 and is a separate decision.
 
 **Acceptance:** four pads pair and play simultaneously through Big Picture.

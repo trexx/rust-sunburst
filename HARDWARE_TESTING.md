@@ -766,60 +766,51 @@ shim, and this cross-build contains no C++ at all. The installer ships
 `usbip.exe`, so attaching is a command. The SDK only earns that cost if the
 *server* ever automates attach, which is Phase 8 work rather than a measurement.
 
-- [ ] **Attach gate.** Export from Linux, `usbip attach` from Windows, device
-      enumerates as itself. Ideally the **Xbox Wireless Adapter** (`045e:02e6`),
-      since that is the actual Phase 8 scenario.
-- [ ] **Attach with `low_latency`, not the default.** `usbip/vhci.h` documents two
-      reception modes and **defaults to the wrong one for us**:
+- [!] **Attach gate: fails for the Xbox controller, in both receive modes.**
+      Exported a wired Xbox One Controller (`045e:02dd`, firmware 2015, busid
+      `1-1`) from the Linux box on kernel 7.2.5 with `usbip_host`, attached from
+      Windows with `usbip-win2` 0.9.8.0. Same result with `low_latency` and with
+      the default `zero_copy`. The kernel log on the Linux side, both times:
 
-      > `zero_copy` — dedicated thread, blocking, written straight to
-      > `URB.TransferBuffer`. *"Should be used for storage devices, webcams etc."*
-      >
-      > `low_latency` — WSK event callbacks, no receive thread. *"Should be used
-      > for devices that generate small amounts of data but at a high frequency,
-      > such as HID keyboard/mouse, etc."*
+      ```
+      usbip-host 1-1: stub up                                 <- Windows attached
+      usbip-host 1-1: usb_clear_halt done: devnum N endp 1    <- x11 over ~8s
+      usbip-host 1-1: USB disconnect, device number N         <- device RESET
+      usb 1-1: new full-speed USB device number N+1
+      input: Microsoft X-Box One pad (Firmware 2015)          <- xpad reclaims it
+      ```
 
-      `persistent_device.recv_mode` initialises to `zero_copy`. A gamepad is
-      squarely the second case, so **measuring the default would price the wrong
-      mode** and the number would look like a property of the transport. This is
-      what v0.9.8.0's WSK work was for.
-- [ ] **`probe-windows --xinput` direct, then forwarded.** Not `--hidreport`:
-      **an Xbox pad does not deliver input over raw HID on Windows.** The XUSB
-      driver claims the device and games read it through XInput, so a `ReadFile`
-      on its HID collection waits for reports that were never coming — a real
-      controller returned nothing in ten seconds, which is the device behaving
-      correctly and the instrument being wrong. PadForge's stack also includes
-      HidHide, whose purpose is hiding physical devices from other processes.
+      Windows' Xbox driver clears the halt on **endpoint 1 — the interrupt pipe
+      that carries GIP** — about once a second, which is a host repeatedly
+      resetting a pipe whose transfers keep failing. After ~8s it escalates to a
+      device reset, USB/IP relays that to the physical pad, the pad re-enumerates
+      on Linux, `xpad` binds it, the export is gone, and Windows sees an unplug.
 
-      `XINPUT_STATE.dwPacketNumber` increments only on a state change, so polling
-      at 1kHz and watching it gives arrival times without needing the device to
-      be readable — and XInput is how a game sees the pad, so it is the layer
-      whose timing counts. **p50 is the pad's own cadence and should not move;
-      the tail is what the link adds.** A p50 that shifts means the transport is
-      rate-limiting rather than jittering.
+      **What this is not.** Not the receive mode: identical under both. Not the
+      Wi-Fi: a flaky link shows as TCP resets or stub `recv` errors, not as an
+      orderly halt-clear storm on one endpoint. This is protocol-level. The
+      likeliest mechanism is the GIP handshake — the host must send a power-on
+      packet over interrupt-OUT before the pad streams on interrupt-IN, and an
+      OUT that does not land looks exactly like this: IN never produces, the
+      driver resets the pipe, retries, gives up.
 
-      `--hidreport` stays for non-gamepad devices, where raw HID does work.
+      **Scope.** One device, one usbip-win2 release. But the device is the *easy*
+      case for the Phase 8 question: the Xbox Wireless Adapter also speaks GIP
+      and additionally needs firmware upload and MT7612U radio bring-up through
+      the same transport — strictly more URB traffic, not less. A transport that
+      cannot carry a wired GIP pad is not going to carry the adapter.
 
-      **Direct baseline (env S, wired Xbox One controller, slot 0):**
-
-      | metric | value |
-      |---|---|
-      | p50 | **8.00ms** (125Hz — the expected Xbox report rate) |
-      | p99 | **12.00ms** |
-      | max | 52.00ms |
-      | continuity | **100%** of gaps within 2× p50 |
-      | poll rate | 905kHz, ~1.1µs resolution |
-      | samples | 1176 changes over 10s |
-
-      **This is the number the forwarded run gets compared against.** The
-      intervals land on exact millisecond boundaries because the USB frame
-      quantises them, which is another sign the measurement is sound.
-
-      A first attempt gave p50 8.22ms with p99 76ms and max 120ms — those tails
-      were **pauses in handling the pad**, not the link, since `dwPacketNumber`
-      moves only on a state change. Hold a stick **off-centre** for the whole run
-      and check the continuity figure: below 90%, only p50 is usable.
-- [ ] **Only then** scope the Android userspace server.
+      Not necessarily permanent. `usbip-win2` is actively developed and 0.9.7.8's
+      notes record a device-specific URB fix ("Handle
+      `_URB_CONTROL_VENDOR_OR_CLASS_REQUEST` to fix some devices"), so this is
+      the kind of thing that gets fixed — worth filing upstream with this log.
+      But it is not a foundation to build Phase 8 on today.
+- [ ] **Control, optional:** forward the webcam (`04f2:b45d`, busid `1-8`)
+      instead. If it attaches and stays, the transport is fine and the failure is
+      GIP-specific, which sharpens the upstream report. Not needed for the
+      decision.
+- [~] **The Android userspace server is moot** until the Windows side carries
+      GIP at all. Nothing to scope.
 
 ### Investigation B — HIDMaestro from Rust: **answered, and it is no**
 
@@ -879,17 +870,25 @@ report layout we would also have to reimplement.
 sidecar, no .NET, and its DS4 target remains the route to motion if the X360
 ceiling ever costs something. Investigation A is unaffected and still open.
 
-### Where that leaves it
+### Where that leaves it — the spike is closed
 
 - **Investigation B is closed**: HIDMaestro is reachable but not supportable from
-  Rust. Pads go through **ViGEmBus**.
-- **Investigation A is still open**: USB/IP could still let Windows' own driver
-  own the Xbox adapter, which is a Phase 8 question rather than a Phase 2 one.
-  The gate is `probe-windows --hidreport` direct versus forwarded, with the Linux
-  box as the server and no Android code written yet.
-- The X360 ceiling therefore stands for now — motion, trigger rumble and
-  battery-to-host — with two routes past it still unspent: ViGEm's DS4 target,
-  and USB/IP.
+  Rust. Its shared memory carries fully-formed profile-specific HID reports built
+  by 53KB of C#, and it documents no non-.NET consumer surface.
+- **Investigation A is closed**: USB/IP cannot carry the Xbox GIP protocol through
+  `usbip-win2` 0.9.8.0 in either receive mode. The adapter is a strictly harder
+  case than the wired pad that failed.
+- **Pads go through ViGEmBus**, which was the fallback all along: ~6 ioctls
+  against an ABI frozen by archival, all Rust, no sidecar.
+- **Phase 8 stands as written** — vendored MT7612U radio, GIP in Rust, ViGEm X360
+  on the server — and its X360 ceiling with it. The one route past the ceiling
+  still unspent is ViGEm's DS4 target. USB/IP is recorded against Phase 8 as
+  "revisit if upstream fixes GIP", not as a plan.
+
+The direct pad baseline — p50 8.00ms, p99 12.00ms, 100% continuity — stays on
+record. It is what the Phase 8 acceptance criterion ("input latency measured
+against a directly-connected pad") will be compared to when the adapter path
+exists.
 
 ---
 
