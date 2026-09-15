@@ -593,6 +593,8 @@ dependencies = [
 name = "sunburst-input"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "sunburst-core",
  "sunburst-net",
  "windows",

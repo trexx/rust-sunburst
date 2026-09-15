@@ -12,6 +12,11 @@ workspace = true
 [dependencies]
 sunburst-core.workspace = true
 sunburst-net.workspace = true
+# Gamepad profiles are HIDMaestro's JSON, parsed once at controller creation —
+# config-plane work off the video path, the same place CLAUDE.md permits serde
+# (sunburst-web), never sunburst-core.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
