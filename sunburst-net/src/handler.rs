@@ -15,7 +15,28 @@
 //! [`on_input`]: ControlHandler::on_input
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
-use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, SessionKey};
+use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, Rumble, ServerControl, SessionKey};
+
+/// A server → client message queued by a producer for the endpoint to send.
+///
+/// The seam every server-originated message crosses. Only the socket-owning
+/// endpoint may transmit, and producers run on other threads — the injector's
+/// rumble callback now, and in Phase 3 the `SessionConfig`, `CursorShape`,
+/// `CursorPosition` and `SecureDesktop` messages. So a producer enqueues an
+/// `Outbound` and the endpoint drains it each [`ControlHandler::drain_outbound`]
+/// without the producer ever touching the socket.
+///
+/// Shaped for both reliabilities deliberately, because its users split on that:
+/// control is retransmitted, rumble is not.
+#[derive(Clone, Debug)]
+pub enum Outbound {
+    /// Reliable control, framed and retransmitted like any [`ServerControl`].
+    Control { client: u32, message: ServerControl },
+    /// Unreliable, latest-wins rumble (packet type 6). A superseded level is
+    /// worthless, so it is never retransmitted — the point of not using the
+    /// reliable channel.
+    Rumble { client: u32, rumble: Rumble },
+}
 
 /// Where authenticated input goes once it has been verified.
 ///
@@ -63,6 +84,13 @@ pub trait ControlHandler: Send {
     fn on_input(&mut self, client: u32, event: InputEvent);
 
     fn on_bye(&mut self, client: u32);
+
+    /// Server → client messages produced since the last call, for the endpoint
+    /// to send. Called each tick; the default is none, so a handler that never
+    /// originates anything (most tests, the pairing path) ignores it.
+    fn drain_outbound(&mut self) -> Vec<Outbound> {
+        Vec::new()
+    }
 }
 
 /// A handler that records what it was told, for tests.
@@ -84,6 +112,8 @@ pub struct Recording {
     pub launches: Vec<u32>,
     pub app_list_calls: usize,
     pub byes: Vec<u32>,
+    /// Messages a test wants the endpoint to send back out. Drained each tick.
+    pub outbound: Vec<Outbound>,
     next_request_id: u32,
 }
 
@@ -160,6 +190,10 @@ impl<H: ControlHandler> ControlHandler for std::sync::Arc<std::sync::Mutex<H>> {
     fn on_bye(&mut self, client: u32) {
         self.lock().expect("not poisoned").on_bye(client);
     }
+
+    fn drain_outbound(&mut self) -> Vec<Outbound> {
+        self.lock().expect("not poisoned").drain_outbound()
+    }
 }
 
 impl ControlHandler for Recording {
@@ -209,5 +243,9 @@ impl ControlHandler for Recording {
 
     fn on_bye(&mut self, client: u32) {
         self.byes.push(client);
+    }
+
+    fn drain_outbound(&mut self) -> Vec<Outbound> {
+        std::mem::take(&mut self.outbound)
     }
 }

@@ -390,3 +390,115 @@ fn a_client_that_reconnects_from_a_new_port_keeps_working() {
         .expect("send");
     server.wait_for("the event after reconnecting", |r| r.inputs.len() == 2);
 }
+
+#[test]
+fn queued_rumble_reaches_the_client_signed_and_unreliable() {
+    // The outbound seam's unreliable user. A producer (the injector, on Windows)
+    // queues a Rumble; the endpoint sends it as a signed type=6 packet, outside
+    // the reliable channel.
+    use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
+    use sunburst_core::proto::{Header, PacketType, Rumble, HEADER_LEN};
+    use sunburst_net::Outbound;
+
+    let server = Server::start(Recording::new().with_key(4, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+
+    // A session only exists once the client has authenticated once, since that
+    // is what teaches the endpoint the return address.
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the session to exist", |r| r.inputs.len() == 1);
+
+    let rumble = Rumble {
+        pad_index: 0,
+        motor_low: 0xBEEF,
+        motor_high: 0x1234,
+        seq: 7,
+    };
+    server
+        .recording
+        .lock()
+        .expect("not poisoned")
+        .outbound
+        .push(Outbound::Rumble { client: 4, rumble });
+
+    // Grab the raw datagram: recv_control would drop it, because it is not a
+    // ServerControl.
+    client
+        .socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let mut buf = [0u8; 256];
+    let len = client.socket.recv(&mut buf).expect("a rumble packet");
+    let datagram = &buf[..len];
+
+    let header = Header::decode(datagram).expect("a header");
+    assert_eq!(
+        header.packet_type,
+        PacketType::Rumble,
+        "rumble must be type 6, not the reliable control type"
+    );
+
+    let key = key(1);
+    let verified = key
+        .verify_packet(datagram)
+        .expect("rumble is authenticated and must verify");
+    let body = &verified[HEADER_LEN..];
+    assert_eq!(body.len(), RUMBLE_BODY_LEN);
+    let decoded = Rumble::decode(body).expect("a rumble body");
+    assert_eq!(decoded, rumble, "the level did not survive the round trip");
+}
+
+#[test]
+fn a_forged_rumble_does_not_verify() {
+    // The client must reject a rumble signed with the wrong key, the same as any
+    // other authenticated packet.
+    use sunburst_core::proto::{Header, PacketType, Rumble};
+    use sunburst_net::Outbound;
+
+    let server = Server::start(Recording::new().with_key(4, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the session", |r| r.inputs.len() == 1);
+
+    server
+        .recording
+        .lock()
+        .expect("not poisoned")
+        .outbound
+        .push(Outbound::Rumble {
+            client: 4,
+            rumble: Rumble {
+                pad_index: 0,
+                motor_low: 1,
+                motor_high: 1,
+                seq: 1,
+            },
+        });
+
+    client
+        .socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let mut buf = [0u8; 256];
+    let len = client.socket.recv(&mut buf).expect("a packet");
+    let datagram = &buf[..len];
+    assert_eq!(
+        Header::decode(datagram).expect("header").packet_type,
+        PacketType::Rumble
+    );
+    // A different key must not verify the server's signature.
+    assert!(
+        key(2).verify_packet(datagram).is_none(),
+        "a rumble packet verified under the wrong key"
+    );
+}

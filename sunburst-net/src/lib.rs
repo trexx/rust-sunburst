@@ -18,5 +18,5 @@ pub mod handler;
 pub mod reliable;
 
 pub use endpoint::{ClientEndpoint, Endpoint, MAX_CONTROL_PAYLOAD};
-pub use handler::{ControlHandler, InputSink, NoInput, Recording};
+pub use handler::{ControlHandler, InputSink, NoInput, Outbound, Recording};
 pub use reliable::{Reliable, ReliableError};

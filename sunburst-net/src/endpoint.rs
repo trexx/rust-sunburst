@@ -53,12 +53,13 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sunburst_core::proto::pairing::NONCE_LEN;
+use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
 use sunburst_core::proto::{
     ClientControl, ClientMessage, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN, MAX_PAYLOAD,
-    PacketType, ReplayWindow, Seq16, ServerControl, SessionKey,
+    PacketType, ReplayWindow, Rumble, Seq16, ServerControl, SessionKey,
 };
 
-use crate::handler::ControlHandler;
+use crate::handler::{ControlHandler, Outbound};
 use crate::reliable::{FRAME_HEADER_LEN, Reliable, ReliableError};
 
 /// Room for a control message once the common header, the reliable frame header
@@ -372,7 +373,7 @@ impl<H: ControlHandler> Endpoint<H> {
         let Ok(frame) = session.reliable.send(&encoded, now_ms) else {
             return;
         };
-        self.transmit(addr, &frame, Some(&key));
+        self.transmit(addr, &frame, Some(&key), PacketType::Control);
     }
 
     fn send_pending(&mut self, to: SocketAddr, message: &ServerControl) {
@@ -387,12 +388,12 @@ impl<H: ControlHandler> Endpoint<H> {
         let Ok(frame) = peer.reliable.send(&encoded, now_ms) else {
             return;
         };
-        self.transmit(to, &frame, None);
+        self.transmit(to, &frame, None, PacketType::Control);
     }
 
-    fn transmit(&self, to: SocketAddr, body: &[u8], key: Option<&SessionKey>) {
+    fn transmit(&self, to: SocketAddr, body: &[u8], key: Option<&SessionKey>, kind: PacketType) {
         let header = Header {
-            packet_type: PacketType::Control,
+            packet_type: kind,
             flags: Flags::EMPTY,
             frame_id: Seq16(0),
             qpc_timestamp: 0,
@@ -409,8 +410,39 @@ impl<H: ControlHandler> Endpoint<H> {
         let _ = self.socket.send_to(&datagram, to);
     }
 
+    /// Send one rumble packet, unreliably.
+    ///
+    /// Not through the reliable channel: a superseded level is worthless, so
+    /// latest-wins beats guaranteed delivery. `type=6` is authenticated, so it
+    /// is signed with the session key like any other. A client that has never
+    /// authenticated has no session and nothing is sent.
+    fn send_rumble(&self, client: u32, rumble: &Rumble) {
+        let Some(session) = self.sessions.get(&client) else {
+            return;
+        };
+        let mut body = [0u8; RUMBLE_BODY_LEN];
+        if rumble.encode(&mut body).is_none() {
+            return;
+        }
+        self.transmit(session.addr, &body, Some(&session.key), PacketType::Rumble);
+    }
+
+    /// Send whatever a producer queued since the last tick.
+    ///
+    /// The one place server-originated messages reach the socket; producers run
+    /// on other threads and never touch it themselves.
+    fn dispatch_outbound(&mut self) {
+        for message in self.handler.drain_outbound() {
+            match message {
+                Outbound::Control { client, message } => self.send_to_client(client, &message),
+                Outbound::Rumble { client, rumble } => self.send_rumble(client, &rumble),
+            }
+        }
+    }
+
     /// Retransmits, owed acks, and dropping peers that have gone quiet.
     fn tick(&mut self) {
+        self.dispatch_outbound();
         let now_ms = self.now_ms();
         let idle_ms = IDLE_SECS * 1000;
         let mut send: Vec<(SocketAddr, Vec<u8>, Option<SessionKey>)> = Vec::new();
@@ -450,7 +482,7 @@ impl<H: ControlHandler> Endpoint<H> {
         }
 
         for (addr, frame, key) in send {
-            self.transmit(addr, &frame, key.as_ref());
+            self.transmit(addr, &frame, key.as_ref(), PacketType::Control);
         }
         for client in drop_clients {
             self.forget(client);
