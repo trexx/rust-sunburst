@@ -6,9 +6,136 @@
 //! a `semantic`, a `"lo-hi"` range) are resolved to numeric ops once here, at
 //! controller creation, so the per-frame codec switches on an enum rather than
 //! re-parsing strings. Byte-for-byte parity with HIDMaestro is the contract; it
-//! is locked by the golden-hash test once every op is ported.
+//! is locked by the golden-hash test in [`super::golden`], which reproduces all
+//! 63 of HIDMaestro's committed report hashes.
 
-use super::spec::{FieldSpec, ReportSpec, parse_range};
+use super::spec::{CrcScope, FieldSpec, ReportSpec, parse_range};
+
+/// D-pad octant. Values 1..8 (N..NW) map to a descriptor's 0..7; `None` maps to
+/// the field's neutral. Mirrors HIDMaestro's `HMHat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Hat {
+    #[default]
+    None = 0,
+    North = 1,
+    NorthEast = 2,
+    East = 3,
+    SouthEast = 4,
+    South = 5,
+    SouthWest = 6,
+    West = 7,
+    NorthWest = 8,
+}
+
+/// The `HMButton` bit for a name, or a sentinel above the 32-bit mask for the
+/// values that are not a plain button bit. `None`/`_`/unresolved → `0` (skip).
+pub mod button {
+    // Plain HMButton bits.
+    pub const A: u64 = 1 << 0;
+    pub const B: u64 = 1 << 1;
+    pub const X: u64 = 1 << 2;
+    pub const Y: u64 = 1 << 3;
+    pub const LEFT_BUMPER: u64 = 1 << 4;
+    pub const RIGHT_BUMPER: u64 = 1 << 5;
+    pub const BACK: u64 = 1 << 6;
+    pub const START: u64 = 1 << 7;
+    pub const LEFT_STICK: u64 = 1 << 8;
+    pub const RIGHT_STICK: u64 = 1 << 9;
+    pub const GUIDE: u64 = 1 << 10;
+    pub const TOUCHPAD: u64 = 1 << 11;
+    pub const SHARE: u64 = 1 << 12;
+    pub const RIGHT_PADDLE: u64 = 1 << 13;
+    pub const LEFT_PADDLE: u64 = 1 << 14;
+    pub const MISC1: u64 = 1 << 15;
+    pub const RIGHT_PADDLE2: u64 = 1 << 16;
+    pub const LEFT_PADDLE2: u64 = 1 << 17;
+
+    // Sentinels above the mask space: values sourced from something other than
+    // the button word.
+    pub const LT_DIGITAL: u64 = 1 << 32;
+    pub const RT_DIGITAL: u64 = 1 << 33;
+    pub const DPAD_UP: u64 = 1 << 34;
+    pub const DPAD_DOWN: u64 = 1 << 35;
+    pub const DPAD_LEFT: u64 = 1 << 36;
+    pub const DPAD_RIGHT: u64 = 1 << 37;
+    pub const PAD0_TOUCH: u64 = 1 << 38;
+    pub const PAD1_TOUCH: u64 = 1 << 39;
+
+    /// A button name that resolves to no control and is not a recognised special
+    /// name — a malformed profile. HIDMaestro throws on this rather than silently
+    /// dropping a control (issue #58); the port names it at compile time.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct UnknownButton;
+
+    /// Resolve a button name to its bit, case-insensitively, including the Sony
+    /// aliases and the special sentinels. `None` for `_`/empty; `Err` for a name
+    /// that resolves to nothing (HIDMaestro throws rather than silently drop a
+    /// control — issue #58).
+    pub fn resolve(name: &str) -> Result<Option<u64>, UnknownButton> {
+        if name.is_empty() || name == "_" {
+            return Ok(None);
+        }
+        let special = match name {
+            "LT_DIGITAL" => Some(LT_DIGITAL),
+            "RT_DIGITAL" => Some(RT_DIGITAL),
+            "DPAD_UP" => Some(DPAD_UP),
+            "DPAD_DOWN" => Some(DPAD_DOWN),
+            "DPAD_LEFT" => Some(DPAD_LEFT),
+            "DPAD_RIGHT" => Some(DPAD_RIGHT),
+            "LEFTPAD_TOUCH" => Some(PAD0_TOUCH),
+            "RIGHTPAD_TOUCH" => Some(PAD1_TOUCH),
+            _ => None,
+        };
+        if let Some(bit) = special {
+            return Ok(Some(bit));
+        }
+        let bit = match name.to_ascii_lowercase().as_str() {
+            "a" | "cross" => A,
+            "b" | "circle" => B,
+            "x" | "square" => X,
+            "y" | "triangle" => Y,
+            "leftbumper" => LEFT_BUMPER,
+            "rightbumper" => RIGHT_BUMPER,
+            "back" => BACK,
+            "start" => START,
+            "leftstick" => LEFT_STICK,
+            "rightstick" => RIGHT_STICK,
+            "guide" => GUIDE,
+            "touchpad" => TOUCHPAD,
+            "share" => SHARE,
+            "rightpaddle" => RIGHT_PADDLE,
+            "leftpaddle" => LEFT_PADDLE,
+            "misc1" => MISC1,
+            "rightpaddle2" => RIGHT_PADDLE2,
+            "leftpaddle2" => LEFT_PADDLE2,
+            _ => return Err(UnknownButton),
+        };
+        Ok(Some(bit))
+    }
+}
+
+/// A `bitfield` position's source flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagKind {
+    None,
+    Charging,
+    Full,
+    Mic,
+    Headphones,
+}
+
+impl FlagKind {
+    fn from_name(name: &str) -> FlagKind {
+        match name {
+            "batteryCharging" => FlagKind::Charging,
+            "batteryFull" => FlagKind::Full,
+            "micMuted" => FlagKind::Mic,
+            "headphonesConnected" => FlagKind::Headphones,
+            _ => FlagKind::None,
+        }
+    }
+}
 
 /// Wire-format family of a field. Numeric mirror of the JSON `type` strings.
 ///
@@ -137,6 +264,9 @@ impl SrcOp {
 pub struct CompiledField {
     pub op: FieldOp,
     pub source: SrcOp,
+    /// The raw `semantic` string, kept for the output/decode directions which key
+    /// a value dictionary by it (the input direction resolves it to [`source`]).
+    pub semantic: Option<String>,
     /// Byte offset, or -1 when the field has no single byte.
     pub byte: i32,
     pub range_lo: i32,
@@ -150,8 +280,14 @@ pub struct CompiledField {
     pub stride: i32,
     /// Rolling-counter key, precomputed.
     pub roll_key: String,
-    /// The original button/flag names, resolved when those ops are ported.
-    pub buttons: Option<Vec<String>>,
+    /// Resolved button bits (per position, `0` = skip), for `button-mask`.
+    pub button_bits: Option<Vec<u64>>,
+    /// Resolved flag sources (per position), for `bitfield`.
+    pub flag_kinds: Option<Vec<FlagKind>>,
+    /// CRC destination start, or -1 to resolve from the buffer end at use.
+    pub crc_dst: i32,
+    /// CRC coverage, for `crc32-le`.
+    pub scope: Option<CrcScope>,
 }
 
 /// A compiled report program.
@@ -216,16 +352,42 @@ fn compile_field(index: usize, f: &FieldSpec) -> Result<CompiledField, CompileEr
         Some((lo, hi)) => (true, lo, hi),
         None => (false, 0, 7),
     };
-    let _ = has_bytes;
 
     let roll_key = f
         .semantic
         .clone()
         .unwrap_or_else(|| format!("_b{}", if byte >= 0 { byte } else { 0 }));
 
+    // CRC dest resolves from a bytes-range start, else the byte, else -1 (the
+    // buffer end at use time — a short host write shortens the buffer).
+    let crc_dst = if has_bytes { range_lo } else { byte };
+
+    let mut button_bits = None;
+    let mut flag_kinds = None;
+    if let Some(names) = &f.buttons {
+        if op == FieldOp::ButtonMask {
+            let mut bits = Vec::with_capacity(names.len());
+            for (j, name) in names.iter().enumerate() {
+                match button::resolve(name) {
+                    Ok(bit) => bits.push(bit.unwrap_or(0)),
+                    Err(button::UnknownButton) => {
+                        return Err(CompileError(format!(
+                            "button name '{name}' at index {j} of the button mask at byte {byte} \
+resolves to no button and is not a recognised special name"
+                        )));
+                    }
+                }
+            }
+            button_bits = Some(bits);
+        } else if op == FieldOp::Bitfield {
+            flag_kinds = Some(names.iter().map(|n| FlagKind::from_name(n)).collect());
+        }
+    }
+
     Ok(CompiledField {
         op,
         source,
+        semantic: f.semantic.clone(),
         byte,
         range_lo,
         range_hi,
@@ -237,7 +399,10 @@ fn compile_field(index: usize, f: &FieldSpec) -> Result<CompiledField, CompileEr
         initial: f.initial.unwrap_or(0) as u8,
         stride: f.stride.map(|s| s as i32).unwrap_or(1),
         roll_key,
-        buttons: f.buttons.clone(),
+        button_bits,
+        flag_kinds,
+        crc_dst,
+        scope: f.scope.clone(),
     })
 }
 
@@ -257,6 +422,7 @@ mod tests {
             initial: None,
             stride: None,
             buttons: None,
+            scope: None,
         }
     }
 
@@ -286,7 +452,8 @@ mod tests {
     fn touchpad_finger_defaults_to_finger0() {
         let c = compile_field(0, &field("touchpad-finger", Some("somethingElse"), 5)).expect("c");
         assert_eq!(c.source, SrcOp::Finger0);
-        let c1 = compile_field(0, &field("touchpad-finger", Some("touchpadFinger1"), 5)).expect("c");
+        let c1 =
+            compile_field(0, &field("touchpad-finger", Some("touchpadFinger1"), 5)).expect("c");
         assert_eq!(c1.source, SrcOp::Finger1);
     }
 }

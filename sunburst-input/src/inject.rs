@@ -29,13 +29,36 @@
 //! expected rather than an error, and matches capture, which cannot see it
 //! either.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use sunburst_core::proto::{InputEvent, MouseMotion};
-use sunburst_net::InputSink;
+use sunburst_core::proto::input::MAX_PADS;
+use sunburst_core::proto::{GamepadState, InputEvent, MouseMotion, PadOutput, TriggerEffect};
+use sunburst_net::{InputSink, Outbound};
+
+use crate::pad::codec::DecodedValue;
+use crate::pad::outpolicy::RepeatPolicy;
+use crate::pad::session::PadSession;
+use crate::pad::{gip, registry, shmem};
+
+/// What crosses the channel to the injector thread. The pad sections live on that
+/// one thread, so pad lifecycle rides the same channel as input.
+enum Msg {
+    Input(InputEvent),
+    PadConnected {
+        client: u32,
+        pad_index: u8,
+        pad_type: u8,
+    },
+    PadDisconnected {
+        pad_index: u8,
+    },
+}
+
+/// How often the thread wakes to drain pad output and repeat rumble when idle.
+const OUTPUT_POLL: Duration = Duration::from_millis(8);
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::StationsAndDesktops::{
@@ -74,8 +97,10 @@ pub struct Stats {
 }
 
 pub struct Injector {
-    tx: SyncSender<InputEvent>,
+    tx: SyncSender<Msg>,
     stats: Arc<Stats>,
+    /// Output effects the thread has produced, drained by the endpoint each tick.
+    outbound: Arc<Mutex<Vec<Outbound>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -83,15 +108,18 @@ impl Injector {
     pub fn start() -> std::io::Result<Injector> {
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
         let stats = Arc::new(Stats::default());
+        let outbound = Arc::new(Mutex::new(Vec::new()));
         let thread_stats = Arc::clone(&stats);
+        let thread_outbound = Arc::clone(&outbound);
 
         let thread = std::thread::Builder::new()
             .name("sunburst-input".into())
-            .spawn(move || run(rx, &thread_stats))?;
+            .spawn(move || run(rx, &thread_stats, &thread_outbound))?;
 
         Ok(Injector {
             tx,
             stats,
+            outbound,
             thread: Some(thread),
         })
     }
@@ -99,18 +127,41 @@ impl Injector {
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
     }
-}
 
-impl InputSink for Injector {
-    fn inject(&mut self, _client: u32, event: InputEvent) {
+    fn send(&self, msg: Msg) {
         // Never block: the caller is the endpoint's receive loop, and stalling
         // it would back up every client rather than just this one.
-        match self.tx.try_send(event) {
+        match self.tx.try_send(msg) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+impl InputSink for Injector {
+    fn inject(&mut self, _client: u32, event: InputEvent) {
+        self.send(Msg::Input(event));
+    }
+
+    fn pad_connected(&mut self, client: u32, pad_index: u8, pad_type: u8, _capabilities: u16) {
+        self.send(Msg::PadConnected {
+            client,
+            pad_index,
+            pad_type,
+        });
+    }
+
+    fn pad_disconnected(&mut self, _client: u32, pad_index: u8) {
+        self.send(Msg::PadDisconnected { pad_index });
+    }
+
+    fn drain_outbound(&mut self) -> Vec<Outbound> {
+        match self.outbound.lock() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
         }
     }
 }
@@ -126,27 +177,209 @@ impl Drop for Injector {
     }
 }
 
-fn run(rx: Receiver<InputEvent>, stats: &Stats) {
+/// One plugged virtual pad: its encoding session and the driver sections it feeds.
+struct PadState {
+    client: u32,
+    session: PadSession,
+    input: shmem::Section,
+    output: shmem::Section,
+    doorbell: shmem::Doorbell,
+    out_seen: u32,
+    policy: RepeatPolicy,
+    /// The last effect sent, re-sent on repeat so a dropped packet self-heals.
+    last_effect: Option<Outbound>,
+}
+
+fn run(rx: Receiver<Msg>, stats: &Stats, outbound: &Arc<Mutex<Vec<Outbound>>>) {
     let mut desktop = Desktop::default();
     let mut modifiers = Modifiers::new();
+    let mut pads: [Option<PadState>; MAX_PADS as usize] = std::array::from_fn(|_| None);
+    let started = Instant::now();
+    let mut last_ensure = started - DESKTOP_POLL;
 
     loop {
-        match rx.recv_timeout(DESKTOP_POLL) {
-            Ok(event) => {
+        match rx.recv_timeout(OUTPUT_POLL) {
+            // Gamepad goes to shared memory, not the desktop.
+            Ok(Msg::Input(InputEvent::Gamepad(state))) => submit_gamepad(&mut pads, &state),
+            Ok(Msg::Input(event)) => {
                 desktop.ensure(stats);
+                last_ensure = Instant::now();
                 apply(event, &mut modifiers, stats);
             }
-            // Idle. Still worth checking, so the first event after a UAC prompt
-            // is not the one that gets lost.
-            Err(RecvTimeoutError::Timeout) => desktop.ensure(stats),
+            Ok(Msg::PadConnected {
+                client,
+                pad_index,
+                pad_type,
+            }) => connect_pad(&mut pads, client, pad_index, pad_type),
+            Ok(Msg::PadDisconnected { pad_index }) => {
+                if let Some(slot) = pads.get_mut(pad_index as usize) {
+                    *slot = None;
+                }
+            }
+            // Idle. Ensure the desktop, throttled — the fast poll is for output,
+            // not for hammering OpenInputDesktop.
+            Err(RecvTimeoutError::Timeout) => {
+                if last_ensure.elapsed() >= DESKTOP_POLL {
+                    desktop.ensure(stats);
+                    last_ensure = Instant::now();
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+
+        // Every wake: carry the pads' output effects (rumble / triggers / LED) back.
+        let now_ms = started.elapsed().as_millis() as u32;
+        drain_pads(&mut pads, outbound, now_ms);
     }
 
     // Whatever the last client left held, so a disconnect mid-chord does not
     // leave Ctrl down on the desktop.
     for action in modifiers.release_all() {
         send_key(action, stats);
+    }
+}
+
+/// Plug a virtual pad: build its session and create the driver's shared sections.
+/// (The device *node* is `device.rs`, held back — so until then this writes into
+/// sections no driver serves, the expected pre-`device.rs` state.)
+fn connect_pad(pads: &mut [Option<PadState>], client: u32, pad_index: u8, pad_type: u8) {
+    let Some(slot) = pads.get_mut(pad_index as usize) else {
+        return;
+    };
+    let Some(session) = registry::session_for(pad_type) else {
+        return;
+    };
+    let (Ok(input), Ok(output), Ok(doorbell)) = (
+        shmem::Section::create(&shmem::input_name(pad_index), shmem::INPUT_SIZE),
+        shmem::Section::create(&shmem::output_name(pad_index), shmem::OUTPUT_SIZE),
+        shmem::Doorbell::create(pad_index),
+    ) else {
+        return;
+    };
+    *slot = Some(PadState {
+        client,
+        session,
+        input,
+        output,
+        doorbell,
+        out_seen: 0,
+        policy: RepeatPolicy::new(),
+        last_effect: None,
+    });
+}
+
+/// Encode a gamepad frame and submit it to the pad's driver section.
+fn submit_gamepad(pads: &mut [Option<PadState>], state: &GamepadState) {
+    let Some(Some(pad)) = pads.get_mut(state.pad_index as usize) else {
+        return;
+    };
+    // GIP first (its own borrow ends), copied to the stack to avoid an alloc.
+    let gip = pad.session.gip(state).map(|g| {
+        let mut b = [0u8; gip::GIP_LEN];
+        b.copy_from_slice(g);
+        b
+    });
+    let extended = pad.session.is_extended();
+    let report = pad.session.submit(state);
+    let (main, ext): (&[u8], Option<&[u8]>) = if extended {
+        (&[], Some(report))
+    } else {
+        (report, None)
+    };
+    shmem::submit(
+        &pad.input,
+        &pad.doorbell,
+        main,
+        gip.as_ref().map(|b| &b[..]),
+        ext,
+    );
+}
+
+/// Drain every pad's output ring, turn the newest report into an outbound effect,
+/// and repeat a non-neutral effect on its cadence.
+fn drain_pads(pads: &mut [Option<PadState>], outbound: &Arc<Mutex<Vec<Outbound>>>, now_ms: u32) {
+    for (index, slot) in pads.iter_mut().enumerate() {
+        let Some(pad) = slot else { continue };
+        let (reports, highest) = shmem::drain_output(&pad.output, pad.out_seen);
+        pad.out_seen = highest;
+
+        // Latest-wins: only the newest report matters.
+        if let Some(last) = reports.last()
+            && let Some((decoded, _crc)) = pad.session.decode_output(&last.data)
+        {
+            let active = effect_is_active(&decoded);
+            let seq = pad.policy.on_send(active, now_ms);
+            let out = Outbound::PadOutput {
+                client: pad.client,
+                output: build_pad_output(index as u8, seq, &decoded),
+            };
+            pad.last_effect = Some(out.clone());
+            push(outbound, out);
+        }
+
+        // Repeat a still-active effect so a dropped packet self-heals.
+        if pad.policy.repeat_due(now_ms).is_some()
+            && let Some(effect) = pad.last_effect.clone()
+        {
+            push(outbound, effect);
+        }
+    }
+}
+
+fn push(outbound: &Arc<Mutex<Vec<Outbound>>>, out: Outbound) {
+    if let Ok(mut q) = outbound.lock() {
+        q.push(out);
+    }
+}
+
+/// Whether a decoded output report commands anything (so it needs repeating).
+fn effect_is_active(decoded: &std::collections::BTreeMap<String, DecodedValue>) -> bool {
+    let byte = |k: &str| matches!(decoded.get(k), Some(DecodedValue::Byte(b)) if *b != 0);
+    let blob = |k: &str| matches!(decoded.get(k), Some(DecodedValue::Bytes(b)) if b.iter().any(|x| *x != 0));
+    byte("leftMotor")
+        || byte("rightMotor")
+        || blob("lightbar")
+        || blob("leftTriggerEffect")
+        || blob("rightTriggerEffect")
+}
+
+/// Build a [`PadOutput`] from decoded output-report fields. Field names follow the
+/// Sony profiles; a family that names them differently contributes nothing here
+/// until its client support lands (box-verified).
+fn build_pad_output(
+    pad_index: u8,
+    seq: u8,
+    decoded: &std::collections::BTreeMap<String, DecodedValue>,
+) -> PadOutput {
+    let byte = |k: &str| match decoded.get(k) {
+        Some(DecodedValue::Byte(b)) => *b,
+        _ => 0,
+    };
+    // Motor bytes (0..255) widened to the wire's 16-bit range.
+    let widen = |b: u8| (b as u16) * 257;
+    let effect = |k: &str| match decoded.get(k) {
+        Some(DecodedValue::Bytes(b)) => TriggerEffect::from_slice(b),
+        _ => TriggerEffect::default(),
+    };
+    let led = match decoded.get("lightbar") {
+        Some(DecodedValue::Bytes(b)) if b.len() >= 3 => [b[0], b[1], b[2]],
+        _ => [0, 0, 0],
+    };
+    let flags = if byte("muteLed") != 0 {
+        sunburst_core::proto::padoutput::flags::MIC_MUTED
+    } else {
+        0
+    };
+    PadOutput {
+        pad_index,
+        seq,
+        motor_low: widen(byte("leftMotor")),
+        motor_high: widen(byte("rightMotor")),
+        led,
+        player_led: byte("playerIndicator"),
+        flags,
+        left_trigger: effect("leftTriggerEffect"),
+        right_trigger: effect("rightTriggerEffect"),
     }
 }
 
@@ -174,8 +407,8 @@ fn apply(event: InputEvent, modifiers: &mut Modifiers, stats: &Stats) {
         InputEvent::MouseWheel { delta, horizontal } => {
             send_mouse(keymap::wheel_action(delta, horizontal), stats);
         }
-        // Gamepad is ViGEm's, and that is its own chunk. Dropping it here is
-        // honest: there is nothing to inject it into yet.
+        // Gamepad is handled before `apply` (it goes to shared memory, not the
+        // desktop), so this arm is unreachable — present only for exhaustiveness.
         InputEvent::Gamepad(_) => {}
     }
 }

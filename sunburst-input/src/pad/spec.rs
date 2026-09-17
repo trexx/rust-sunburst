@@ -23,6 +23,11 @@ pub struct ReportSpec {
     /// Total report length in bytes.
     pub size: usize,
     pub fields: Vec<FieldSpec>,
+    /// Whether the device streams this vendor report from power-on (Switch 2 Pro,
+    /// Valve) rather than switching into it on a host handshake. When set, this is
+    /// the profile's input report and its id is preferred during descriptor parse.
+    #[serde(rename = "alwaysArmed", default)]
+    pub always_armed: Option<bool>,
 }
 
 impl ReportSpec {
@@ -59,6 +64,18 @@ pub struct FieldSpec {
     pub stride: Option<i64>,
     /// Button or flag names, one per bit position, for `button-mask` / `bitfield`.
     pub buttons: Option<Vec<String>>,
+    /// CRC coverage, for `crc32-le`: a prefix and an inclusive byte range.
+    pub scope: Option<CrcScope>,
+}
+
+/// What a `crc32-le` field covers: some literal prefix bytes, then a byte range
+/// of the report itself. DualSense's Bluetooth report seeds the CRC with the
+/// `0xA1 0x31` report header before the payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CrcScope {
+    pub prefix: Option<Vec<u8>>,
+    pub from: i32,
+    pub to: i32,
 }
 
 impl ReportSpec {
