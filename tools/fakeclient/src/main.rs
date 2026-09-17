@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use sunburst_core::proto::input::buttons;
 use sunburst_core::proto::pairing::{NONCE_LEN, PIN_DIGITS, confirm_tag, derive_secret};
 use sunburst_core::proto::{
-    ClientControl, GamepadState, Hello, InputEvent, InputPacket, MouseButton, MouseMotion,
-    PairRequest, ServerControl, SessionKey,
+    Battery, ClientControl, Finger, GamepadState, Hello, Imu, InputEvent, InputPacket, MouseButton,
+    MouseMotion, PairRequest, ServerControl, SessionKey, Touchpad,
 };
 use sunburst_net::ClientEndpoint;
 
@@ -74,7 +74,7 @@ usage:
   fakeclient apps  [--server host:port] [--state path]
   fakeclient input [--server host:port] [--state path] [--script name]
 
-scripts: gamepad-sweep (default), keyboard, mouse
+scripts: gamepad-sweep (default), gamepad-rich, keyboard, mouse
 
 Pairing prints a PIN to type into the web UI. The PIN is never transmitted.";
 
@@ -288,6 +288,7 @@ fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<()
 
     let events = match script.unwrap_or("gamepad-sweep") {
         "gamepad-sweep" => gamepad_sweep(),
+        "gamepad-rich" => gamepad_rich(),
         "keyboard" => keyboard(),
         "mouse" => mouse(),
         other => return Err(format!("unknown script {other}")),
@@ -345,43 +346,145 @@ fn gamepad_sweep() -> Vec<InputEvent> {
     events
 }
 
-fn keyboard() -> Vec<InputEvent> {
-    // "HELLO" as virtual-key codes, each down then up.
+/// A DualSense-shaped stream: every rich section populated and moving, so the
+/// whole IMU / touchpad / battery path is exercised without an Android client.
+/// The gyro rotates, one finger drags across the pad, and the battery drains —
+/// values a decode or endianness bug would visibly scramble.
+fn gamepad_rich() -> Vec<InputEvent> {
     let mut events = Vec::new();
-    for vk in [0x48u16, 0x45, 0x4C, 0x4C, 0x4F] {
-        events.push(InputEvent::KeyDown { vk, modifiers: 0 });
-        events.push(InputEvent::KeyUp { vk, modifiers: 0 });
+    for step in 0..32i32 {
+        let sweep = (step * 2048 - 32768).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        events.push(InputEvent::Gamepad(GamepadState {
+            pad_index: 0,
+            buttons: buttons::A | buttons::TOUCHPAD_CLICK,
+            lx: sweep,
+            ly: sweep.saturating_neg(),
+            rx: 0,
+            ry: 0,
+            lt: (step * 8) as u8,
+            rt: 255 - (step * 8) as u8,
+            imu: Some(Imu {
+                gyro_pitch: (step * 100) as i16,
+                gyro_yaw: (-step * 50) as i16,
+                gyro_roll: (step * 25) as i16,
+                accel_x: 4096,
+                accel_y: -8192,
+                accel_z: 512,
+                sensor_timestamp: (step as u32).wrapping_mul(1333),
+            }),
+            touchpad: Some(Touchpad {
+                finger0: Finger {
+                    active: true,
+                    x: (step * 60) as u16, // drags 0..1860 across the pad
+                    y: 540,
+                    id: 1,
+                },
+                finger1: Finger {
+                    active: false,
+                    x: 0,
+                    y: 0,
+                    id: 0,
+                },
+            }),
+            battery: Some(Battery {
+                level: (8 - step / 4).max(0) as u8,
+                charging: false,
+                full: false,
+                mic_muted: step % 8 >= 4,
+                headphones: true,
+            }),
+        }));
     }
+    events
+}
+
+fn keyboard() -> Vec<InputEvent> {
+    use sunburst_input::keymap::{EXPECTED_EXTENDED, modifiers};
+
+    let mut events = Vec::new();
+    let tap = |events: &mut Vec<InputEvent>, vk: u16, m: u8| {
+        events.push(InputEvent::KeyDown { vk, modifiers: m });
+        events.push(InputEvent::KeyUp { vk, modifiers: 0 });
+    };
+
+    // "HELLO", so a plain-key regression is obvious.
+    for vk in [0x48u16, 0x45, 0x4C, 0x4C, 0x4F] {
+        tap(&mut events, vk, 0);
+    }
+
+    // Every extended key (§6): arrows, Ins/Del/Home/End/PgUp/PgDn, right
+    // Ctrl/Alt, numpad divide, Win keys — the E0-prefix set that turns into its
+    // numpad twin without the flag. The checklist is `keymap::EXPECTED_EXTENDED`,
+    // so drive it straight from there and it can never drift.
+    for (vk, _name) in EXPECTED_EXTENDED {
+        tap(&mut events, *vk, 0);
+    }
+
+    // The chords §6 names, each a different modifier path. The modifier byte is
+    // asserted on the key event; the injector reconciles the transitions.
+    tap(&mut events, 0x1B, modifiers::CTRL | modifiers::SHIFT); // Ctrl+Shift+Esc → Task Manager
+    tap(&mut events, 0x73, modifiers::ALT); // Alt+F4
+    tap(&mut events, 0x56, modifiers::CTRL); // Ctrl+V
+    tap(&mut events, 0x5B, modifiers::META); // Win → Start
+    tap(&mut events, 0x44, modifiers::META); // Win+D → show desktop
+
     events
 }
 
 fn mouse() -> Vec<InputEvent> {
     let mut events = Vec::new();
+
+    // Relative motion — the path Enhanced Pointer Precision distorts.
     for step in 0..20 {
         events.push(InputEvent::MouseMove(MouseMotion::Relative {
             dx: 10,
             dy: if step % 2 == 0 { 5 } else { -5 },
         }));
     }
+    // Absolute, for the multi-monitor / DPI-scaling item: centre of the virtual
+    // desktop, then a corner — reachable only with MOUSEEVENTF_VIRTUALDESK.
     events.push(InputEvent::MouseMove(MouseMotion::Absolute {
         x: 32_768,
         y: 32_768,
     }));
-    events.push(InputEvent::MouseButton {
-        button: MouseButton::Left,
-        down: true,
-    });
-    events.push(InputEvent::MouseButton {
-        button: MouseButton::Left,
-        down: false,
-    });
+    events.push(InputEvent::MouseMove(MouseMotion::Absolute {
+        x: 65_535,
+        y: 0,
+    }));
+
+    // Every button, each pressed then released. Both X buttons distinctly — they
+    // share XDOWN/XUP and differ only in mouseData, so this catches X2→X1.
+    for button in [
+        MouseButton::Left,
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::X1,
+        MouseButton::X2,
+    ] {
+        events.push(InputEvent::MouseButton { button, down: true });
+        events.push(InputEvent::MouseButton {
+            button,
+            down: false,
+        });
+    }
+
+    // Wheel and horizontal wheel, both directions — the sign is the direction.
     events.push(InputEvent::MouseWheel {
         delta: 120,
         horizontal: false,
     });
     events.push(InputEvent::MouseWheel {
         delta: -120,
+        horizontal: false,
+    });
+    events.push(InputEvent::MouseWheel {
+        delta: 120,
         horizontal: true,
     });
+    events.push(InputEvent::MouseWheel {
+        delta: -120,
+        horizontal: true,
+    });
+
     events
 }

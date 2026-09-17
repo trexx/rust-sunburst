@@ -15,4 +15,5 @@ workspace = true
 [dependencies]
 sunburst-core.workspace = true
 sunburst-net.workspace = true
+sunburst-input.workspace = true
 getrandom.workspace = true
