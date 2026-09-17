@@ -42,6 +42,44 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+  # Build the artifacts a Windows host is needed for and publish them, so the
+  # 4070 box gets a runnable server + fakeclient without building on the box.
+  # Only on a push to main (and on demand) — PRs stay fast with the type-check
+  # above.
+  package:
+    name: Windows binaries (artifact)
+    runs-on: windows-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the server and fakeclient (release)
+        run: cargo build --release -p sunburst-server -p fakeclient
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build the web UI
+        run: |
+          npm ci
+          npm run build
+        working-directory: web
+      - name: Stage the bundle
+        # The server serves the UI from a runtime assets dir; ship it beside the
+        # binaries so `web.assets_dir` can point at `web/`.
+        shell: bash
+        run: |
+          mkdir -p dist/web
+          cp target/release/sunburst-server.exe dist/
+          cp target/release/fakeclient.exe dist/
+          cp -r web/dist/* dist/web/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sunburst-windows
+          path: dist/
+          if-no-files-found: error
+
   web:
     name: Management UI
     runs-on: ubuntu-latest

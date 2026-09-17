@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Obtain the HIDMaestro UMDF2 driver — the one artifact this project needs that a
+# Linux host cannot produce. We do NOT build it: HIDMaestro publishes prebuilt
+# GitHub releases, and its driver binaries (HIDMaestro.dll + HMXInput.dll) ship
+# embedded as managed resources inside HIDMaestro.Core.dll. So we download a
+# release and extract those resources — no WDK, no compile.
+#
+# The extraction reads the assembly's manifest-resource bytes directly (PEReader /
+# MetadataReader), so it neither runs HIDMaestro's code nor needs its target
+# runtime. Download the artifact and vendor the DLLs under
+# third-party/hidmaestro/driver/ with a pinned version + SHA-256.
+#
+# Manual-only (workflow_dispatch): not part of the CI gate. The one thing I can't
+# verify from a Linux host is a release's exact asset layout — if the release ships
+# the assembly under a different name/archive, adjust the "find the assembly" step;
+# that is the expected one-time iteration this file makes cheap.
+#
+# Fallback if a release ever stops embedding the DLLs: build from the vendored
+# source with the WDK via HIDMaestro's own scripts/build.cmd (cl.exe + UMDF 2.15).
+
+name: Driver artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      hidmaestro_ref:
+        description: HIDMaestro release tag to pull
+        default: v1.8.0
+
+jobs:
+  extract:
+    name: Extract driver DLLs from a HIDMaestro release
+    runs-on: windows-latest
+    steps:
+      - name: Download the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ github.event.inputs.hidmaestro_ref }}" --repo hifihedgehog/HIDMaestro --dir release --pattern "*"
+
+      - name: Unpack archives and locate HIDMaestro.Core.dll
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release -name '*.zip' -print -exec unzip -o {} -d release/unpacked \; || true
+          find release -name '*.nupkg' -print -exec unzip -o {} -d release/unpacked \; || true
+          core="$(find release -iname 'HIDMaestro.Core.dll' | head -1)"
+          if [ -z "$core" ]; then
+            echo "::error::HIDMaestro.Core.dll not found in the release assets — adjust this step for the release layout."
+            find release -maxdepth 4 -type f | sort
+            exit 1
+          fi
+          echo "CORE_DLL=$core" >> "$GITHUB_ENV"
+          echo "found $core"
+
+      - name: Extract the embedded driver resources
+        shell: pwsh
+        run: |
+          $core = $env:CORE_DLL
+          $fs = [System.IO.File]::OpenRead((Resolve-Path $core))
+          $pe = New-Object System.Reflection.PortableExecutable.PEReader($fs)
+          $md = $pe.GetMetadataReader()
+          $base = $pe.PEHeaders.CorHeader.ResourcesDirectory.RelativeVirtualAddress
+          New-Item -ItemType Directory -Force -Path extracted | Out-Null
+          $count = 0
+          foreach ($h in $md.ManifestResources) {
+            $res = $md.GetManifestResource($h)
+            if (-not $res.Implementation.IsNil) { continue }   # embedded in this assembly only
+            $name = $md.GetString($res.Name)
+            if ($name -notmatch '\.(dll|inf)$') { continue }
+            $reader = $pe.GetSectionData($base + [int]$res.Offset).GetReader()
+            $len = $reader.ReadInt32()
+            $bytes = $reader.ReadBytes($len)
+            $out = Join-Path 'extracted' ($name -replace '^HIDMaestro\.Resources\.', '')
+            [System.IO.File]::WriteAllBytes($out, $bytes)
+            Write-Host "extracted $out ($len bytes)"
+            $count++
+          }
+          $pe.Dispose(); $fs.Dispose()
+          if ($count -eq 0) { throw "no embedded driver resources found in $core" }
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd extracted && sha256sum * | tee SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hidmaestro-driver-${{ github.event.inputs.hidmaestro_ref }}
+          path: extracted/
+          if-no-files-found: error
