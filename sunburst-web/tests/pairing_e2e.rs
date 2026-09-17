@@ -294,10 +294,42 @@ fn a_paired_client_lists_apps_and_sends_input() {
         .expect("send");
     h.wait("the launch", || h.state.host().running_app().map(|_| ()));
 
-    // And input reaches the sink `sunburst-input` will replace.
+    // And input reaches the sink `sunburst-input` will replace — a rich,
+    // DualSense-shaped pad, so the whole IMU/touchpad/battery body makes it
+    // through pairing, transport and attribution intact.
     let event = InputEvent::Gamepad(GamepadState {
         pad_index: 0,
-        buttons: sunburst_core::proto::input::buttons::A,
+        buttons: sunburst_core::proto::input::buttons::A
+            | sunburst_core::proto::input::buttons::SHARE,
+        lx: 1234,
+        ly: -5678,
+        lt: 40,
+        rt: 200,
+        imu: Some(sunburst_core::proto::Imu {
+            gyro_pitch: 1000,
+            gyro_yaw: -2000,
+            gyro_roll: 300,
+            accel_x: 4096,
+            accel_y: -8192,
+            accel_z: 512,
+            sensor_timestamp: 0xDEAD_BEEF,
+        }),
+        touchpad: Some(sunburst_core::proto::Touchpad {
+            finger0: sunburst_core::proto::Finger {
+                active: true,
+                x: 960,
+                y: 540,
+                id: 3,
+            },
+            finger1: sunburst_core::proto::Finger::default(),
+        }),
+        battery: Some(sunburst_core::proto::Battery {
+            level: 8,
+            charging: true,
+            full: false,
+            mic_muted: true,
+            headphones: true,
+        }),
         ..Default::default()
     });
     for seq in 1..=4u32 {

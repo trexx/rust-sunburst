@@ -8,10 +8,10 @@
 //! lets unauthenticated traffic move the window.
 
 use sunburst_core::proto::{
-    Flags, GamepadState, Header, InputEvent, InputPacket, PacketType, ReplayWindow, Seq16,
-    SessionKey,
+    Battery, Finger, Flags, GamepadState, Header, Imu, InputEvent, InputPacket, PacketType,
+    ReplayWindow, Seq16, SessionKey, Touchpad,
     auth::NONCE_LEN,
-    input::{MAX_INPUT_BODY, MAX_PADS},
+    input::{MAX_INPUT_BODY, MAX_PADS, buttons},
 };
 
 const SECRET: &[u8] = b"secret established at pairing";
@@ -62,9 +62,63 @@ fn receive(key: &SessionKey, window: &mut ReplayWindow, packet: &[u8]) -> Option
 fn press(pad_index: u8) -> InputEvent {
     InputEvent::Gamepad(GamepadState {
         pad_index,
-        buttons: sunburst_core::proto::input::buttons::A,
+        buttons: buttons::A,
         ..Default::default()
     })
+}
+
+/// A DualSense-shaped pad: IMU, touchpad and battery all populated.
+fn rich_pad() -> InputEvent {
+    InputEvent::Gamepad(GamepadState {
+        pad_index: 2,
+        buttons: buttons::A | buttons::SHARE | buttons::LEFT_PADDLE,
+        lx: 1234,
+        ly: -5678,
+        rx: -1,
+        ry: 32767,
+        lt: 40,
+        rt: 200,
+        imu: Some(Imu {
+            gyro_pitch: 1000,
+            gyro_yaw: -2000,
+            gyro_roll: 300,
+            accel_x: 4096,
+            accel_y: -8192,
+            accel_z: 512,
+            sensor_timestamp: 0xDEAD_BEEF,
+        }),
+        touchpad: Some(Touchpad {
+            finger0: Finger {
+                active: true,
+                x: 960,
+                y: 540,
+                id: 3,
+            },
+            finger1: Finger {
+                active: false,
+                x: 100,
+                y: 200,
+                id: 7,
+            },
+        }),
+        battery: Some(Battery {
+            level: 8,
+            charging: true,
+            full: false,
+            mic_muted: true,
+            headphones: true,
+        }),
+    })
+}
+
+#[test]
+fn a_rich_gamepad_survives_the_authenticated_round_trip() {
+    // The DualSense-shaped payload must reach the far side of encode → MAC →
+    // verify → decode byte-for-byte, or the codec is fed the wrong device state.
+    let key = session();
+    let mut window = ReplayWindow::new();
+    let packet = send(&key, 1, rich_pad());
+    assert_eq!(receive(&key, &mut window, &packet), Some(rich_pad()));
 }
 
 #[test]

@@ -16,7 +16,7 @@ use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, SessionKey};
 // Re-exported so callers of this crate do not need to reach past it for the
 // seam its own handler is generic over.
-use sunburst_net::ControlHandler;
+use sunburst_net::{ControlHandler, Outbound};
 pub use sunburst_net::{InputSink, NoInput};
 
 use crate::api::AppState;
@@ -89,8 +89,25 @@ impl<S: InputSink> ControlHandler for WebHandler<S> {
         self.input.inject(client, event);
     }
 
+    fn on_pad_connected(&mut self, client: u32, pad_index: u8, pad_type: u8, capabilities: u16) {
+        self.state.touch_last_seen(client, unix_now());
+        self.input
+            .pad_connected(client, pad_index, pad_type, capabilities);
+    }
+
+    fn on_pad_disconnected(&mut self, client: u32, pad_index: u8) {
+        self.state.touch_last_seen(client, unix_now());
+        self.input.pad_disconnected(client, pad_index);
+    }
+
     fn on_bye(&mut self, client: u32) {
         self.state.touch_last_seen(client, unix_now());
+    }
+
+    /// The output effects the injector has produced since the last tick — rumble
+    /// and rich pad output a game wrote to the virtual controllers.
+    fn drain_outbound(&mut self) -> Vec<Outbound> {
+        self.input.drain_outbound()
     }
 }
 

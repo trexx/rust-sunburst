@@ -91,10 +91,49 @@ fn pair_request() -> ClientControl {
 }
 
 fn press() -> InputEvent {
+    // A rich, DualSense-shaped pad, so the full IMU/touchpad/battery body is
+    // exercised over the real socket, not just the X360 core.
+    use sunburst_core::proto::input::buttons;
+    use sunburst_core::proto::{Battery, Finger, Imu, Touchpad};
     InputEvent::Gamepad(GamepadState {
         pad_index: 0,
-        buttons: sunburst_core::proto::input::buttons::A,
-        ..Default::default()
+        buttons: buttons::A | buttons::SHARE,
+        lx: 1234,
+        ly: -5678,
+        rx: -1,
+        ry: 32767,
+        lt: 40,
+        rt: 200,
+        imu: Some(Imu {
+            gyro_pitch: 1000,
+            gyro_yaw: -2000,
+            gyro_roll: 300,
+            accel_x: 4096,
+            accel_y: -8192,
+            accel_z: 512,
+            sensor_timestamp: 0xDEAD_BEEF,
+        }),
+        touchpad: Some(Touchpad {
+            finger0: Finger {
+                active: true,
+                x: 960,
+                y: 540,
+                id: 3,
+            },
+            finger1: Finger {
+                active: false,
+                x: 100,
+                y: 200,
+                id: 7,
+            },
+        }),
+        battery: Some(Battery {
+            level: 8,
+            charging: true,
+            full: false,
+            mic_muted: true,
+            headphones: true,
+        }),
     })
 }
 
@@ -191,6 +230,33 @@ fn an_authenticated_client_is_recognised_by_its_key_alone() {
 
     server.wait_for("the hello", |r| !r.hellos.is_empty());
     server.recording(|r| assert_eq!(r.hellos[0].0, 9, "attributed to the wrong client"));
+}
+
+#[test]
+fn pad_connect_and_disconnect_reach_the_handler() {
+    // Pad lifecycle rides the reliable control channel, so the injector learns
+    // which controller to plug and never misses a plug/unplug.
+    let server = Server::start(Recording::new().with_key(5, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+
+    client
+        .send_control(&ClientControl::PadConnected {
+            pad_index: 0,
+            pad_type: 2,
+            capabilities: 0x1234,
+        })
+        .expect("pad connected");
+    client
+        .send_control(&ClientControl::PadDisconnected { pad_index: 0 })
+        .expect("pad disconnected");
+
+    server.wait_for("the pad lifecycle", |r| {
+        !r.pad_connects.is_empty() && !r.pad_disconnects.is_empty()
+    });
+    server.recording(|r| {
+        assert_eq!(r.pad_connects[0], (5, 0, 2, 0x1234));
+        assert_eq!(r.pad_disconnects[0], (5, 0));
+    });
 }
 
 #[test]
@@ -397,7 +463,7 @@ fn queued_rumble_reaches_the_client_signed_and_unreliable() {
     // queues a Rumble; the endpoint sends it as a signed type=6 packet, outside
     // the reliable channel.
     use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
-    use sunburst_core::proto::{Header, PacketType, Rumble, HEADER_LEN};
+    use sunburst_core::proto::{HEADER_LEN, Header, PacketType, Rumble};
     use sunburst_net::Outbound;
 
     let server = Server::start(Recording::new().with_key(4, key(1)));
@@ -451,6 +517,67 @@ fn queued_rumble_reaches_the_client_signed_and_unreliable() {
     assert_eq!(body.len(), RUMBLE_BODY_LEN);
     let decoded = Rumble::decode(body).expect("a rumble body");
     assert_eq!(decoded, rumble, "the level did not survive the round trip");
+}
+
+#[test]
+fn queued_pad_output_reaches_the_client_signed_and_unreliable() {
+    // The rich sibling of rumble: the injector queues a PadOutput; the endpoint
+    // sends it as a signed type=7 packet, unreliable like rumble.
+    use sunburst_core::proto::{HEADER_LEN, Header, PacketType, PadOutput, TriggerEffect};
+    use sunburst_net::Outbound;
+
+    let server = Server::start(Recording::new().with_key(4, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the session to exist", |r| r.inputs.len() == 1);
+
+    let output = PadOutput {
+        pad_index: 0,
+        seq: 9,
+        motor_low: 0xBEEF,
+        motor_high: 0x1234,
+        led: [0x10, 0x20, 0x30],
+        player_led: 0b0000_0101,
+        flags: 1,
+        left_trigger: TriggerEffect::from_slice(&[0x02, 0x90, 0xA0]),
+        right_trigger: TriggerEffect::default(),
+    };
+    server
+        .recording
+        .lock()
+        .expect("not poisoned")
+        .outbound
+        .push(Outbound::PadOutput { client: 4, output });
+
+    client
+        .socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let mut buf = [0u8; 256];
+    let len = client.socket.recv(&mut buf).expect("a pad-output packet");
+    let datagram = &buf[..len];
+
+    let header = Header::decode(datagram).expect("a header");
+    assert_eq!(
+        header.packet_type,
+        PacketType::PadOutput,
+        "pad output must be type 7"
+    );
+
+    let key = key(1);
+    let verified = key
+        .verify_packet(datagram)
+        .expect("pad output is authenticated and must verify");
+    let decoded = PadOutput::decode(&verified[HEADER_LEN..]).expect("a pad-output body");
+    assert_eq!(
+        decoded, output,
+        "the effects did not survive the round trip"
+    );
 }
 
 #[test]

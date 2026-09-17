@@ -26,6 +26,7 @@ All integers little-endian. Payload ≤1200 bytes to stay under path MTU.
 ```
 
 `type`: 0=Video 1=Audio 2=Input 3=Control 4=Nack 5=Feedback 6=Rumble
+7=PadOutput
 
 `flags`: bit0 keyframe/IDR, bit1 last-packet-of-frame, bit2 unit-boundary
 (NAL for HEVC, OBU for AV1), bit3 intra-refresh-active, bits4-7 reserved.
@@ -108,9 +109,34 @@ the authentication subkey. Video is unauthenticated by design, so nothing here
 runs at a rate where hardware crypto pays.
 
 Payloads:
-- **Gamepad**: `pad_index u8`, buttons `u16`, LX/LY/RX/RY `i16`, LT/RT `u8`.
-  Maps to ViGEm X360 report. The index is not optional: two Bluetooth pads need
-  it and the Xbox Wireless Adapter's four make it unavoidable.
+- **Gamepad**: a controller-agnostic superset, presence-flagged. The core is
+  always present; a 1-byte mask gates optional rich sections, so an Xbox pad stays
+  ~16 bytes and a DualSense ~44.
+
+  ```
+  u8   pad_index      not optional: two Bluetooth pads need it, the Xbox adapter's four make it unavoidable
+  u8   presence       bit0 IMU, bit1 touchpad, bit2 battery; bits3-7 reserved 0
+  u32  buttons        low 16 are XInput's own bits; bits16+ are LEFT/RIGHT_PADDLE, *_PADDLE2,
+                      TOUCHPAD_CLICK, SHARE, MISC1 — controls XInput has no name for
+  i16  LX LY RX RY
+  u8   LT RT
+  -- if IMU:      i16 gyro pitch/yaw/roll (dps×16), i16 accel x/y/z (g×4096), u32 sensor_timestamp  (16 bytes)
+  -- if touchpad: two fingers, each { u8 id|lifted-bit, u16 x, u16 y }             (10 bytes)
+  -- if battery:  u8 level, u8 flags (bit0 charging, 1 full, 2 mic_muted, 3 headphones)  (2 bytes)
+  ```
+
+  A finger's byte 0 is `id & 0x7F`, with bit 7 set when the finger is **not**
+  touching — the convention the HIDMaestro codec's touchpad field uses, so the
+  server forwards it unchanged. The **d-pad lives in the four XInput direction
+  bits**; there is no separate hat field — the server derives the codec's hat
+  octant from them. The core maps onto a ViGEm X360 report; that is the fallback
+  when the native driver is unavailable, not the primary target. The primary
+  target is the HIDMaestro codec, which packs this into whatever profile the pad
+  emulates (Xbox, DualSense, Switch Pro, …).
+
+  A pad's *capability* to send each rich section is announced once at connect
+  (`PadConnected.capabilities`, below); the per-frame presence mask is which
+  sections a given packet actually carries.
 - **KeyDown/KeyUp**: Windows VK `u16` + modifier bitfield `u8`. Server derives the
   scancode via `MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)`. Do **not** send Android
   `getScanCode()` — those are Linux evdev codes and the mapping isn't clean.
@@ -180,7 +206,14 @@ Client → server:
 - `DecoderQuirks` — the quirks struct (see CLAUDE.md); server adapts encoder config
 - `RequestIdr` — last resort only; prefer NACK + reference invalidation
 - `Resize` — client resolution/refresh change
-- `PadConnected` — `pad_index`, type, capabilities. Server plugs a ViGEm target.
+- `PadConnected` — `pad_index`, `pad_type`, `capabilities`. The per-connection
+  profile selector: `pad_type` says which controller the pad emulates — the server
+  emulates the same family the client reports. Codes (`sunburst_input::pad::registry`):
+  **0 = Xbox 360** (universal fallback), **1 = Xbox Series X|S**, **2 = DualShock 4**,
+  **3 = DualSense**, **4 = Switch Pro**; more families extend the list. `capabilities` says which rich
+  sections the pad can send (IMU, touchpad, battery, adaptive triggers). Sent
+  reliably at connect, so the per-frame gamepad packet carries no profile byte —
+  only the presence mask for what *this* packet holds.
 - `PadDisconnected` — `pad_index`. Server unplugs it.
 - `Bye`
 
@@ -280,8 +313,41 @@ be lost, and the failure mode is a controller that buzzes until the battery dies
 The client stops any motor it has heard nothing about for 200ms, and the server
 repeats the current level every 100ms while it is non-zero.
 
-Trigger rumble is not carried. XInput has no API for it, so there would be
-nowhere on the server for it to go.
+This packet carries only the two motors — the subset the X360 fallback can drive.
+A native pad's richer effects ride **`PadOutput`** (type 7) below; the two are
+never sent for the same controller. Rumble stays its own type because a motor
+level is continuous and latest-wins, which suits a simple pad and the X360
+fallback path.
+
+---
+
+## PadOutput (server → client, unreliable)
+
+```
+common header (type=7)
+u8   pad_index
+u8   pad_seq              wraps; latest-wins, like rumble
+u16  motor_low
+u16  motor_high
+u8   led[3]               lightbar RGB
+u8   player_led           family-specific player-indicator pattern
+u8   flags                bit0 mic-mute LED; bits1-7 reserved
+u8   left_len             adaptive-trigger effect length (≤11)
+...  left_effect[left_len]
+u8   right_len
+...  right_effect[right_len]
+u64  mac
+```
+
+A native pad's output report sets more than a motor level — a DualSense frame
+carries both motors, the two adaptive-trigger effects, the lightbar and the
+player LEDs at once. The server decodes the game's output report (via the
+HIDMaestro codec) and ships that union here, so the client applies whatever its
+hardware supports and drops the rest. **The trigger effects are opaque,
+length-prefixed, family-specific blobs** (a DualSense effect is 11 bytes); the
+server does not model their semantics. **Unreliable and latest-wins** for the same
+reason as rumble — a superseded effect is worthless — with `pad_seq` guarding
+against reordering. Simple pads use `Rumble`; rich pads use this.
 
 ---
 

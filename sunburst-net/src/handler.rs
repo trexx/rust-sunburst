@@ -15,7 +15,9 @@
 //! [`on_input`]: ControlHandler::on_input
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
-use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, Rumble, ServerControl, SessionKey};
+use sunburst_core::proto::{
+    AppListing, Hello, InputEvent, PadOutput, PairRequest, Rumble, ServerControl, SessionKey,
+};
 
 /// A server → client message queued by a producer for the endpoint to send.
 ///
@@ -36,6 +38,9 @@ pub enum Outbound {
     /// worthless, so it is never retransmitted — the point of not using the
     /// reliable channel.
     Rumble { client: u32, rumble: Rumble },
+    /// Unreliable, latest-wins rich pad output (packet type 7): motors, adaptive
+    /// triggers, LED. Same reasoning as [`Outbound::Rumble`], for rich pads.
+    PadOutput { client: u32, output: PadOutput },
 }
 
 /// Where authenticated input goes once it has been verified.
@@ -46,6 +51,21 @@ pub enum Outbound {
 /// the injecting does not have to depend on `hyper` to reach the trait.
 pub trait InputSink: Send {
     fn inject(&mut self, client: u32, event: InputEvent);
+
+    /// A client announced a pad. The injector plugs a virtual controller of the
+    /// declared type and readies its encoding session. Default no-op — most sinks
+    /// (tests, `NoInput`) do not manage pads.
+    fn pad_connected(&mut self, _client: u32, _pad_index: u8, _pad_type: u8, _capabilities: u16) {}
+
+    /// A client removed a pad; the injector unplugs it.
+    fn pad_disconnected(&mut self, _client: u32, _pad_index: u8) {}
+
+    /// Server → client messages this sink has produced since the last call — the
+    /// output effects (rumble / adaptive triggers / LED) a game wrote to the pads.
+    /// Drained each tick and handed to the endpoint. Default none.
+    fn drain_outbound(&mut self) -> Vec<Outbound> {
+        Vec::new()
+    }
 }
 
 /// Drops input. What the server uses until an injector is attached.
@@ -83,6 +103,19 @@ pub trait ControlHandler: Send {
     /// Where `sunburst-input` attaches on Windows.
     fn on_input(&mut self, client: u32, event: InputEvent);
 
+    /// A client connected / disconnected a pad. Default no-op — a handler that
+    /// manages virtual controllers (the Windows one) forwards these to its
+    /// [`InputSink`]. Reliable, so a plug or unplug is never lost.
+    fn on_pad_connected(
+        &mut self,
+        _client: u32,
+        _pad_index: u8,
+        _pad_type: u8,
+        _capabilities: u16,
+    ) {
+    }
+    fn on_pad_disconnected(&mut self, _client: u32, _pad_index: u8) {}
+
     fn on_bye(&mut self, client: u32);
 
     /// Server → client messages produced since the last call, for the endpoint
@@ -109,6 +142,8 @@ pub struct Recording {
     pub pair_confirms: Vec<(u32, [u8; TAG_LEN])>,
     pub hellos: Vec<(u32, Hello)>,
     pub inputs: Vec<(u32, InputEvent)>,
+    pub pad_connects: Vec<(u32, u8, u8, u16)>,
+    pub pad_disconnects: Vec<(u32, u8)>,
     pub launches: Vec<u32>,
     pub app_list_calls: usize,
     pub byes: Vec<u32>,
@@ -187,6 +222,21 @@ impl<H: ControlHandler> ControlHandler for std::sync::Arc<std::sync::Mutex<H>> {
         self.lock().expect("not poisoned").on_input(client, event);
     }
 
+    fn on_pad_connected(&mut self, client: u32, pad_index: u8, pad_type: u8, capabilities: u16) {
+        self.lock().expect("not poisoned").on_pad_connected(
+            client,
+            pad_index,
+            pad_type,
+            capabilities,
+        );
+    }
+
+    fn on_pad_disconnected(&mut self, client: u32, pad_index: u8) {
+        self.lock()
+            .expect("not poisoned")
+            .on_pad_disconnected(client, pad_index);
+    }
+
     fn on_bye(&mut self, client: u32) {
         self.lock().expect("not poisoned").on_bye(client);
     }
@@ -239,6 +289,15 @@ impl ControlHandler for Recording {
 
     fn on_input(&mut self, client: u32, event: InputEvent) {
         self.inputs.push((client, event));
+    }
+
+    fn on_pad_connected(&mut self, client: u32, pad_index: u8, pad_type: u8, capabilities: u16) {
+        self.pad_connects
+            .push((client, pad_index, pad_type, capabilities));
+    }
+
+    fn on_pad_disconnected(&mut self, client: u32, pad_index: u8) {
+        self.pad_disconnects.push((client, pad_index));
     }
 
     fn on_bye(&mut self, client: u32) {

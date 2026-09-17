@@ -26,6 +26,7 @@ pub mod auth;
 pub mod control;
 pub mod header;
 pub mod input;
+pub mod padoutput;
 pub mod pairing;
 pub mod rumble;
 pub mod seq;
@@ -36,7 +37,11 @@ pub use control::{
     ServerMessage,
 };
 pub use header::{Flags, HEADER_LEN, Header, MAX_PAYLOAD, PacketType};
-pub use input::{GamepadState, InputEvent, InputKind, InputPacket, MouseButton, MouseMotion};
+pub use input::{
+    Battery, Finger, GamepadState, Imu, InputEvent, InputKind, InputPacket, MouseButton,
+    MouseMotion, Touchpad,
+};
+pub use padoutput::{PAD_OUTPUT_MAX_BODY, PadOutput, TriggerEffect};
 pub use pairing::{PIN_DIGITS, TAG_LEN, confirm_tag, derive_secret, tags_match};
 pub use rumble::{Rumble, RumbleTracker};
 pub use seq::{REPLAY_WINDOW, ReplayWindow, Seq16};

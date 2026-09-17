@@ -26,6 +26,9 @@ pub enum PacketType {
     Nack = 4,
     Feedback = 5,
     Rumble = 6,
+    /// Server→client rich pad output — motors, adaptive triggers, LED (see
+    /// [`super::padoutput`]). Unreliable, latest-wins, like [`PacketType::Rumble`].
+    PadOutput = 7,
 }
 
 impl PacketType {
@@ -38,6 +41,7 @@ impl PacketType {
             4 => PacketType::Nack,
             5 => PacketType::Feedback,
             6 => PacketType::Rumble,
+            7 => PacketType::PadOutput,
             _ => return None,
         })
     }
@@ -45,13 +49,13 @@ impl PacketType {
     /// Whether this type must carry a MAC.
     ///
     /// Input and control are the packets that can make the server act, so they
-    /// are authenticated; rumble is included because it drives hardware on the
-    /// client. Video and audio are not, per CLAUDE.md — LAN-only, and the
-    /// threat model does not justify the key management.
+    /// are authenticated; rumble and pad output are included because they drive
+    /// hardware on the client. Video and audio are not, per CLAUDE.md — LAN-only,
+    /// and the threat model does not justify the key management.
     pub const fn is_authenticated(self) -> bool {
         matches!(
             self,
-            PacketType::Input | PacketType::Control | PacketType::Rumble
+            PacketType::Input | PacketType::Control | PacketType::Rumble | PacketType::PadOutput
         )
     }
 }
@@ -189,7 +193,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_packet_type() {
         let mut buf = [0u8; HEADER_LEN];
-        buf[0] = 7; // one past Rumble
+        buf[0] = 8; // one past PadOutput
         assert_eq!(Header::decode(&buf), None);
         assert_eq!(PacketType::from_u8(255), None);
     }
@@ -219,6 +223,7 @@ mod tests {
         assert!(PacketType::Input.is_authenticated());
         assert!(PacketType::Control.is_authenticated());
         assert!(PacketType::Rumble.is_authenticated());
+        assert!(PacketType::PadOutput.is_authenticated());
         assert!(!PacketType::Video.is_authenticated());
         assert!(!PacketType::Audio.is_authenticated());
     }

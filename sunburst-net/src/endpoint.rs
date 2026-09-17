@@ -52,11 +52,12 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sunburst_core::proto::padoutput::PAD_OUTPUT_MAX_BODY;
 use sunburst_core::proto::pairing::NONCE_LEN;
 use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
 use sunburst_core::proto::{
     ClientControl, ClientMessage, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN, MAX_PAYLOAD,
-    PacketType, ReplayWindow, Rumble, Seq16, ServerControl, SessionKey,
+    PacketType, PadOutput, ReplayWindow, Rumble, Seq16, ServerControl, SessionKey,
 };
 
 use crate::handler::{ControlHandler, Outbound};
@@ -316,6 +317,16 @@ impl<H: ControlHandler> Endpoint<H> {
             ClientControl::LaunchApp { app_id } => {
                 let _ = self.handler.on_launch(app_id);
             }
+            ClientControl::PadConnected {
+                pad_index,
+                pad_type,
+                capabilities,
+            } => self
+                .handler
+                .on_pad_connected(client, pad_index, pad_type, capabilities),
+            ClientControl::PadDisconnected { pad_index } => {
+                self.handler.on_pad_disconnected(client, pad_index)
+            }
             ClientControl::Bye => {
                 self.handler.on_bye(client);
                 self.forget(client);
@@ -427,6 +438,24 @@ impl<H: ControlHandler> Endpoint<H> {
         self.transmit(session.addr, &body, Some(&session.key), PacketType::Rumble);
     }
 
+    /// Send one rich pad-output packet, unreliably (`type=7`, authenticated).
+    /// Same latest-wins reasoning as [`Self::send_rumble`], for rich pads.
+    fn send_pad_output(&self, client: u32, output: &PadOutput) {
+        let Some(session) = self.sessions.get(&client) else {
+            return;
+        };
+        let mut body = [0u8; PAD_OUTPUT_MAX_BODY];
+        let Some(n) = output.encode(&mut body) else {
+            return;
+        };
+        self.transmit(
+            session.addr,
+            &body[..n],
+            Some(&session.key),
+            PacketType::PadOutput,
+        );
+    }
+
     /// Send whatever a producer queued since the last tick.
     ///
     /// The one place server-originated messages reach the socket; producers run
@@ -436,6 +465,7 @@ impl<H: ControlHandler> Endpoint<H> {
             match message {
                 Outbound::Control { client, message } => self.send_to_client(client, &message),
                 Outbound::Rumble { client, rumble } => self.send_rumble(client, &rumble),
+                Outbound::PadOutput { client, output } => self.send_pad_output(client, &output),
             }
         }
     }
