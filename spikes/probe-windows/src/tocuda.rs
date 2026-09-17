@@ -34,7 +34,7 @@ use std::ffi::c_void;
 use sunburst_core::instr::clock;
 
 use crate::capture::{Capture, FrameGrabInfo, sample_hash};
-use crate::cuda::{CUDA_SUCCESS, Cuda, CuContext, CuDevicePtr};
+use crate::cuda::{CUDA_SUCCESS, CuContext, CuDevicePtr, Cuda};
 use crate::nvfbc::{self, result_name};
 
 /// `NVFBC_SHARED_CUDA` at `NVFBC_DLL_VERSION 0x70`.
@@ -361,7 +361,9 @@ pub fn run(session: &mut ToCuda, count: u32, blocking: bool) -> Capture {
     }
 
     result.elapsed_ns = clock::ticks_to_ns(clock::now() - started);
-    result.overhead_ns = result.elapsed_ns.saturating_sub(per_grab.iter().sum::<u64>());
+    result.overhead_ns = result
+        .elapsed_ns
+        .saturating_sub(per_grab.iter().sum::<u64>());
 
     per_grab.sort_unstable();
     if !per_grab.is_empty() {

@@ -62,9 +62,9 @@ mod tocuda;
 #[cfg(windows)]
 mod tosys;
 #[cfg(windows)]
-mod xinput;
-#[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod xinput;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {

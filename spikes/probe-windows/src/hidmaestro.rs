@@ -97,7 +97,9 @@ const _: () = assert!(OUTPUT_SIZE == 16904);
 /// do with whether the approach works.
 fn elevated() -> Option<bool> {
     use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let mut token = HANDLE::default();
@@ -264,7 +266,11 @@ impl Drop for Section {
 /// writer — which is what makes the delta a usable check rather than noise.
 fn submit(input: &Section, doorbell: Option<&Doorbell>, report: &[u8]) -> bool {
     let base = input.read_u32(IN_SEQNO);
-    let start = if base.is_multiple_of(2) { base } else { base.wrapping_add(1) };
+    let start = if base.is_multiple_of(2) {
+        base
+    } else {
+        base.wrapping_add(1)
+    };
 
     input.write_u32(IN_SEQNO, start.wrapping_add(1));
     let len = report.len().min(IN_DATA_CAPACITY);
@@ -470,8 +476,11 @@ pub fn run() {
 
     // Drive the lowest index that has an input section, rather than assuming 0.
     let input_index = |names: &[String]| {
-        (0..SURVEY_INDICES)
-            .find(|i| names.iter().any(|n| n == &format!("Global\\HIDMaestroInput{i}")))
+        (0..SURVEY_INDICES).find(|i| {
+            names
+                .iter()
+                .any(|n| n == &format!("Global\\HIDMaestroInput{i}"))
+        })
     };
 
     let index = match input_index(&found) {
@@ -519,11 +528,18 @@ pub fn run() {
     println!("  driving controller index {index}");
 
     let input = Section::open(&format!("Global\\HIDMaestroInput{index}"), true, INPUT_SIZE);
-    let output = Section::open(&format!("Global\\HIDMaestroOutput{index}"), false, OUTPUT_SIZE);
+    let output = Section::open(
+        &format!("Global\\HIDMaestroOutput{index}"),
+        false,
+        OUTPUT_SIZE,
+    );
 
     let input = match input {
         Ok(section) => {
-            println!("  input  section: open, SeqNo {}", section.read_u32(IN_SEQNO));
+            println!(
+                "  input  section: open, SeqNo {}",
+                section.read_u32(IN_SEQNO)
+            );
             section
         }
         Err(e) => {
@@ -541,7 +557,10 @@ pub fn run() {
 
     let output = match output {
         Ok(section) => {
-            println!("  output section: open, Head {}", section.read_u32(OUT_HEAD));
+            println!(
+                "  output section: open, Head {}",
+                section.read_u32(OUT_HEAD)
+            );
             Some(section)
         }
         Err(e) => {
@@ -598,9 +617,7 @@ pub fn run() {
     println!("  our {FRAMES} writes account for ~{ours} of that");
     if moved > ours {
         let others = moved - ours;
-        println!(
-            "  -> ~{others} increments came from elsewhere: PadForge is submitting for this",
-        );
+        println!("  -> ~{others} increments came from elsewhere: PadForge is submitting for this",);
         println!("     pad too. Expected, and it is why the read-back below matters more than");
         println!("     anything joy.cpl shows.");
     }

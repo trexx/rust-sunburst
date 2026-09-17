@@ -395,9 +395,7 @@ pub fn probe(attempt_enable: bool) -> Report {
 
     // Optional, explicit, and last of the pre-create steps: it toggles the
     // feature on for the whole machine and resets the display driver doing it.
-    if attempt_enable
-        && let Some(p) = symbol(module, "NvFBC_Enable")
-    {
+    if attempt_enable && let Some(p) = symbol(module, "NvFBC_Enable") {
         // SAFETY: signature transcribed from nvFBC.h.
         let f: PfnEnable = unsafe { cast_fn(p) };
         // SAFETY: takes an NVFBC_STATE by value and returns a result code.

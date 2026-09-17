@@ -152,7 +152,11 @@ fn measure_sys(label: &str, variant: crate::tosys::Variant, ten_bit: bool, hdr: 
 /// Deliberately comparative. An NvFBC frame rate on its own says nothing, since
 /// a static desktop produces few unique frames however fast the calls return —
 /// so this runs DDA over the same wall-clock window and compares.
-fn interpret_capture(iface: &str, polled: &crate::capture::Capture, blocked: &crate::capture::Capture) {
+fn interpret_capture(
+    iface: &str,
+    polled: &crate::capture::Capture,
+    blocked: &crate::capture::Capture,
+) {
     // A static desktop yields few unique frames however fast the calls return,
     // so unique-per-second is the honest rate, not raw call rate.
     let unique_fps = blocked.unique as f64 * 1e9 / blocked.elapsed_ns.max(1) as f64;
@@ -190,12 +194,18 @@ fn interpret_capture(iface: &str, polled: &crate::capture::Capture, blocked: &cr
 
     println!();
     if blocked.unique < MIN_UNIQUE_FOR_VERDICT {
-        println!("      -> INCONCLUSIVE. Only {} unique frame(s) in the window, so both", blocked.unique);
+        println!(
+            "      -> INCONCLUSIVE. Only {} unique frame(s) in the window, so both",
+            blocked.unique
+        );
         println!("         numbers measure how often the screen changed, not how fast either");
         println!("         path can capture. No verdict is drawn from this.");
         println!();
         if blocked.unique <= 2 && dda.fps() > 10.0 {
-            println!("         NOTE: DDA saw {:.0} new frames/sec over the same window, so the", dda.fps());
+            println!(
+                "         NOTE: DDA saw {:.0} new frames/sec over the same window, so the",
+                dda.fps()
+            );
             println!("         screen was NOT static -- this capture path is frozen while the");
             println!("         desktop moves. On an HDR desktop that is what 8-bit ARGB does:");
             println!("         it returns one stale frame forever rather than failing. Use");
@@ -300,9 +310,7 @@ multi_head {}, cfg_diffmap {}, classification {}, iface v{}",
         }
     }
 
-    let worked = |c: &Option<crate::nvfbc::Create>| {
-        c.as_ref().is_some_and(|c| c.succeeded)
-    };
+    let worked = |c: &Option<crate::nvfbc::Create>| c.as_ref().is_some_and(|c| c.succeeded);
     // Decide the verdict from the create results *before* anything consumes
     // them. An earlier version took them first and then tested the emptied
     // Options, which reported "CreateEx refused" directly under a line saying it

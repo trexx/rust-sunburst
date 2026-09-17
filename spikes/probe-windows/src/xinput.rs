@@ -171,7 +171,11 @@ pub fn run() {
         // How much of the run was continuous. A stick held off-centre reports at
         // the pad's full rate; every pause shows up as an outlier, and without
         // this the tail reads as link jitter when it is just idle time.
-        let near = pad.gaps.iter().filter(|g| **g <= p50.saturating_mul(2)).count();
+        let near = pad
+            .gaps
+            .iter()
+            .filter(|g| **g <= p50.saturating_mul(2))
+            .count();
         let continuity = near as f64 * 100.0 / pad.gaps.len() as f64;
         println!("           {continuity:.0}% of gaps within 2x p50");
         if continuity < 90.0 {

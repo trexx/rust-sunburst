@@ -342,8 +342,12 @@ pub fn run() {
                         println!(
                             "  {name}: sees NO signal -- {frames} frames, {errors} errors, 0 changes"
                         );
-                        println!("          Expected ~{expected} changes in {VALIDATE_SECS}s. Either the window is");
-                        println!("          covered, or this backend is capturing a different monitor.");
+                        println!(
+                            "          Expected ~{expected} changes in {VALIDATE_SECS}s. Either the window is"
+                        );
+                        println!(
+                            "          covered, or this backend is capturing a different monitor."
+                        );
                         println!("          No latency reported: there is nothing to time.");
                         return;
                     }
@@ -351,15 +355,17 @@ pub fn run() {
                         println!(
                             "  {name}: {transitions} changes in {VALIDATE_SECS}s, expected ~{expected}."
                         );
-                        println!("          Something other than the presenter is changing at the read");
+                        println!(
+                            "          Something other than the presenter is changing at the read"
+                        );
                         println!("          point, so samples below may be timing that instead.");
                     }
 
                     let measured = measure(signal, w, LATENCY_SECS);
                     report(name, &measured);
                 });
-                let presents = signal.presents.load(std::sync::atomic::Ordering::Relaxed)
-                    - presents_before;
+                let presents =
+                    signal.presents.load(std::sync::atomic::Ordering::Relaxed) - presents_before;
                 println!();
                 println!("  presenter issued {presents} presents while the above ran.");
             }

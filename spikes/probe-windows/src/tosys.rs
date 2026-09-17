@@ -539,7 +539,9 @@ pub fn run(session: &mut ToSys, count: u32, blocking: bool) -> Capture {
     }
 
     result.elapsed_ns = clock::ticks_to_ns(clock::now() - started);
-    result.overhead_ns = result.elapsed_ns.saturating_sub(per_grab.iter().sum::<u64>());
+    result.overhead_ns = result
+        .elapsed_ns
+        .saturating_sub(per_grab.iter().sum::<u64>());
 
     per_grab.sort_unstable();
     if !per_grab.is_empty() {
@@ -552,4 +554,3 @@ pub fn run(session: &mut ToSys, count: u32, blocking: bool) -> Capture {
 
     result
 }
-

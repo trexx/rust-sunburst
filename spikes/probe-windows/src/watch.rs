@@ -42,14 +42,17 @@ pub trait Watcher {
     fn poll(&mut self, out: &mut [u8; SAMPLE_BYTES]) -> Result<bool, String>;
 }
 
-fn create_device(adapter: Option<&IDXGIAdapter1>) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+fn create_device(
+    adapter: Option<&IDXGIAdapter1>,
+) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
     // SAFETY: standard D3D11 setup; both out parameters are valid. The driver
     // type must be UNKNOWN when an adapter is supplied and HARDWARE when not.
     unsafe {
         D3D11CreateDevice(
-            adapter.map(|a| a.cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter>())
+            adapter
+                .map(|a| a.cast::<windows::Win32::Graphics::Dxgi::IDXGIAdapter>())
                 .transpose()
                 .map_err(|e| format!("IDXGIAdapter: {e}"))?
                 .as_ref(),
@@ -130,7 +133,10 @@ impl Watcher for Dda {
 
         let sampled = resource
             .ok_or_else(|| "AcquireNextFrame returned no resource".to_string())
-            .and_then(|r| r.cast::<ID3D11Texture2D>().map_err(|e| format!("texture: {e}")))
+            .and_then(|r| {
+                r.cast::<ID3D11Texture2D>()
+                    .map_err(|e| format!("texture: {e}"))
+            })
             .and_then(|texture| self.read.sample(&texture, self.x, self.y, out));
 
         // Owed exactly one release per successful acquire, whatever the sample
@@ -161,8 +167,9 @@ impl Wgc {
         // SAFETY: `dxgi` is a live IDXGIDevice.
         let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
             .map_err(|e| format!("CreateDirect3D11DeviceFromDXGIDevice: {e}"))?;
-        let winrt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice =
-            inspectable.cast().map_err(|e| format!("IDirect3DDevice: {e}"))?;
+        let winrt_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice = inspectable
+            .cast()
+            .map_err(|e| format!("IDirect3DDevice: {e}"))?;
 
         // The monitor the presenter's window is on. Capture is per-monitor, and
         // an item for the wrong one would simply never show the signal.

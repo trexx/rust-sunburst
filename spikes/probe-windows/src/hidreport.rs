@@ -35,8 +35,8 @@ use windows::Win32::Devices::HumanInterfaceDevice::{
 };
 use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, ReadFile,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -105,8 +105,7 @@ fn describe(path: &str) -> Option<Device> {
             name.as_mut_ptr().cast(),
             u32::try_from(size_of_val(&name)).expect("fits"),
         )
-    }
-    ;
+    };
 
     // The input report length decides how big a ReadFile buffer has to be; too
     // small and every read fails rather than returning a short report.
@@ -187,7 +186,9 @@ fn enumerate() -> Vec<Device> {
             continue;
         }
         let mut buffer = vec![0u8; needed as usize];
-        let detail = buffer.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+        let detail = buffer
+            .as_mut_ptr()
+            .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
         // SAFETY: `buffer` is at least `needed` bytes and correctly aligned for
         // the struct, whose cbSize must be the struct header size, not `needed`.
         unsafe {
@@ -196,14 +197,7 @@ fn enumerate() -> Vec<Device> {
         }
         // SAFETY: as above; the call fills the path at the struct's tail.
         if unsafe {
-            SetupDiGetDeviceInterfaceDetailW(
-                set,
-                &interface,
-                Some(detail),
-                needed,
-                None,
-                None,
-            )
+            SetupDiGetDeviceInterfaceDetailW(set, &interface, Some(detail), needed, None, None)
         }
         .is_err()
         {
@@ -233,7 +227,7 @@ fn enumerate() -> Vec<Device> {
 /// and the timeout could never be reached. It froze rather than reporting that
 /// nothing arrived, which is the one outcome the caller most needs told.
 fn measure(device: &Device, secs: u64) -> Vec<u64> {
-    use windows::Win32::Foundation::{GetLastError, ERROR_IO_PENDING, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{ERROR_IO_PENDING, GetLastError, WAIT_OBJECT_0};
     use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -272,7 +266,12 @@ fn measure(device: &Device, secs: u64) -> Vec<u64> {
         // SAFETY: `buffer` is at least the input report length, `overlapped`
         // outlives the operation, and the handle was opened overlapped.
         let started = unsafe {
-            ReadFile(handle, Some(buffer.as_mut_slice()), None, Some(&mut overlapped))
+            ReadFile(
+                handle,
+                Some(buffer.as_mut_slice()),
+                None,
+                Some(&mut overlapped),
+            )
         };
         if started.is_err() {
             // SAFETY: reading a thread-local error code.
@@ -284,7 +283,9 @@ fn measure(device: &Device, secs: u64) -> Vec<u64> {
         // Wait only as long as is left, so the total honours `secs` even when
         // the device is silent.
         let remaining_ns = clock::ticks_to_ns(deadline.saturating_sub(clock::now()));
-        let wait_ms = u32::try_from(remaining_ns / 1_000_000).unwrap_or(u32::MAX).max(1);
+        let wait_ms = u32::try_from(remaining_ns / 1_000_000)
+            .unwrap_or(u32::MAX)
+            .max(1);
         // SAFETY: `event` is live; the wait is bounded.
         let waited = unsafe { WaitForSingleObject(event, wait_ms) };
         if waited != WAIT_OBJECT_0 {
@@ -345,9 +346,7 @@ pub fn run() {
     // identifier -- a keyboard here shows five -- while enumeration order is not
     // guaranteed stable between runs, so a number is only meaningful against the
     // listing that produced it.
-    let arg = std::env::args()
-        .skip_while(|a| a != "--hidreport")
-        .nth(1);
+    let arg = std::env::args().skip_while(|a| a != "--hidreport").nth(1);
 
     let timeable = |d: &&Device| d.input_len > 0;
     let list = |devices: &[Device]| {

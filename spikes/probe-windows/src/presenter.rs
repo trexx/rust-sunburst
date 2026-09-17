@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use sunburst_core::instr::clock;
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -45,21 +46,18 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-    DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGIFactory5,
-    IDXGISwapChain1,
+    DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGIFactory5, IDXGISwapChain1,
 };
-use windows::Win32::Foundation::RECT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowRect,
-    IsWindowVisible, MSG,
-    PM_REMOVE, PeekMessageW, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage, WNDCLASSW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_SHOW, ShowWindow,
+    TranslateMessage, WNDCLASSW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{BOOL, Interface, w};
 
@@ -191,8 +189,8 @@ fn create_window() -> Result<HWND, String> {
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
     // SAFETY: the current module's handle; passing None asks for the exe.
-    let instance = unsafe { GetModuleHandleW(None) }
-        .map_err(|e| format!("GetModuleHandleW: {e}"))?;
+    let instance =
+        unsafe { GetModuleHandleW(None) }.map_err(|e| format!("GetModuleHandleW: {e}"))?;
 
     let class = w!("sunburst_presenter");
     let wc = WNDCLASSW {
@@ -267,8 +265,8 @@ fn create_swapchain(hwnd: HWND, uncapped: bool) -> Result<Swapchain, String> {
     // SAFETY: standard DXGI/D3D11 setup; every interface is refcounted by
     // `windows` and released on drop.
     unsafe {
-        let factory: IDXGIFactory2 =
-            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
+        let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+            .map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
 
         // Tearing is what lets Present exceed the refresh rate. Without it the
         // stress mode measures the panel, not the paths.
@@ -407,9 +405,12 @@ fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<
             // first version also skipped it silently, and silently not painting
             // is indistinguishable from having no window.
             signal.render_errors.fetch_add(1, Ordering::Relaxed);
-            let _ = signal
-                .first_hr
-                .compare_exchange(0, e.code().0, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = signal.first_hr.compare_exchange(
+                0,
+                e.code().0,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             continue;
         }
 
@@ -449,5 +450,7 @@ fn run(signal: &Arc<Signal>, mode: Mode, ready: &std::sync::mpsc::Sender<Result<
     // screen. Thread exit would destroy it anyway; being explicit means the
     // stress phase's window is unambiguously a new one.
     // SAFETY: `hwnd` belongs to this thread and is destroyed exactly once.
-    unsafe { let _ = DestroyWindow(hwnd); }
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
 }
