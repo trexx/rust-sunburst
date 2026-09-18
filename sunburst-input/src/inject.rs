@@ -29,6 +29,7 @@
 //! expected rather than an error, and matches capture, which cannot see it
 //! either.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -41,7 +42,7 @@ use sunburst_net::{InputSink, Outbound};
 use crate::pad::codec::DecodedValue;
 use crate::pad::outpolicy::RepeatPolicy;
 use crate::pad::session::PadSession;
-use crate::pad::{gip, registry, shmem};
+use crate::pad::{device, gip, install, registry, shmem};
 
 /// What crosses the channel to the injector thread. The pad sections live on that
 /// one thread, so pad lifecycle rides the same channel as input.
@@ -105,7 +106,12 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn start() -> std::io::Result<Injector> {
+    /// Start the injector thread. `driver_inf`, when set, points at the vendored
+    /// `hidmaestro.inf`; the thread stages that driver and creates a real device
+    /// node per connected pad so games enumerate it. `None` keeps the pre-driver
+    /// behaviour — sections are mapped but no node is created (useful before the
+    /// driver artifact is provisioned, and on a box without it).
+    pub fn start(driver_inf: Option<PathBuf>) -> std::io::Result<Injector> {
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
         let stats = Arc::new(Stats::default());
         let outbound = Arc::new(Mutex::new(Vec::new()));
@@ -114,7 +120,7 @@ impl Injector {
 
         let thread = std::thread::Builder::new()
             .name("sunburst-input".into())
-            .spawn(move || run(rx, &thread_stats, &thread_outbound))?;
+            .spawn(move || run(rx, &thread_stats, &thread_outbound, driver_inf))?;
 
         Ok(Injector {
             tx,
@@ -188,9 +194,40 @@ struct PadState {
     policy: RepeatPolicy,
     /// The last effect sent, re-sent on repeat so a dropped packet self-heals.
     last_effect: Option<Outbound>,
+    /// The virtual device node, when a driver was available to create one. Held
+    /// only for its `Drop`: clearing the slot on disconnect (or reusing it)
+    /// removes the pad from the OS. Never read, hence the allow.
+    #[allow(dead_code)]
+    node: Option<device::PadNode>,
 }
 
-fn run(rx: Receiver<Msg>, stats: &Stats, outbound: &Arc<Mutex<Vec<Outbound>>>) {
+fn run(
+    rx: Receiver<Msg>,
+    stats: &Stats,
+    outbound: &Arc<Mutex<Vec<Outbound>>>,
+    driver_inf: Option<PathBuf>,
+) {
+    // Stage the driver once. If it is missing or the store install fails (no
+    // elevation, unsigned on a non-test-signed box), pads still map their
+    // sections — they just will not be enumerated. Report, don't abort.
+    if let Some(inf) = driver_inf.as_deref() {
+        if let Err(e) = install::ensure_installed(inf) {
+            eprintln!("sunburst-input: driver install failed, pads will not enumerate: {e}");
+        }
+        // The XUSB companion (Xbox 360) is bound by hidmaestro_xusb.inf; install
+        // it too when it sits beside the main INF. Best-effort — HID pads do not
+        // need it.
+        if let Some(xusb) = inf.parent().map(|d| d.join("hidmaestro_xusb.inf"))
+            && xusb.exists()
+            && let Err(e) = install::ensure_installed(&xusb)
+        {
+            eprintln!(
+                "sunburst-input: XUSB driver install failed, Xbox 360 pads may not enumerate: {e}"
+            );
+        }
+    }
+    let driver_inf = driver_inf.as_deref();
+
     let mut desktop = Desktop::default();
     let mut modifiers = Modifiers::new();
     let mut pads: [Option<PadState>; MAX_PADS as usize] = std::array::from_fn(|_| None);
@@ -210,7 +247,7 @@ fn run(rx: Receiver<Msg>, stats: &Stats, outbound: &Arc<Mutex<Vec<Outbound>>>) {
                 client,
                 pad_index,
                 pad_type,
-            }) => connect_pad(&mut pads, client, pad_index, pad_type),
+            }) => connect_pad(&mut pads, client, pad_index, pad_type, driver_inf),
             Ok(Msg::PadDisconnected { pad_index }) => {
                 if let Some(slot) = pads.get_mut(pad_index as usize) {
                     *slot = None;
@@ -240,13 +277,23 @@ fn run(rx: Receiver<Msg>, stats: &Stats, outbound: &Arc<Mutex<Vec<Outbound>>>) {
 }
 
 /// Plug a virtual pad: build its session and create the driver's shared sections.
-/// (The device *node* is `device.rs`, held back — so until then this writes into
-/// sections no driver serves, the expected pre-`device.rs` state.)
-fn connect_pad(pads: &mut [Option<PadState>], client: u32, pad_index: u8, pad_type: u8) {
+/// Map the pad's shared sections, build its encoding session, and — when a driver
+/// is available — create the virtual device node so a game enumerates it. The
+/// sections are created *before* the node so the driver finds them when it binds.
+fn connect_pad(
+    pads: &mut [Option<PadState>],
+    client: u32,
+    pad_index: u8,
+    pad_type: u8,
+    driver_inf: Option<&Path>,
+) {
     let Some(slot) = pads.get_mut(pad_index as usize) else {
         return;
     };
-    let Some(session) = registry::session_for(pad_type) else {
+    let Some(profile) = registry::profile_for(pad_type) else {
+        return;
+    };
+    let Ok(session) = PadSession::new(&profile) else {
         return;
     };
     let (Ok(input), Ok(output), Ok(doorbell)) = (
@@ -256,6 +303,21 @@ fn connect_pad(pads: &mut [Option<PadState>], client: u32, pad_index: u8, pad_ty
     ) else {
         return;
     };
+
+    // Create the device node last, and only if a driver is provisioned. A
+    // failure here (unsupported Xbox path, not elevated, driver missing) leaves
+    // the pad's data path intact but unenumerated — reported, not fatal.
+    let node = driver_inf.and_then(|inf| {
+        let spec = device::PadNodeSpec::from_profile(&profile, pad_index)?;
+        match device::create(&spec, inf) {
+            Ok(node) => Some(node),
+            Err(e) => {
+                eprintln!("sunburst-input: pad {pad_index} node not created: {e}");
+                None
+            }
+        }
+    });
+
     *slot = Some(PadState {
         client,
         session,
@@ -265,6 +327,7 @@ fn connect_pad(pads: &mut [Option<PadState>], client: u32, pad_index: u8, pad_ty
         out_seen: 0,
         policy: RepeatPolicy::new(),
         last_effect: None,
+        node,
     });
 }
 

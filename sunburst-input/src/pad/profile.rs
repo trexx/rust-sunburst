@@ -21,12 +21,24 @@ use super::spec::ReportSpec;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Profile {
     pub id: String,
+    /// Human-readable device name, shown in Device Manager / joy.cpl when the
+    /// virtual pad is created. Optional in the JSON; falls back to `id`.
+    #[serde(rename = "productString", default)]
+    pub product_string: Option<String>,
     /// USB vendor id, `"0x045E"` etc.
     #[serde(default)]
     pub vid: Option<String>,
     /// USB product id.
     #[serde(default)]
     pub pid: Option<String>,
+    /// Alternate PID the *driver* matches on (xinputhid's INF wants `0x02FF`);
+    /// apps still read the real `pid` via HID attributes.
+    #[serde(rename = "driverPid", default)]
+    pub driver_pid: Option<String>,
+    /// `"xinputhid"` / `"xusb22"` route the pad through an upper-filter companion
+    /// (Xbox Series family); absent means a plain HID device.
+    #[serde(rename = "driverMode", default)]
+    pub driver_mode: Option<String>,
     /// Raw HID report descriptor, as a hex string.
     #[serde(default)]
     pub descriptor: String,
@@ -91,6 +103,12 @@ impl Profile {
         Some(pairs)
     }
 
+    /// The name to show for the created device: the profile's `productString`
+    /// when it has one, else its `id`.
+    pub fn display_name(&self) -> &str {
+        self.product_string.as_deref().unwrap_or(&self.id)
+    }
+
     /// The USB vendor id, decoded.
     pub fn vid_u16(&self) -> Option<u16> {
         self.vid.as_deref().and_then(parse_usage)
@@ -99,6 +117,30 @@ impl Profile {
     /// The USB product id, decoded.
     pub fn pid_u16(&self) -> Option<u16> {
         self.pid.as_deref().and_then(parse_usage)
+    }
+
+    /// The PID used to form the hardware ID the driver INF matches — `driverPid`
+    /// when the profile overrides it (xinputhid), else the real `pid`.
+    pub fn driver_hw_pid(&self) -> Option<u16> {
+        self.driver_pid
+            .as_deref()
+            .and_then(parse_usage)
+            .or_else(|| self.pid_u16())
+    }
+
+    /// Whether this pad routes through the xinputhid / xusb22 upper-filter path
+    /// (Xbox Series) rather than a plain HID node.
+    pub fn uses_upper_filter(&self) -> bool {
+        matches!(
+            self.driver_mode.as_deref(),
+            Some("xinputhid") | Some("xusb22")
+        )
+    }
+
+    /// Whether this pad needs the XUSB companion (the Xbox 360 wired family):
+    /// Microsoft VID and not an upper-filter pad.
+    pub fn requires_xusb_companion(&self) -> bool {
+        self.vid_u16() == Some(0x045E) && !self.uses_upper_filter()
     }
 
     /// `triggerButtons` as a fixed pair, when it has at least two entries.

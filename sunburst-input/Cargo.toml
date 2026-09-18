@@ -26,4 +26,11 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Threading",
     "Win32_Security",
+    # Virtual-pad device creation: stage the INF into the driver store and
+    # register a ROOT-enumerated HID node the HIDMaestro UMDF2 driver binds to.
+    "Win32_Devices_DeviceAndDriverInstallation",
+    # SwDeviceCreate, for the SWD-enumerated Xbox companion device.
+    "Win32_Devices_Enumeration_Pnp",
+    "Win32_Devices_Properties",
+    "Win32_System_Registry",
 ] }

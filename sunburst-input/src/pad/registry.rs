@@ -60,6 +60,11 @@ impl PadType {
         }
     }
 
+    /// Parse this family's vendored profile.
+    pub fn profile(self) -> Option<Profile> {
+        Profile::from_json(self.profile_json()).ok()
+    }
+
     /// Build a session for this family.
     pub fn session(self) -> Result<PadSession, SessionError> {
         let profile = Profile::from_json(self.profile_json())
@@ -72,6 +77,12 @@ impl PadType {
 /// server plugs nothing rather than guessing).
 pub fn session_for(pad_type: u8) -> Option<PadSession> {
     PadType::from_u8(pad_type)?.session().ok()
+}
+
+/// The vendored profile for a wire `pad_type` — the identity (VID/PID, name) the
+/// virtual device node is created from. `None` for an unknown code.
+pub fn profile_for(pad_type: u8) -> Option<Profile> {
+    PadType::from_u8(pad_type)?.profile()
 }
 
 #[cfg(test)]

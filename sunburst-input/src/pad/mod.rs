@@ -15,6 +15,12 @@
 pub mod codec;
 pub mod gip;
 pub mod hid;
+// Virtual-pad device lifecycle on the box: stage the driver, create the node.
+// Windows-only (SetupAPI/CfgMgr), like `inject`.
+#[cfg(windows)]
+pub mod device;
+#[cfg(windows)]
+pub mod install;
 pub mod layout;
 pub mod map;
 pub mod outpolicy;
