@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,12 @@ pub fn run(
     window: NativeWindow,
     stop: Arc<AtomicBool>,
     input_rx: Receiver<ClientInput>,
+    client_tid: Arc<AtomicI32>,
 ) {
+    // Publish our tid so the Java PerformanceHintManager can target this thread.
+    // SAFETY: gettid takes no arguments and cannot fail.
+    let tid = unsafe { libc::gettid() };
+    client_tid.store(tid, Ordering::Relaxed);
     if let Err(e) = run_inner(server, secret, codecs, &window, &stop, &input_rx) {
         log::error!("client stopped: {e}");
     }
@@ -117,6 +122,7 @@ fn run_inner(
         config.height as i32,
         fps,
         &csd0,
+        config.hdr,
         window,
     )?;
 

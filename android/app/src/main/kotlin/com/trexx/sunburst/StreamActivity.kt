@@ -4,7 +4,10 @@ package com.trexx.sunburst
 import android.app.Activity
 import android.content.Intent
 import android.media.MediaCodecList
+import android.os.Build
 import android.os.Bundle
+import android.os.PerformanceHintManager
+import android.os.PerformanceHintManager.Session
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -24,6 +27,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     private var handle: Long = 0
     private var surface: Surface? = null
     private lateinit var view: SurfaceView
+    private var hintSession: Session? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,11 +58,27 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        if (handle != 0L) nativeSurfaceChanged(handle, holder.surface)
+        if (handle == 0L) return
+        nativeSurfaceChanged(handle, holder.surface)
+        // Tell the compositor the content cadence (4K60 workload).
+        holder.surface.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        startPerformanceHint()
+    }
+
+    /** Ask the scheduler to favour the client thread for a ~16.6 ms frame budget.
+     *  A real win on the Amlogic's small cores; API 31+. */
+    private fun startPerformanceHint() {
+        if (hintSession != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        val tid = nativeClientTid(handle)
+        if (tid == 0) return
+        val phm = getSystemService(PerformanceHintManager::class.java) ?: return
+        hintSession = phm.createHintSession(intArrayOf(tid), 16_666_666L)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         surface = null
+        hintSession?.close()
+        hintSession = null
         if (handle != 0L) {
             nativeStop(handle)
             handle = 0
@@ -162,6 +182,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeStart(surface: Surface, host: String, port: Int, secretHex: String, codecs: Int): Long
     private external fun nativeStop(handle: Long)
     private external fun nativeSurfaceChanged(handle: Long, surface: Surface)
+    private external fun nativeClientTid(handle: Long): Int
     private external fun nativeKey(handle: Long, code: Int, down: Boolean, meta: Int)
     private external fun nativeMouseMove(handle: Long, dx: Float, dy: Float)
     private external fun nativeMouseButton(handle: Long, code: Int, down: Boolean)

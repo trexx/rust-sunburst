@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
@@ -30,6 +30,9 @@ pub struct Client {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     input_tx: Sender<ClientInput>,
+    /// The client thread's OS tid, set once it starts, so the Java
+    /// PerformanceHintManager can target that thread. 0 until set.
+    client_tid: Arc<AtomicI32>,
 }
 
 impl Client {
@@ -113,9 +116,21 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
     let thread_stop = Arc::clone(&stop);
     let codecs = codecs as u8;
     let (input_tx, input_rx) = mpsc::channel();
+    let client_tid = Arc::new(AtomicI32::new(0));
+    let thread_tid = Arc::clone(&client_tid);
     let thread = std::thread::Builder::new()
         .name("sunburst-client".into())
-        .spawn(move || client::run(server, secret, codecs, window, thread_stop, input_rx))
+        .spawn(move || {
+            client::run(
+                server,
+                secret,
+                codecs,
+                window,
+                thread_stop,
+                input_rx,
+                thread_tid,
+            )
+        })
         .ok();
 
     log::info!("client started for {server}");
@@ -123,7 +138,24 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
         stop,
         thread,
         input_tx,
+        client_tid,
     })) as jlong
+}
+
+/// The client thread's OS tid, for the Java PerformanceHintManager to target.
+/// 0 until the thread has started.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeClientTid(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    if handle == 0 {
+        return 0;
+    }
+    // SAFETY: `handle` is a live `Client` from `nativeStart`.
+    let client = unsafe { &*(handle as *const Client) };
+    client.client_tid.load(Ordering::Relaxed)
 }
 
 /// Stop and free a client started by `nativeStart`.

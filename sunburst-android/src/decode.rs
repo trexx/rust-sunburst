@@ -16,7 +16,9 @@ use ndk::media::media_codec::{
 };
 use ndk::native_window::NativeWindow;
 use sunburst_core::instr::{self, Stage};
-use sunburst_core::proto::StreamCodec;
+use sunburst_core::proto::{HdrMastering, StreamCodec};
+
+use crate::hdr_static_info::hdr_static_info;
 
 /// A configured, started decoder rendering to a Surface.
 pub struct Decoder {
@@ -27,12 +29,14 @@ impl Decoder {
     /// Build and start a decoder for `codec` at `width`×`height`, fed `csd0`
     /// (HEVC VPS/SPS/PPS Annex-B, or the AV1 av1C record) and rendering into
     /// `surface`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         codec: StreamCodec,
         width: i32,
         height: i32,
         fps: i32,
         csd0: &[u8],
+        hdr: Option<HdrMastering>,
         surface: &NativeWindow,
     ) -> Result<Decoder, String> {
         let mime = match codec {
@@ -50,6 +54,19 @@ impl Decoder {
         fmt.set_i32("low-latency", 1);
         fmt.set_i32("priority", 0);
         fmt.set_i32("operating-rate", fps.max(60) * 2);
+
+        // HDR10: BT.2020 primaries, PQ transfer, and the mastering metadata when
+        // the server supplied it. (It rides in the bitstream too; this is the
+        // out-of-band copy MediaCodec/​the display can also read.)
+        if let Some(m) = hdr {
+            const COLOR_STANDARD_BT2020: i32 = 6;
+            const COLOR_TRANSFER_ST2084: i32 = 6;
+            const COLOR_RANGE_LIMITED: i32 = 2;
+            fmt.set_i32("color-standard", COLOR_STANDARD_BT2020);
+            fmt.set_i32("color-transfer", COLOR_TRANSFER_ST2084);
+            fmt.set_i32("color-range", COLOR_RANGE_LIMITED);
+            fmt.set_buffer("hdr-static-info", &hdr_static_info(&m));
+        }
 
         let codec =
             MediaCodec::from_decoder_type(mime).ok_or_else(|| format!("no decoder for {mime}"))?;
