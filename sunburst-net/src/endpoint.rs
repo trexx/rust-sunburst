@@ -133,7 +133,13 @@ pub struct Endpoint<H: ControlHandler> {
 
 impl<H: ControlHandler> Endpoint<H> {
     pub fn bind(addr: SocketAddr, handler: H) -> io::Result<Endpoint<H>> {
-        let socket = UdpSocket::bind(addr)?;
+        Endpoint::from_socket(UdpSocket::bind(addr)?, handler)
+    }
+
+    /// Build on an already-bound socket, so the video send path can hold a clone
+    /// of the very same socket (one shared port). The caller clones before
+    /// handing the socket over.
+    pub fn from_socket(socket: UdpSocket, handler: H) -> io::Result<Endpoint<H>> {
         socket.set_read_timeout(Some(POLL_INTERVAL))?;
         Ok(Endpoint {
             socket,

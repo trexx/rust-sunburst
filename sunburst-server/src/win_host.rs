@@ -17,7 +17,7 @@
 
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sunburst_core::instr::{DrainHandle, Report};
@@ -45,6 +45,10 @@ pub struct WindowsHost {
     started: Instant,
     running: Mutex<Option<Launched>>,
     drain: Option<DrainHandle>,
+    /// The live-session view, shared with the session manager on the endpoint
+    /// thread. Reads for `GET /api/sessions`; a disconnect is requested through
+    /// it and acted on by the manager.
+    sessions: Arc<crate::session::Sessions>,
 }
 
 struct Launched {
@@ -56,11 +60,12 @@ struct Launched {
 }
 
 impl WindowsHost {
-    pub fn new(drain: Option<DrainHandle>) -> WindowsHost {
+    pub fn new(drain: Option<DrainHandle>, sessions: Arc<crate::session::Sessions>) -> WindowsHost {
         WindowsHost {
             started: Instant::now(),
             running: Mutex::new(None),
             drain,
+            sessions,
         }
     }
 
@@ -233,13 +238,17 @@ impl Host for WindowsHost {
     }
 
     fn sessions(&self) -> Vec<SessionSummary> {
-        // Nothing streams yet. Reporting an empty list is the truth; inventing a
-        // placeholder session would be a lie the UI would render as fact.
-        Vec::new()
+        self.sessions.list()
     }
 
     fn disconnect(&self, session_id: u32) -> Result<(), HostError> {
-        Err(HostError::UnknownSession(session_id))
+        // The manager owns the pipeline; ask it to drop this one. It acts on the
+        // request on its next tick.
+        if self.sessions.request_disconnect(session_id) {
+            Ok(())
+        } else {
+            Err(HostError::UnknownSession(session_id))
+        }
     }
 
     fn metrics(&self) -> Option<Report> {

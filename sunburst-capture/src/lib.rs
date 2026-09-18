@@ -218,6 +218,14 @@ pub trait Capture {
 
     /// This backend's static capabilities.
     fn caps(&self) -> Caps;
+
+    /// The CUDA context this backend produces [`Frame::Cuda`] surfaces in, as a
+    /// raw `CUcontext`, or `None` for a D3D11 backend. The NvFBC-native encode
+    /// spine adopts it so the convert kernel and the NVENC-CUDA session run in
+    /// the same context the grab does — the frame never leaves the GPU.
+    fn cuda_context(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Choose the default backend for the host.

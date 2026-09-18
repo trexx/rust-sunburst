@@ -1,96 +1,142 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! The frame path: capture → convert → encode → packetize → send.
+//! The frame path: capture → convert → encode → packetize → paced send, with
+//! loss recovery and rate control driven from the control thread.
 //!
-//! Two dedicated OS threads, both MMCSS "Games" / `TIME_CRITICAL` (see
-//! [`crate::realtime`]), joined by a lock-free SPSC packet ring
-//! ([`sunburst_net::packet_ring`]):
+//! Two dedicated OS threads, both MMCSS "Games" / `TIME_CRITICAL`
+//! ([`crate::realtime`]), joined by a lock-free SPSC packet ring:
 //!
 //! - **GPU thread** — the serial half. D3D11's immediate context is
-//!   single-threaded and capture, the colour-convert compute shader and the
-//!   NVENC submit all run on the one device, so they share one thread. It grabs
-//!   a frame, converts scRGB→P010, submits to NVENC, and drains the encoder
-//!   slice-by-slice; each slice/tile is packetized and pushed to the ring the
+//!   single-threaded, so capture, the colour convert and the NVENC submit share
+//!   one thread. It grabs the freshest frame within the client's frame interval
+//!   (the governor), converts to P010, applies any pending recovery, submits to
+//!   NVENC and drains it slice-by-slice; each slice is packetized and pushed the
 //!   instant it exists (subframe readback — CLAUDE.md: mandatory).
-//! - **Send thread** — drains the ring and puts packets on the wire, overlapping
-//!   transmit with the next slice's encode.
+//! - **Send thread** — services NACK retransmits from a cache first, then paces
+//!   the main stream onto the wire, batching equal-size datagrams for USO.
 //!
-//! Every stage records `(stage_id, frame_id, qpc)` into the instrumentation ring
-//! ([`sunburst_core::instr::record`]); no locks, no logging, no allocation on the
-//! per-frame path. The GPU thread builds the converter/encoder lazily on the
-//! first frame (the device and resolution come from the frame), and re-emits a
-//! keyframe + fresh sequence headers whenever capture is rebuilt after
-//! [`CaptureError::AccessLost`](sunburst_capture::CaptureError::AccessLost).
+//! Both NvFBC (CUDA) and DDA/WGC (D3D11) are handled: the [`Spine`] is built
+//! lazily from whichever surface the first frame carries, each taking its
+//! shortest path to NVENC.
 //!
-//! # Scope
-//!
-//! This wires the **D3D11** backends (DDA/WGC → [`Frame::Texture`]). The NvFBC
-//! CUDA-native path ([`Frame::Cuda`]) encodes through a CUDA kernel and an
-//! NVENC-CUDA session — a separate spine that needs the CUDA context plumbed off
-//! the concrete backend — and is a follow-up; a `Cuda` frame here ends the loop
-//! with a clear error rather than being silently mishandled.
+//! The control thread never touches the socket or the encoder. It signals the
+//! GPU thread through [`StreamShared`] (an IDR request, the oldest abandoned
+//! frame, the target bitrate) and the send thread through the retransmit ring.
 
+use std::ffi::c_void;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{JoinHandle, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use sunburst_capture::cuda::{CuContext, CuDevicePtr};
 use sunburst_capture::{CaptureError, Frame, select};
 use sunburst_core::instr::{self, Stage};
-use sunburst_core::proto::{Header, Seq16};
+use sunburst_core::proto::{Header, Nack, Seq16};
 use sunburst_encode::convert::Converter;
+use sunburst_encode::cuda_convert::CudaConverter;
 use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
 use sunburst_encode::nvenc::Nvenc;
-use sunburst_net::{Consumer, Packetizer, Producer, packet_ring};
+use sunburst_net::send::Sender;
+use sunburst_net::send::windows::WsaSender;
+use sunburst_net::{
+    Av1RefState, Batch, Consumer, HevcRefState, Pacer, Packetizer, Producer, Recovery, RefState,
+    RetransmitCache, packet_ring,
+};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::core::Interface;
 
-use crate::realtime::RealtimeThread;
-
 /// Packets the GPU→send ring holds. Sized to absorb a keyframe burst (a 4K IDR
-/// is on the order of a thousand packets) without the encoder ever stalling on a
-/// briefly-behind sender; a full ring drops, and the drop is recovered by the
-/// next keyframe, not by back-pressuring the frame path.
+/// is on the order of a thousand packets) without the encoder stalling on a
+/// briefly-behind sender; a full ring drops, recovered by NACK, not by
+/// back-pressuring the frame path.
 const RING_CAPACITY: usize = 4096;
+/// Retransmit requests the control thread may queue for the send thread.
+const RETRANSMIT_CAPACITY: usize = 256;
+/// Sentinel for [`StreamShared::abandon`]: no frame is currently abandoned.
+pub const NO_ABANDON: u32 = u32::MAX;
 
-/// How the pipeline should encode.
-#[derive(Clone, Copy, Debug)]
-pub struct PipelineConfig {
+/// How the pipeline should encode a session.
+#[derive(Clone, Debug)]
+pub struct PipelineParams {
     pub codec: Codec,
-    /// Prefer an HDR (scRGB FP16 / BT.2020 PQ) capture and carry mastering
-    /// metadata into the encoder.
-    pub hdr: bool,
-    /// HEVC slices, or AV1 tiles **per axis** (`2` = a 2×2 grid). `>1` turns on
-    /// subframe readback.
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
     pub slices: u32,
+    pub hdr: bool,
+    pub intra_refresh: Option<(u32, u32)>,
+    pub dpb_depth: u32,
+    pub ref_invalidation: bool,
+    /// Use the NvFBC CUDA-native backend (opt-in resilience), else DDA/WGC.
+    pub nvfbc: bool,
 }
 
-impl PipelineConfig {
-    /// The default subdivision for `codec`: 4 HEVC slices, or a 2×2 AV1 tile grid
-    /// (CLAUDE.md: "Start at 2×2 for 4K").
-    pub fn new(codec: Codec, hdr: bool) -> PipelineConfig {
-        let slices = match codec {
-            Codec::Hevc => 4,
-            Codec::Av1 => 2,
-        };
-        PipelineConfig { codec, hdr, slices }
+/// The lock-free signals the control thread raises for the frame path. Read and
+/// cleared on the GPU thread; never a lock on the hot path.
+pub struct StreamShared {
+    /// A client `RequestIdr`, or recovery that found nothing to reference.
+    pub request_idr: AtomicBool,
+    /// The target bitrate the rate controller last set. The GPU thread
+    /// reconfigures the encoder when it changes.
+    pub target_kbps: AtomicU32,
+    /// The oldest frame the client has abandoned, or [`NO_ABANDON`]. The GPU
+    /// thread swaps it out and runs reference invalidation from it; coalescing
+    /// to the oldest is correct, since invalidating it covers everything since.
+    pub abandon: AtomicU32,
+    /// The GPU thread sets this on `Unavailable` (secure desktop / DRM) and
+    /// clears it on return; the session manager turns transitions into
+    /// `SecureDesktop` messages.
+    pub secure: AtomicBool,
+}
+
+impl StreamShared {
+    pub fn new(initial_kbps: u32) -> Arc<StreamShared> {
+        Arc::new(StreamShared {
+            request_idr: AtomicBool::new(false),
+            target_kbps: AtomicU32::new(initial_kbps),
+            abandon: AtomicU32::new(NO_ABANDON),
+            secure: AtomicBool::new(false),
+        })
+    }
+
+    /// Record `frame_id` as abandoned, keeping the modularly-oldest of any
+    /// already pending, so the GPU thread invalidates from the earliest.
+    pub fn note_abandon(&self, frame_id: Seq16) {
+        let mut cur = self.abandon.load(Ordering::Relaxed);
+        loop {
+            let keep = cur == NO_ABANDON || Seq16(cur as u16).is_newer_than(frame_id);
+            if !keep {
+                return;
+            }
+            match self.abandon.compare_exchange_weak(
+                cur,
+                frame_id.0 as u32,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 }
 
-/// The codec's out-of-band configuration for the client — HEVC VPS/SPS/PPS or the
-/// AV1 `av1C` record (`csd-0`). Emitted once when the encoder is built; the
-/// client needs it before any frame, so it travels the reliable control channel.
+/// The codec's out-of-band configuration for the client — HEVC VPS/SPS/PPS or an
+/// AV1 `av1C` record. Emitted once when the encoder is built (and again after a
+/// rebuild); the client needs it before any frame, so it travels the reliable
+/// control channel.
 #[derive(Clone, Debug)]
 pub struct CodecHeaders {
     pub codec: Codec,
     pub sequence: Vec<u8>,
 }
 
-/// A running stream. Dropping it (or calling [`stop`](Self::stop)) tears the
-/// threads down and joins them.
+/// A running stream. Dropping it (or [`stop`](Self::stop)) tears the threads down.
 pub struct Pipeline {
     stop: Arc<AtomicBool>,
     gpu: Option<JoinHandle<()>>,
@@ -98,29 +144,49 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Start streaming to `client` over `socket` (a clone of the endpoint's UDP
-    /// socket, so video leaves the one shared port). `headers` receives the
-    /// codec's sequence headers once, when the encoder is built.
+    /// Start streaming to `client` over `socket`. `shared` carries control-thread
+    /// signals, `headers` receives the codec config when the encoder is built,
+    /// and `retransmit` delivers NACK retransmit requests to the send thread.
     pub fn spawn(
         socket: UdpSocket,
         client: SocketAddr,
-        cfg: PipelineConfig,
+        params: PipelineParams,
+        shared: Arc<StreamShared>,
         headers: mpsc::Sender<CodecHeaders>,
+        retransmit: Consumer,
     ) -> io::Result<Pipeline> {
         let stop = Arc::new(AtomicBool::new(false));
         let (producer, consumer) = packet_ring(RING_CAPACITY);
 
         let send_stop = Arc::clone(&stop);
+        let send_bitrate = params.bitrate_kbps;
         let send = std::thread::Builder::new()
             .name("sunburst-send".into())
-            .spawn(move || send_loop(&send_stop, &consumer, &socket, client))?;
+            .spawn(move || {
+                send_loop(
+                    &send_stop,
+                    &consumer,
+                    &retransmit,
+                    &socket,
+                    client,
+                    send_bitrate,
+                )
+            })?;
         let send_thread = send.thread().clone();
 
         let gpu_stop = Arc::clone(&stop);
+        let gpu_shared = Arc::clone(&shared);
         let gpu = std::thread::Builder::new()
             .name("sunburst-gpu".into())
             .spawn(move || {
-                if let Err(e) = gpu_loop(&gpu_stop, producer, cfg, &headers, &send_thread) {
+                if let Err(e) = gpu_loop(
+                    &gpu_stop,
+                    producer,
+                    &params,
+                    &gpu_shared,
+                    &headers,
+                    &send_thread,
+                ) {
                     // Setup or fatal encode failure — off the per-frame path, so a
                     // one-time diagnostic is fine. AccessLost never lands here.
                     eprintln!("sunburst pipeline stopped: {e}");
@@ -134,14 +200,12 @@ impl Pipeline {
         })
     }
 
-    /// Signal both threads and join them.
     pub fn stop(mut self) {
         self.shutdown();
     }
 
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // Wake the send thread if it is parked, so it observes the stop promptly.
         if let Some(s) = &self.send {
             s.thread().unpark();
         }
@@ -160,109 +224,148 @@ impl Drop for Pipeline {
     }
 }
 
+/// The convert+encode spine, built from whichever surface the first frame
+/// carries. DDA/WGC take the D3D11 path; NvFBC stays CUDA-native.
+enum Spine<'a> {
+    D3d11 {
+        converter: Converter,
+        encoder: Encoder<'a>,
+    },
+    Cuda {
+        converter: CudaConverter,
+        encoder: Encoder<'a>,
+    },
+}
+
+impl<'a> Spine<'a> {
+    fn encoder(&mut self) -> &mut Encoder<'a> {
+        match self {
+            Spine::D3d11 { encoder, .. } => encoder,
+            Spine::Cuda { encoder, .. } => encoder,
+        }
+    }
+}
+
 /// The serial GPU half. Returns `Err` only on setup or a fatal encode failure;
 /// `AccessLost` is handled in-loop by rebuilding.
 fn gpu_loop(
     stop: &AtomicBool,
     producer: Producer,
-    cfg: PipelineConfig,
+    params: &PipelineParams,
+    shared: &StreamShared,
     headers: &mpsc::Sender<CodecHeaders>,
     send_thread: &Thread,
 ) -> Result<(), String> {
     let _rt = RealtimeThread::register();
     instr::register_thread("gpu");
 
-    // NvFBC off: this pipeline wires the D3D11 backends (see the module docs).
-    let mut capture = select::build(false, cfg.hdr).map_err(|e| e.to_string())?;
+    let mut capture = select::build(params.nvfbc, params.hdr).map_err(|e| e.to_string())?;
     let nvenc = Nvenc::load()?;
-    let mut converter: Option<Converter> = None;
-    let mut encoder: Option<Encoder> = None;
+    let mut spine: Option<Spine> = None;
     let mut packetizer = Packetizer::new();
+    let mut refs: Box<dyn RefState> = match params.codec {
+        Codec::Hevc => Box::new(HevcRefState::new(params.dpb_depth as u16)),
+        Codec::Av1 => Box::new(Av1RefState::new()),
+    };
     let mut frame_id = Seq16(0);
-    // The first frame after start or a rebuild must be a keyframe so the client
-    // can begin decoding.
+    let mut frame_ts: u64 = 0;
     let mut need_keyframe = true;
+    let mut last_kbps = params.target_kbps_seed();
+
+    // The frame-rate governor: one encode per client frame interval, taking the
+    // freshest capture at each slot. Without it a 144 Hz desktop feeds NVENC far
+    // past what a 60 Hz client will show.
+    let interval = Duration::from_nanos(1_000_000_000 / params.fps.max(1) as u64);
+    let mut next_slot = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         let frame = match capture.acquire(Duration::from_millis(100)) {
             Ok(Some(f)) => f,
-            Ok(None) => continue, // idle desktop presented nothing
+            Ok(None) => continue,
             Err(CaptureError::AccessLost) => {
-                // Mode change / fullscreen transition / desktop switch: the device
-                // may be gone, so drop everything bound to it and rebuild.
-                capture = select::build(false, cfg.hdr).map_err(|e| e.to_string())?;
-                converter = None;
-                encoder = None;
+                capture = select::build(params.nvfbc, params.hdr).map_err(|e| e.to_string())?;
+                spine = None;
                 need_keyframe = true;
                 continue;
             }
             Err(CaptureError::Unavailable) => {
-                // Secure desktop / DRM. A placeholder frame is a later refinement;
-                // for now wait it out and force a keyframe on return.
+                shared.secure.store(true, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(50));
                 need_keyframe = true;
                 continue;
             }
             Err(CaptureError::Backend(m)) => return Err(m),
         };
+        shared.secure.store(false, Ordering::Relaxed);
 
-        let Frame::Texture(tf) = frame else {
-            return Err("pipeline is wired for the D3D11 backends; a CUDA (NvFBC) \
-                        frame arrived — the CUDA-native path is a follow-up"
-                .into());
-        };
+        // Governor: skip frames that arrive before the slot, keeping the latest.
+        let now = Instant::now();
+        if now < next_slot {
+            continue;
+        }
+        next_slot = (next_slot + interval).max(now);
 
         let fid = frame_id;
         instr::record(Stage::CaptureAcquire, fid.0 as u32);
-        let (w, h) = (tf.meta.width, tf.meta.height);
-        let qpc = tf.meta.present_qpc as u32;
+        let qpc = frame.meta().present_qpc as u32;
 
-        // scRGB FP16 → P010, on the texture's own device.
-        let conv = match &mut converter {
-            Some(c) => c,
-            None => converter.insert(Converter::new(&tf.texture)?),
-        };
-        let p010 = conv.convert(&tf.texture, w, h)?;
-        let p010_raw = p010.as_raw();
+        // Convert to P010 on the surface's own path, building the spine and the
+        // encoder (and emitting the codec headers) on the first frame.
+        let (input, first_build) =
+            build_and_convert(&mut spine, &nvenc, params, capture.as_ref(), frame)?;
         instr::record(Stage::ColorConvert, fid.0 as u32);
+        if first_build {
+            let enc = spine.as_mut().expect("just built").encoder();
+            let sequence = match params.codec {
+                Codec::Hevc => enc.sequence_header()?,
+                Codec::Av1 => enc.av1c()?,
+            };
+            let _ = headers.send(CodecHeaders {
+                codec: params.codec,
+                sequence,
+            });
+        }
 
-        // Build the encoder on the first frame; hand its sequence headers out.
-        let enc = match &mut encoder {
-            Some(e) => e,
-            None => {
-                // SAFETY: a captured texture always has a live device.
-                let device: ID3D11Device =
-                    unsafe { tf.texture.GetDevice() }.map_err(|e| e.to_string())?;
-                let hdr_meta = capture.caps().hdr_metadata;
-                let mut ecfg = EncoderConfig::new(cfg.codec, w, h);
-                ecfg.slices = cfg.slices;
-                ecfg.hdr = hdr_meta;
-                let built = Encoder::new(&nvenc, device.as_raw(), &ecfg)?;
-                let e = encoder.insert(built);
-                let sequence = match cfg.codec {
-                    Codec::Hevc => e.sequence_header()?,
-                    Codec::Av1 => e.av1c()?,
-                };
-                // Control-plane, once per session; the channel decouples us from
-                // however the endpoint delivers it.
-                let _ = headers.send(CodecHeaders {
-                    codec: cfg.codec,
-                    sequence,
-                });
-                e
+        let enc = spine.as_mut().expect("built above").encoder();
+
+        // Apply control-thread signals before encoding this frame.
+        let mut force_idr = need_keyframe || shared.request_idr.swap(false, Ordering::AcqRel);
+        let abandoned = shared.abandon.swap(NO_ABANDON, Ordering::AcqRel);
+        if abandoned != NO_ABANDON && params.ref_invalidation {
+            match refs.on_abandoned(Seq16(abandoned as u16)) {
+                Recovery::Invalidate { from, to } => {
+                    let mut id = from;
+                    loop {
+                        if let Some(ts) = refs.timestamp_of(id) {
+                            enc.invalidate_ref_frames(ts)?;
+                        }
+                        if id == to {
+                            break;
+                        }
+                        id = id.next();
+                    }
+                }
+                Recovery::ForceIdr => force_idr = true,
+                Recovery::Nothing => {}
             }
-        };
+        } else if abandoned != NO_ABANDON {
+            // The decoder cannot use reference invalidation: a keyframe instead.
+            force_idr = true;
+        }
+        let target = shared.target_kbps.load(Ordering::Relaxed);
+        if target != last_kbps && target != 0 {
+            enc.reconfigure_bitrate(target)?;
+            last_kbps = target;
+        }
 
         instr::record(Stage::EncodeSubmit, fid.0 as u32);
-        let keyframe = need_keyframe;
         need_keyframe = false;
-        packetizer.begin_frame(fid, qpc, keyframe);
-        // Each slice/tile: packetize and push to the send thread as it completes.
+        packetizer.begin_frame(fid, qpc, force_idr);
         let req = PicRequest {
-            timestamp: fid.0 as u64,
-            force_idr: keyframe,
+            timestamp: frame_ts,
+            force_idr,
         };
-        enc.encode_slices(p010_raw, req, |unit| {
+        enc.encode_slices(input, req, |unit| {
             instr::record(Stage::EncodeUnitOut, fid.0 as u32);
             packetizer.push_unit(unit, |pkt| {
                 producer.push(pkt);
@@ -275,36 +378,187 @@ fn gpu_loop(
         });
         send_thread.unpark();
 
+        refs.on_encoded(fid, frame_ts, force_idr);
         frame_id = frame_id.next();
+        frame_ts += 1;
     }
     Ok(())
 }
 
-/// The network half. Drains the ring onto the wire, recording `Send` per packet,
-/// and parks briefly when the ring is empty.
-fn send_loop(stop: &AtomicBool, consumer: &Consumer, socket: &UdpSocket, client: SocketAddr) {
+/// Build the spine on the first frame and convert this frame to a P010 input
+/// pointer. Returns `(input, first_build)`.
+fn build_and_convert<'a>(
+    spine: &mut Option<Spine<'a>>,
+    nvenc: &'a Nvenc,
+    params: &PipelineParams,
+    capture: &dyn sunburst_capture::Capture,
+    frame: Frame,
+) -> Result<(*mut c_void, bool), String> {
+    let mut ecfg = EncoderConfig::new(params.codec, params.width, params.height);
+    ecfg.fps = params.fps;
+    ecfg.bitrate_kbps = params.bitrate_kbps;
+    ecfg.slices = params.slices;
+    ecfg.dpb_depth = params.dpb_depth;
+    ecfg.intra_refresh = params.intra_refresh;
+    ecfg.hdr = capture.caps().hdr_metadata;
+
+    match frame {
+        Frame::Texture(tf) => {
+            let (w, h) = (tf.meta.width, tf.meta.height);
+            let first = !matches!(spine, Some(Spine::D3d11 { .. }));
+            if first {
+                // SAFETY: a captured texture always has a live device.
+                let device: ID3D11Device =
+                    unsafe { tf.texture.GetDevice() }.map_err(|e| e.to_string())?;
+                ecfg.width = w;
+                ecfg.height = h;
+                let converter = Converter::new(&tf.texture)?;
+                let encoder = Encoder::new(nvenc, device.as_raw(), &ecfg)?;
+                *spine = Some(Spine::D3d11 { converter, encoder });
+            }
+            let Some(Spine::D3d11 { converter, .. }) = spine.as_mut() else {
+                return Err("spine is not D3D11".into());
+            };
+            let p010 = converter.convert(&tf.texture, w, h)?;
+            Ok((p010.as_raw(), first))
+        }
+        Frame::Cuda(cf) => {
+            let (w, h) = (cf.meta.width, cf.meta.height);
+            let ctx = capture
+                .cuda_context()
+                .ok_or("a CUDA frame arrived but the backend exposes no context")?
+                as CuContext;
+            let first = !matches!(spine, Some(Spine::Cuda { .. }));
+            if first {
+                ecfg.width = w;
+                ecfg.height = h;
+                let converter = CudaConverter::new(ctx, w, h)?;
+                let pitch = converter.pitch();
+                let encoder = Encoder::new_cuda(nvenc, ctx, &ecfg, pitch)?;
+                *spine = Some(Spine::Cuda { converter, encoder });
+            }
+            let Some(Spine::Cuda { converter, .. }) = spine.as_mut() else {
+                return Err("spine is not CUDA".into());
+            };
+            let p010: CuDevicePtr = converter.convert(cf.device_ptr, cf.pitch as u32)?;
+            Ok((p010 as *mut c_void, first))
+        }
+    }
+}
+
+/// The network half. Services retransmits first (urgent, unpaced), then paces
+/// the main stream onto the wire in USO batches, caching each packet so a NACK
+/// can be answered without the encoder.
+fn send_loop(
+    stop: &AtomicBool,
+    consumer: &Consumer,
+    retransmit: &Consumer,
+    socket: &UdpSocket,
+    client: SocketAddr,
+    bitrate_kbps: u32,
+) {
     let _rt = RealtimeThread::register();
     instr::register_thread("send");
 
+    let no_uso = std::env::var_os("SUNBURST_NO_USO").is_some();
+    let mut sender = if no_uso {
+        WsaSender::without_offload(socket)
+    } else {
+        WsaSender::new(socket)
+    };
+    let mut cache = RetransmitCache::default();
+    // Pace at twice the target so a frame's bytes leave over ~half its interval,
+    // with a small burst so the sender is not throttled after an idle gap.
+    let mut pacer = Pacer::new(bitrate_kbps as u64 * 1000 * 2, 500_000, 0);
+    let mut batch = Batch::new();
+    let origin = Instant::now();
+    let now_ns = || origin.elapsed().as_nanos() as u64;
+
     while !stop.load(Ordering::Relaxed) {
+        // Retransmits first: they are closing a gap the client already noticed.
+        while retransmit.pop_with(|req| service_retransmit(req, &mut cache, socket, client)) {}
+
         let mut drained = false;
         while consumer.pop_with(|pkt| {
-            let _ = socket.send_to(pkt, client);
+            cache.store(pkt);
             if let Some(h) = Header::decode(pkt) {
                 instr::record(Stage::Send, h.frame_id.0 as u32);
+            }
+            if !batch.try_add(pkt) {
+                flush(&mut batch, &mut sender, &mut pacer, client, now_ns);
+                batch.try_add(pkt);
             }
         }) {
             drained = true;
         }
+        flush(&mut batch, &mut sender, &mut pacer, client, now_ns);
+
         if !drained {
-            // Woken by the GPU thread's unpark after each unit; the timeout is a
-            // backstop so a missed wake cannot wedge the sender.
             std::thread::park_timeout(Duration::from_micros(250));
         }
     }
-
-    // Flush whatever is queued so a clean stop still puts the last frame out.
+    // A clean stop still flushes the last frame.
     while consumer.pop_with(|pkt| {
-        let _ = socket.send_to(pkt, client);
+        if !batch.try_add(pkt) {
+            flush(&mut batch, &mut sender, &mut pacer, client, now_ns);
+            batch.try_add(pkt);
+        }
     }) {}
+    flush(&mut batch, &mut sender, &mut pacer, client, now_ns);
+}
+
+/// Wait for the pace, then hand the batch to the sender.
+fn flush(
+    batch: &mut Batch,
+    sender: &mut WsaSender<'_>,
+    pacer: &mut Pacer,
+    client: SocketAddr,
+    now_ns: impl Fn() -> u64,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let (bytes, seg) = batch.bytes();
+    let wait = pacer.wait_ns(now_ns());
+    if wait > 0 {
+        std::thread::sleep(Duration::from_nanos(wait));
+    }
+    let _ = sender.send_batch(bytes, seg, client);
+    pacer.record(bytes.len(), now_ns());
+    batch.clear();
+}
+
+/// Answer one retransmit request: `[frame_id: u16][Nack body]`. Each requested
+/// packet still in the cache goes back out; a miss (aged out) is skipped.
+fn service_retransmit(
+    req: &[u8],
+    cache: &mut RetransmitCache,
+    socket: &UdpSocket,
+    client: SocketAddr,
+) {
+    if req.len() < 2 {
+        return;
+    }
+    let frame_id = Seq16(u16::from_le_bytes([req[0], req[1]]));
+    let Some(nack) = Nack::decode(&req[2..]) else {
+        return;
+    };
+    for idx in nack.missing() {
+        if let Some(pkt) = cache.get(frame_id, idx) {
+            let _ = socket.send_to(pkt, client);
+        }
+    }
+}
+
+impl PipelineParams {
+    fn target_kbps_seed(&self) -> u32 {
+        self.bitrate_kbps
+    }
+}
+
+use crate::realtime::RealtimeThread;
+
+/// Build a retransmit-ring producer/consumer pair sized for this pipeline.
+pub fn retransmit_ring() -> (Producer, Consumer) {
+    packet_ring(RETRANSMIT_CAPACITY)
 }

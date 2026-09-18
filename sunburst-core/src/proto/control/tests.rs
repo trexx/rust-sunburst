@@ -488,3 +488,17 @@ fn quirks_default_is_the_conservative_decoder() {
     assert!(!q.slice_output);
     assert!(q.needs_annexb_startcodes);
 }
+
+#[test]
+fn codec_negotiation_respects_the_client_and_the_preference() {
+    use StreamCodec::{Av1, Hevc};
+    let both = codecs::HEVC_MAIN10 | codecs::AV1_MAIN10;
+    // Auto prefers AV1 when both are on offer, falls back to HEVC, else nothing.
+    assert_eq!(negotiate_codec(None, both), Some(Av1));
+    assert_eq!(negotiate_codec(None, codecs::HEVC_MAIN10), Some(Hevc));
+    assert_eq!(negotiate_codec(None, 0), None);
+    // A pinned codec is honoured only if the client can decode it.
+    assert_eq!(negotiate_codec(Some(Hevc), both), Some(Hevc));
+    assert_eq!(negotiate_codec(Some(Av1), codecs::HEVC_MAIN10), None);
+    assert_eq!(negotiate_codec(Some(Hevc), codecs::AV1_MAIN10), None);
+}

@@ -187,6 +187,16 @@ impl AppState {
         self.inner.lock().expect("not poisoned").config.stream.port
     }
 
+    /// The stream defaults (codec preference, bitrate), for the session manager.
+    pub fn stream_config(&self) -> StreamConfig {
+        self.inner
+            .lock()
+            .expect("not poisoned")
+            .config
+            .stream
+            .clone()
+    }
+
     pub fn web_config(&self) -> WebConfig {
         self.inner.lock().expect("not poisoned").config.web.clone()
     }

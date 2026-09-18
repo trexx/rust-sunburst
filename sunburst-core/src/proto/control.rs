@@ -280,6 +280,22 @@ impl StreamCodec {
     }
 }
 
+/// Pick the codec to stream, given the server's `prefer` (`None` = "auto") and
+/// the bitmask of codecs the client advertised in [`Hello::codecs`].
+///
+/// A pinned preference the client cannot decode yields `None` — the server
+/// declines rather than sending a stream that will not play. Auto takes AV1 when
+/// offered (it is the more efficient of the two), else HEVC.
+pub fn negotiate_codec(prefer: Option<StreamCodec>, client_codecs: u8) -> Option<StreamCodec> {
+    let has = |c: StreamCodec| client_codecs & c.hello_bit() != 0;
+    match prefer {
+        Some(c) => has(c).then_some(c),
+        None if has(StreamCodec::Av1) => Some(StreamCodec::Av1),
+        None if has(StreamCodec::Hevc) => Some(StreamCodec::Hevc),
+        None => None,
+    }
+}
+
 /// HDR mastering metadata, in the SMPTE ST 2086 fixed-point units the
 /// bitstream itself carries: chromaticity in 0.00002 steps, luminance in
 /// 0.0001 cd/m². The client hands these to `MediaFormat.KEY_HDR_STATIC_INFO`.

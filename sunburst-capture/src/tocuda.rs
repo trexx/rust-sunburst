@@ -256,6 +256,10 @@ impl NvFbcCapture {
 }
 
 impl Capture for NvFbcCapture {
+    fn cuda_context(&self) -> Option<u64> {
+        Some(self.context() as u64)
+    }
+
     fn acquire(&mut self, _timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         // NvFBC blocks until the next frame, so the timeout is advisory: a blocking
         // grab always returns a frame (or an error), never `Ok(None)`.
