@@ -571,6 +571,7 @@ name = "sunburst-capture"
 version = "0.1.0"
 dependencies = [
  "sunburst-core",
+ "windows",
 ]
 
 [[package]]
@@ -587,7 +588,9 @@ dependencies = [
 name = "sunburst-encode"
 version = "0.1.0"
 dependencies = [
+ "sunburst-capture",
  "sunburst-core",
+ "windows",
 ]
 
 [[package]]
@@ -613,7 +616,9 @@ dependencies = [
 name = "sunburst-server"
 version = "0.1.0"
 dependencies = [
+ "sunburst-capture",
  "sunburst-core",
+ "sunburst-encode",
  "sunburst-input",
  "sunburst-net",
  "sunburst-web",

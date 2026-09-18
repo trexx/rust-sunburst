@@ -116,6 +116,17 @@ impl<H: ControlHandler> Endpoint<H> {
         self.socket.local_addr()
     }
 
+    /// A second handle on the endpoint's UDP socket, for the video send path.
+    ///
+    /// PROTOCOL.md puts video and control on one port, and the endpoint owns it
+    /// for receive; the frame path sends from a clone so both leave the same
+    /// source address without the two paths sharing a lock. `try_clone` dups the
+    /// OS socket — the receive loop here and the send loop there refer to one
+    /// underlying socket.
+    pub fn try_clone_socket(&self) -> io::Result<UdpSocket> {
+        self.socket.try_clone()
+    }
+
     pub fn handler(&self) -> &H {
         &self.handler
     }
