@@ -81,6 +81,95 @@ const NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR: u32 = 1;
 const NV_ENC_INPUT_IMAGE: u32 = 0;
 /// `NV_ENC_PIC_STRUCT_FRAME`.
 const NV_ENC_PIC_STRUCT_FRAME: u32 = 1;
+/// `NV_ENC_PIC_FLAG_FORCEIDR` — encode this picture as an IDR.
+const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x2;
+/// `NV_ENC_PIC_FLAG_OUTPUT_SPSPPS` — inline the sequence headers on this frame,
+/// so a client that joins or recovers at the IDR has them.
+const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x4;
+/// `NV_ENC_PARAMS_RC_CBR` — constant bitrate, the low-latency choice.
+const NV_ENC_PARAMS_RC_CBR: u32 = 0x2;
+/// `NVENC_INFINITE_GOPLENGTH` — never emit a periodic IDR; recovery is by
+/// reference invalidation and intra refresh instead (CLAUDE.md).
+const NVENC_INFINITE_GOPLENGTH: u32 = 0xffff_ffff;
+/// `NV_ENC_RECONFIGURE_PARAMS_VER`.
+const NV_ENC_RECONFIGURE_PARAMS_VER: u32 = struct_version(2) | (1 << 31);
+/// `enableIntraRefresh` bit in `NV_ENC_CONFIG_HEVC`'s first bitfield word.
+const HEVC_ENABLE_INTRA_REFRESH: u32 = 1 << 8;
+/// `enableIntraRefresh` bit in `NV_ENC_CONFIG_AV1`'s first bitfield word.
+const AV1_ENABLE_INTRA_REFRESH: u32 = 1 << 6;
+
+/// `NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE`.
+const NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE: u32 = 12;
+/// `NV_ENC_CAPS_SUPPORT_INTRA_REFRESH`.
+const NV_ENC_CAPS_SUPPORT_INTRA_REFRESH: u32 = 15;
+/// `NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION`.
+const NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION: u32 = 19;
+
+/// How to build an encoder. Replaces the positional soup `new` used to take, and
+/// carries the rate-control and recovery settings the transport drives.
+#[derive(Clone, Debug)]
+pub struct EncoderConfig {
+    pub codec: Codec,
+    pub width: u32,
+    pub height: u32,
+    /// Whole frames per second, for the VBV sizing and the rate header.
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    /// HEVC slices, or AV1 tiles per axis (`2` = a 2×2 grid). `>1` turns on
+    /// subframe readback.
+    pub slices: u32,
+    pub hdr: Option<HdrMetadata>,
+    /// `(period, count)` for gradual intra refresh, or `None`. Gated on the
+    /// decoder's quirks and the encoder's caps by the caller.
+    pub intra_refresh: Option<(u32, u32)>,
+    /// `maxNumRefFramesInDPB`. A deep DPB is what lets reference invalidation
+    /// fall back to an older good frame instead of forcing a keyframe
+    /// (`NvEncInvalidateRefFrames` docs recommend it).
+    pub dpb_depth: u32,
+}
+
+impl EncoderConfig {
+    /// A sensible default for `codec` at `width`×`height`: the plan's slice/tile
+    /// counts, an 8-frame DPB, no intra refresh, SDR.
+    pub fn new(codec: Codec, width: u32, height: u32) -> EncoderConfig {
+        let slices = match codec {
+            Codec::Hevc => 4,
+            Codec::Av1 => 2,
+        };
+        EncoderConfig {
+            codec,
+            width,
+            height,
+            fps: 60,
+            bitrate_kbps: 120_000,
+            slices,
+            hdr: None,
+            intra_refresh: None,
+            dpb_depth: 8,
+        }
+    }
+}
+
+/// What the encoder reported it can do. Queried once at build, so the transport
+/// does not assume parity between HEVC and AV1 (CLAUDE.md: "Do not assume").
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EncoderCaps {
+    pub ref_invalidation: bool,
+    pub intra_refresh: bool,
+    pub dyn_bitrate: bool,
+}
+
+/// Per-frame encode request.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PicRequest {
+    /// The tag reference invalidation keys on — the frame's capture time. Must be
+    /// distinct and increasing across frames.
+    pub timestamp: u64,
+    /// Force this frame to be an IDR (and inline the sequence headers). Used for
+    /// the first frame, a client `RequestIdr`, and recovery when nothing good is
+    /// left to reference.
+    pub force_idr: bool,
+}
 
 // ── parameter structs (see nvEncodeAPI.h) ────────────────────────────────────
 
@@ -414,6 +503,19 @@ type FnLock = unsafe extern "C" fn(*mut c_void, *mut NvEncLockBitstream) -> Nven
 type FnPtrArg = unsafe extern "C" fn(*mut c_void, *mut c_void) -> NvencStatus;
 type FnGetSequenceParams =
     unsafe extern "C" fn(*mut c_void, *mut NvEncSequenceParamPayload) -> NvencStatus;
+type FnReconfigure = unsafe extern "C" fn(*mut c_void, *mut NvEncReconfigureParams) -> NvencStatus;
+type FnInvalidate = unsafe extern "C" fn(*mut c_void, u64) -> NvencStatus;
+
+/// `NV_ENC_RECONFIGURE_PARAMS` — a re-init params block plus two flag bits.
+#[repr(C)]
+struct NvEncReconfigureParams {
+    version: u32,
+    reserved: u32,
+    re_init_encode_params: NvEncInitializeParams,
+    /// `resetEncoder:1, forceIDR:1, reserved1:30`.
+    bitfields: u32,
+    reserved2: u32,
+}
 
 #[repr(C)]
 struct NvEncSequenceParamPayload {
@@ -430,15 +532,18 @@ struct NvEncSequenceParamPayload {
 /// A configured HEVC or AV1 encoder.
 pub struct Encoder<'a> {
     session: Session<'a>,
-    codec: Codec,
+    cfg: EncoderConfig,
+    caps: EncoderCaps,
     /// `NV_ENC_INPUT_RESOURCE_TYPE_*` — DIRECTX (a texture) or CUDADEVICEPTR (a
     /// CUDA surface), set by how the encoder was opened.
     resource_type: u32,
     /// Row pitch in bytes for a CUDA input (0 for D3D11, which infers it).
     input_pitch: u32,
     bitstream: *mut c_void,
-    width: u32,
-    height: u32,
+    /// The input surface registered once and reused: `(input ptr, registered
+    /// resource)`. The converter hands back one reused P010 surface, so
+    /// registration is a per-session cost, not a per-frame one.
+    registered: Option<(*mut c_void, *mut c_void)>,
     /// HDR metadata pointed at by each frame's pic-params, kept alive here so the
     /// pointers stay valid across `encode_picture`.
     mastering: Option<MasteringDisplayInfo>,
@@ -446,145 +551,61 @@ pub struct Encoder<'a> {
 }
 
 impl<'a> Encoder<'a> {
-    /// Open a `codec` P1/ULL encoder on a **D3D11 device** at `width`×`height`
-    /// (the DDA/WGC path). `slices` (1 = whole-frame; >1 enables subframe readback)
-    /// is the count of HEVC slices, or of AV1 tiles **per axis** (`slices = 2` is a
-    /// 2×2 tile grid).
+    /// Open a P1/ULL encoder on a **D3D11 device** (the DDA/WGC path).
     pub fn new(
         nvenc: &'a Nvenc,
         d3d_device: *mut c_void,
-        width: u32,
-        height: u32,
-        codec: Codec,
-        slices: u32,
-        hdr: Option<HdrMetadata>,
+        cfg: &EncoderConfig,
     ) -> Result<Encoder<'a>, String> {
         let session = nvenc.open_session(d3d_device)?;
-        Self::build(
-            session,
-            width,
-            height,
-            codec,
-            slices,
-            hdr,
-            NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
-            0,
-        )
+        Self::build(session, cfg, NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX, 0)
     }
 
-    /// Open a `codec` P1/ULL encoder on a **CUDA context** at `width`×`height` (the
-    /// NvFBC path). `input_pitch` is the row pitch (bytes) of the P010 device
-    /// buffer that will be encoded.
-    #[allow(clippy::too_many_arguments)]
+    /// Open a P1/ULL encoder on a **CUDA context** (the NvFBC path). `input_pitch`
+    /// is the row pitch (bytes) of the P010 device buffer that will be encoded.
     pub fn new_cuda(
         nvenc: &'a Nvenc,
         cuda_ctx: *mut c_void,
-        width: u32,
-        height: u32,
-        codec: Codec,
-        slices: u32,
-        hdr: Option<HdrMetadata>,
+        cfg: &EncoderConfig,
         input_pitch: u32,
     ) -> Result<Encoder<'a>, String> {
         let session = nvenc.open_session_cuda(cuda_ctx)?;
         Self::build(
             session,
-            width,
-            height,
-            codec,
-            slices,
-            hdr,
+            cfg,
             NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
             input_pitch,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build(
         session: Session<'a>,
-        width: u32,
-        height: u32,
-        codec: Codec,
-        slices: u32,
-        hdr: Option<HdrMetadata>,
+        cfg: &EncoderConfig,
         resource_type: u32,
         input_pitch: u32,
     ) -> Result<Encoder<'a>, String> {
         let nvenc = session.nvenc;
         let encoder = session.encoder;
 
-        // Preset config → then initialize with it.
-        let get_preset: FnGetPresetEx =
-            fnptr(nvenc.list.get_encode_preset_config_ex, "get_preset")?;
-        // SAFETY: plain data; zero is valid for every field.
-        let mut preset: NvEncPresetConfig = unsafe { std::mem::zeroed() };
-        preset.version = NV_ENC_PRESET_CONFIG_VER;
-        preset.preset_cfg.version = NV_ENC_CONFIG_VER;
-        // SAFETY: live encoder; correctly versioned preset config out-param.
-        let status = unsafe {
-            get_preset(
-                encoder,
-                codec.guid(),
-                NV_ENC_PRESET_P1_GUID,
-                NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
-                &mut preset,
-            )
+        let caps = EncoderCaps {
+            ref_invalidation: session
+                .cap(cfg.codec.guid(), NV_ENC_CAPS_SUPPORT_REF_PIC_INVALIDATION)
+                .unwrap_or(0)
+                != 0,
+            intra_refresh: session
+                .cap(cfg.codec.guid(), NV_ENC_CAPS_SUPPORT_INTRA_REFRESH)
+                .unwrap_or(0)
+                != 0,
+            dyn_bitrate: session
+                .cap(cfg.codec.guid(), NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE)
+                .unwrap_or(0)
+                != 0,
         };
-        check(status, "nvEncGetEncodePresetConfigEx")?;
-        preset.preset_cfg.version = NV_ENC_CONFIG_VER;
 
-        // Subdivide the frame so subframe readback can emit slices/tiles as they
-        // complete, and enable the HDR output flags — codec-specific offsets.
-        if slices > 1 || hdr.is_some() {
-            let cfg = std::ptr::addr_of_mut!(preset.preset_cfg.encode_codec_config);
-            match codec {
-                Codec::Hevc => {
-                    // SAFETY: the union begins with NV_ENC_CONFIG_HEVC.
-                    let hevc = unsafe { &mut *(cfg as *mut HevcConfigHead) };
-                    if slices > 1 {
-                        hevc.slice_mode = 3; // a fixed number of uniform slices
-                        hevc.slice_mode_data = slices;
-                    }
-                    if hdr.is_some() {
-                        // outputMaxCll (bit 23) + outputMasteringDisplay (bit 24).
-                        hevc.bitfields |= (1 << 23) | (1 << 24);
-                    }
-                }
-                Codec::Av1 => {
-                    // SAFETY: the union begins with NV_ENC_CONFIG_AV1.
-                    let av1 = unsafe { &mut *(cfg as *mut Av1ConfigHead) };
-                    if slices > 1 {
-                        // Uniform tiles (enableCustomTileConfig stays 0).
-                        av1.num_tile_columns = slices;
-                        av1.num_tile_rows = slices;
-                    }
-                    if hdr.is_some() {
-                        // outputMaxCll (bit 14) + outputMasteringDisplay (bit 15).
-                        av1.bitfields |= (1 << 14) | (1 << 15);
-                    }
-                }
-            }
-        }
-
+        // A preset config, tuned per `cfg`, then initialize with it.
+        let mut preset = preset_config(nvenc, encoder, cfg)?;
+        let mut init = init_params(cfg, &mut preset.preset_cfg);
         let initialize: FnInitialize = fnptr(nvenc.list.initialize_encoder, "initialize")?;
-        // SAFETY: plain data.
-        let mut init: NvEncInitializeParams = unsafe { std::mem::zeroed() };
-        init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encode_guid = codec.guid();
-        init.preset_guid = NV_ENC_PRESET_P1_GUID;
-        init.encode_width = width;
-        init.encode_height = height;
-        init.dar_width = width;
-        init.dar_height = height;
-        init.frame_rate_num = 60;
-        init.frame_rate_den = 1;
-        init.enable_ptd = 1;
-        init.tuning_info = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
-        init.encode_config = &mut preset.preset_cfg;
-        if slices > 1 {
-            // reportSliceOffsets (bit 0) + enableSubFrameWrite (bit 1).
-            init.bitfields |= 0b11;
-        }
         // SAFETY: live encoder; `init` is correctly versioned and its
         // `encode_config` points at `preset`, alive for this call.
         let status = unsafe { initialize(encoder, &mut init) };
@@ -601,15 +622,65 @@ impl<'a> Encoder<'a> {
 
         Ok(Encoder {
             session,
-            codec,
+            caps,
             resource_type,
             input_pitch,
             bitstream: bs.bitstream_buffer,
-            width,
-            height,
-            mastering: hdr.as_ref().map(MasteringDisplayInfo::from_metadata),
-            max_cll: hdr.as_ref().map(ContentLightLevel::from_metadata),
+            registered: None,
+            mastering: cfg.hdr.as_ref().map(MasteringDisplayInfo::from_metadata),
+            max_cll: cfg.hdr.as_ref().map(ContentLightLevel::from_metadata),
+            cfg: cfg.clone(),
         })
+    }
+
+    /// What the encoder reported it supports. The transport consults this so it
+    /// never asks for reference invalidation or intra refresh on a codec that
+    /// lacks it.
+    pub fn caps(&self) -> EncoderCaps {
+        self.caps
+    }
+
+    /// Invalidate the reference frame tagged `timestamp` (the `inputTimeStamp`
+    /// the frame was encoded with). The encoder drops it and anything predicted
+    /// from it and falls back to an older reference, or forces intra if none is
+    /// left. No-op if the encoder does not support it.
+    pub fn invalidate_ref_frames(&self, timestamp: u64) -> Result<(), String> {
+        if !self.caps.ref_invalidation {
+            return Ok(());
+        }
+        let f: FnInvalidate = fnptr(self.session.nvenc.list.invalidate_ref_frames, "invalidate")?;
+        // SAFETY: live encoder; the timestamp is a plain value.
+        check(
+            unsafe { f(self.session.encoder, timestamp) },
+            "nvEncInvalidateRefFrames",
+        )
+    }
+
+    /// Change the target bitrate without tearing the session down
+    /// (`NvEncReconfigureEncoder`), for the delay-gradient rate controller.
+    /// `resetEncoder`/`forceIDR` stay off, so it is seamless.
+    pub fn reconfigure_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), String> {
+        if !self.caps.dyn_bitrate || bitrate_kbps == self.cfg.bitrate_kbps {
+            return Ok(());
+        }
+        let mut cfg = self.cfg.clone();
+        cfg.bitrate_kbps = bitrate_kbps;
+
+        let nvenc = self.session.nvenc;
+        let encoder = self.session.encoder;
+        let mut preset = preset_config(nvenc, encoder, &cfg)?;
+        // SAFETY: plain data.
+        let mut params: NvEncReconfigureParams = unsafe { std::mem::zeroed() };
+        params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+        params.re_init_encode_params = init_params(&cfg, &mut preset.preset_cfg);
+
+        let reconfigure: FnReconfigure = fnptr(nvenc.list.reconfigure_encoder, "reconfigure")?;
+        // SAFETY: live encoder; `params.re_init_encode_params.encode_config`
+        // points at `preset`, alive for this call.
+        let status = unsafe { reconfigure(encoder, &mut params) };
+        check(status, "nvEncReconfigureEncoder")?;
+        self.cfg = cfg;
+        Ok(())
     }
 
     /// Point a frame's pic-params at our HDR metadata, when present — the pointer
@@ -619,7 +690,7 @@ impl<'a> Encoder<'a> {
             let p_max_cll = (max_cll as *const ContentLightLevel).cast::<c_void>();
             let p_mastering = (mastering as *const MasteringDisplayInfo).cast::<c_void>();
             let cfg = std::ptr::addr_of_mut!(pic.codec_pic_params);
-            match self.codec {
+            match self.cfg.codec {
                 Codec::Hevc => {
                     // SAFETY: the union begins with NV_ENC_PIC_PARAMS_HEVC.
                     let head = unsafe { &mut *(cfg as *mut HevcPicParamsHead) };
@@ -661,123 +732,43 @@ impl<'a> Encoder<'a> {
     /// The AV1 `av1C` record (the client's MediaCodec `csd-0`). Errors for a
     /// non-AV1 encoder. Profile 0, 10-bit, tier 0; level from the resolution.
     pub fn av1c(&self) -> Result<Vec<u8>, String> {
-        if self.codec != Codec::Av1 {
+        if self.cfg.codec != Codec::Av1 {
             return Err("av1c is only valid for an AV1 encoder".into());
         }
         let obu = self.sequence_header()?;
         Ok(crate::av1c::av1c_record(
             0,
-            crate::av1c::seq_level_idx(self.width, self.height),
+            crate::av1c::seq_level_idx(self.cfg.width, self.cfg.height),
             0,
             true,
             &obu,
         ))
     }
 
-    /// Encode one P010 D3D11 texture, returning the bitstream bytes.
-    ///
-    /// Registers, maps, encodes, locks, then unmaps/unregisters — a simple
-    /// per-frame path; caching the registration is a later optimisation.
-    pub fn encode(&mut self, texture: *mut c_void) -> Result<Vec<u8>, String> {
-        let list = &self.session.nvenc.list;
-        let encoder = self.session.encoder;
-
-        // Register + map the input texture.
-        let register: FnRegister = fnptr(list.register_resource, "register")?;
-        // SAFETY: plain data.
-        let mut reg: NvEncRegisterResource = unsafe { std::mem::zeroed() };
-        reg.version = NV_ENC_REGISTER_RESOURCE_VER;
-        reg.resource_type = self.resource_type;
-        reg.pitch = self.input_pitch;
-        reg.width = self.width;
-        reg.height = self.height;
-        reg.resource_to_register = texture;
-        reg.buffer_format = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
-        reg.buffer_usage = NV_ENC_INPUT_IMAGE;
-        // SAFETY: live encoder; `texture` is a live P010 ID3D11Texture2D.
-        let reg_status = unsafe { register(encoder, &mut reg) };
-        check(reg_status, "nvEncRegisterResource")?;
-
-        let map: FnMap = fnptr(list.map_input_resource, "map")?;
-        // SAFETY: plain data.
-        let mut m: NvEncMapInputResource = unsafe { std::mem::zeroed() };
-        m.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-        m.registered_resource = reg.registered_resource;
-        // SAFETY: live encoder; `reg.registered_resource` is from register above.
-        let map_status = unsafe { map(encoder, &mut m) };
-        if map_status != NV_ENC_SUCCESS {
-            self.unregister(reg.registered_resource);
-            return Err(format!("nvEncMapInputResource failed with {map_status}"));
-        }
-
-        // Encode.
-        let encode: FnEncode = fnptr(list.encode_picture, "encode")?;
-        // SAFETY: plain data.
-        let mut pic: NvEncPicParams = unsafe { std::mem::zeroed() };
-        pic.version = NV_ENC_PIC_PARAMS_VER;
-        pic.input_width = self.width;
-        pic.input_height = self.height;
-        pic.input_buffer = m.mapped_resource;
-        pic.output_bitstream = self.bitstream;
-        pic.buffer_fmt = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
-        pic.picture_struct = NV_ENC_PIC_STRUCT_FRAME;
-        self.apply_hdr(&mut pic);
-        // SAFETY: live encoder; the mapped input and bitstream buffer are live.
-        let enc_status = unsafe { encode(encoder, &mut pic) };
-
-        let out = if enc_status == NV_ENC_SUCCESS {
-            self.lock_bitstream()
-        } else {
-            Err(format!("nvEncEncodePicture failed with {enc_status}"))
-        };
-
-        // Always unmap + unregister the input.
-        if let Ok(unmap) = fnptr::<FnPtrArg>(list.unmap_input_resource, "unmap") {
-            // SAFETY: `m.mapped_resource` is live and unmapped once.
-            unsafe { unmap(encoder, m.mapped_resource) };
-        }
-        self.unregister(reg.registered_resource);
-        out
-    }
-
-    /// Encode one P010 texture, emitting each HEVC slice via `on_slice` as it
-    /// completes — the subframe path (needs `slices > 1` at construction). It
-    /// overlaps encode with transmit (CLAUDE.md: mandatory, not an optimisation).
-    /// The drain uses non-blocking locks, so it cannot hang; the exact completion
-    /// heuristic is box-to-validate.
+    /// Encode one P010 input, emitting each slice (HEVC) or tile (AV1) via
+    /// `on_slice` as it completes — the subframe path (needs `slices > 1` at
+    /// construction). It overlaps encode with transmit (CLAUDE.md: mandatory).
+    /// The input surface is registered once and reused; the drain uses
+    /// non-blocking locks, so it cannot hang. The completion heuristic is
+    /// box-to-validate.
     pub fn encode_slices(
         &mut self,
-        texture: *mut c_void,
+        input: *mut c_void,
+        req: PicRequest,
         mut on_slice: impl FnMut(&[u8]),
     ) -> Result<(), String> {
+        let registered = self.ensure_registered(input)?;
         let list = &self.session.nvenc.list;
         let encoder = self.session.encoder;
-
-        // Register + map the input (as in `encode`).
-        let register: FnRegister = fnptr(list.register_resource, "register")?;
-        // SAFETY: plain data.
-        let mut reg: NvEncRegisterResource = unsafe { std::mem::zeroed() };
-        reg.version = NV_ENC_REGISTER_RESOURCE_VER;
-        reg.resource_type = self.resource_type;
-        reg.pitch = self.input_pitch;
-        reg.width = self.width;
-        reg.height = self.height;
-        reg.resource_to_register = texture;
-        reg.buffer_format = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
-        reg.buffer_usage = NV_ENC_INPUT_IMAGE;
-        // SAFETY: live encoder; `texture` is a live P010 texture.
-        let reg_status = unsafe { register(encoder, &mut reg) };
-        check(reg_status, "nvEncRegisterResource")?;
 
         let map: FnMap = fnptr(list.map_input_resource, "map")?;
         // SAFETY: plain data.
         let mut m: NvEncMapInputResource = unsafe { std::mem::zeroed() };
         m.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-        m.registered_resource = reg.registered_resource;
-        // SAFETY: live encoder; registered above.
+        m.registered_resource = registered;
+        // SAFETY: live encoder; `registered` came from a live registration.
         let map_status = unsafe { map(encoder, &mut m) };
         if map_status != NV_ENC_SUCCESS {
-            self.unregister(reg.registered_resource);
             return Err(format!("nvEncMapInputResource failed with {map_status}"));
         }
 
@@ -785,12 +776,17 @@ impl<'a> Encoder<'a> {
         // SAFETY: plain data.
         let mut pic: NvEncPicParams = unsafe { std::mem::zeroed() };
         pic.version = NV_ENC_PIC_PARAMS_VER;
-        pic.input_width = self.width;
-        pic.input_height = self.height;
+        pic.input_width = self.cfg.width;
+        pic.input_height = self.cfg.height;
         pic.input_buffer = m.mapped_resource;
         pic.output_bitstream = self.bitstream;
         pic.buffer_fmt = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
         pic.picture_struct = NV_ENC_PIC_STRUCT_FRAME;
+        // The tag reference invalidation keys on, and the IDR request.
+        pic.input_time_stamp = req.timestamp;
+        if req.force_idr {
+            pic.encode_pic_flags |= NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+        }
         self.apply_hdr(&mut pic);
         // SAFETY: live encoder; mapped input + bitstream are live.
         let enc_status = unsafe { encode(encoder, &mut pic) };
@@ -802,11 +798,42 @@ impl<'a> Encoder<'a> {
         };
 
         if let Ok(unmap) = fnptr::<FnPtrArg>(list.unmap_input_resource, "unmap") {
-            // SAFETY: mapped above; unmapped once.
+            // SAFETY: mapped above; unmapped once. The registration is kept for
+            // the next frame and released on Drop.
             unsafe { unmap(encoder, m.mapped_resource) };
         }
-        self.unregister(reg.registered_resource);
         result
+    }
+
+    /// Register `input` if it is not already the cached one, returning the
+    /// registered-resource handle. The converter reuses one P010 surface, so
+    /// this registers once per session rather than once per frame.
+    fn ensure_registered(&mut self, input: *mut c_void) -> Result<*mut c_void, String> {
+        if let Some((cached, res)) = self.registered {
+            if cached == input {
+                return Ok(res);
+            }
+            // The input surface changed (a resolution change rebuilds it); drop
+            // the stale registration first.
+            self.unregister(res);
+            self.registered = None;
+        }
+        let register: FnRegister = fnptr(self.session.nvenc.list.register_resource, "register")?;
+        // SAFETY: plain data.
+        let mut reg: NvEncRegisterResource = unsafe { std::mem::zeroed() };
+        reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+        reg.resource_type = self.resource_type;
+        reg.pitch = self.input_pitch;
+        reg.width = self.cfg.width;
+        reg.height = self.cfg.height;
+        reg.resource_to_register = input;
+        reg.buffer_format = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+        reg.buffer_usage = NV_ENC_INPUT_IMAGE;
+        // SAFETY: live encoder; `input` is a live P010 surface of this size.
+        let status = unsafe { register(self.session.encoder, &mut reg) };
+        check(status, "nvEncRegisterResource")?;
+        self.registered = Some((input, reg.registered_resource));
+        Ok(reg.registered_resource)
     }
 
     /// Drain the bitstream slice-by-slice with non-blocking locks, emitting each
@@ -857,35 +884,6 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Lock the output bitstream, copy the bytes out, unlock.
-    fn lock_bitstream(&self) -> Result<Vec<u8>, String> {
-        let list = &self.session.nvenc.list;
-        let encoder = self.session.encoder;
-        let lock: FnLock = fnptr(list.lock_bitstream, "lock")?;
-        // SAFETY: plain data.
-        let mut lb: NvEncLockBitstream = unsafe { std::mem::zeroed() };
-        lb.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lb.output_bitstream = self.bitstream;
-        // SAFETY: live encoder; `bitstream` is a live output buffer.
-        check(unsafe { lock(encoder, &mut lb) }, "nvEncLockBitstream")?;
-
-        // SAFETY: the driver set `bitstream_buffer_ptr` to a mapping of
-        // `bitstream_size_in_bytes` valid bytes, live until unlock.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                lb.bitstream_buffer_ptr as *const u8,
-                lb.bitstream_size_in_bytes as usize,
-            )
-            .to_vec()
-        };
-
-        if let Ok(unlock) = fnptr::<FnPtrArg>(list.unlock_bitstream, "unlock") {
-            // SAFETY: locked above; unlocked once.
-            unsafe { unlock(encoder, self.bitstream) };
-        }
-        Ok(bytes)
-    }
-
     fn unregister(&self, registered: *mut c_void) {
         if registered.is_null() {
             return;
@@ -901,6 +899,9 @@ impl<'a> Encoder<'a> {
 
 impl Drop for Encoder<'_> {
     fn drop(&mut self) {
+        if let Some((_, res)) = self.registered.take() {
+            self.unregister(res);
+        }
         if self.bitstream.is_null() {
             return;
         }
@@ -913,6 +914,113 @@ impl Drop for Encoder<'_> {
             unsafe { destroy(self.session.encoder, self.bitstream) };
         }
     }
+}
+
+/// Fetch the P1/ULL preset config and tune it per `cfg`: CBR at the target
+/// bitrate with a one-frame VBV, an infinite GOP (no periodic IDR), the slice or
+/// tile subdivision for subframe readback, a DPB deep enough for reference
+/// invalidation to fall back rather than force a keyframe, and the intra-refresh
+/// and HDR-output flags when asked.
+fn preset_config(
+    nvenc: &Nvenc,
+    encoder: *mut c_void,
+    cfg: &EncoderConfig,
+) -> Result<NvEncPresetConfig, String> {
+    let get_preset: FnGetPresetEx = fnptr(nvenc.list.get_encode_preset_config_ex, "get_preset")?;
+    // SAFETY: plain data; zero is valid for every field.
+    let mut preset: NvEncPresetConfig = unsafe { std::mem::zeroed() };
+    preset.version = NV_ENC_PRESET_CONFIG_VER;
+    preset.preset_cfg.version = NV_ENC_CONFIG_VER;
+    // SAFETY: live encoder; correctly versioned preset config out-param.
+    let status = unsafe {
+        get_preset(
+            encoder,
+            cfg.codec.guid(),
+            NV_ENC_PRESET_P1_GUID,
+            NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            &mut preset,
+        )
+    };
+    check(status, "nvEncGetEncodePresetConfigEx")?;
+    preset.preset_cfg.version = NV_ENC_CONFIG_VER;
+
+    // Constant bitrate, one-frame VBV, infinite GOP, one P per frame.
+    let bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
+    let fps = cfg.fps.max(1);
+    let rc = &mut preset.preset_cfg.rc_params;
+    rc.rate_control_mode = NV_ENC_PARAMS_RC_CBR;
+    rc.average_bit_rate = bitrate_bps;
+    rc.max_bit_rate = bitrate_bps;
+    rc.vbv_buffer_size = bitrate_bps / fps;
+    rc.vbv_initial_delay = bitrate_bps / fps;
+    preset.preset_cfg.gop_length = NVENC_INFINITE_GOPLENGTH;
+    preset.preset_cfg.frame_interval_p = 1;
+
+    let head = std::ptr::addr_of_mut!(preset.preset_cfg.encode_codec_config);
+    match cfg.codec {
+        Codec::Hevc => {
+            // SAFETY: the union begins with NV_ENC_CONFIG_HEVC.
+            let hevc = unsafe { &mut *(head as *mut HevcConfigHead) };
+            hevc.max_num_ref_frames_in_dpb = cfg.dpb_depth;
+            if cfg.slices > 1 {
+                hevc.slice_mode = 3; // a fixed number of uniform slices
+                hevc.slice_mode_data = cfg.slices;
+            }
+            if let Some((period, count)) = cfg.intra_refresh {
+                hevc.bitfields |= HEVC_ENABLE_INTRA_REFRESH;
+                hevc.intra_refresh_period = period;
+                hevc.intra_refresh_cnt = count;
+            }
+            if cfg.hdr.is_some() {
+                // outputMaxCll (bit 23) + outputMasteringDisplay (bit 24).
+                hevc.bitfields |= (1 << 23) | (1 << 24);
+            }
+        }
+        Codec::Av1 => {
+            // SAFETY: the union begins with NV_ENC_CONFIG_AV1.
+            let av1 = unsafe { &mut *(head as *mut Av1ConfigHead) };
+            av1.max_num_ref_frames_in_dpb = cfg.dpb_depth;
+            if cfg.slices > 1 {
+                // Uniform tiles (enableCustomTileConfig stays 0).
+                av1.num_tile_columns = cfg.slices;
+                av1.num_tile_rows = cfg.slices;
+            }
+            if let Some((period, count)) = cfg.intra_refresh {
+                av1.bitfields |= AV1_ENABLE_INTRA_REFRESH;
+                av1.intra_refresh_period = period;
+                av1.intra_refresh_cnt = count;
+            }
+            if cfg.hdr.is_some() {
+                // outputMaxCll (bit 14) + outputMasteringDisplay (bit 15).
+                av1.bitfields |= (1 << 14) | (1 << 15);
+            }
+        }
+    }
+    Ok(preset)
+}
+
+/// The init/reconfigure params for `cfg`, with `encode_config` pointing at a
+/// config the caller keeps alive for the FFI call.
+fn init_params(cfg: &EncoderConfig, encode_config: *mut NvEncConfig) -> NvEncInitializeParams {
+    // SAFETY: plain data.
+    let mut init: NvEncInitializeParams = unsafe { std::mem::zeroed() };
+    init.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    init.encode_guid = cfg.codec.guid();
+    init.preset_guid = NV_ENC_PRESET_P1_GUID;
+    init.encode_width = cfg.width;
+    init.encode_height = cfg.height;
+    init.dar_width = cfg.width;
+    init.dar_height = cfg.height;
+    init.frame_rate_num = cfg.fps.max(1);
+    init.frame_rate_den = 1;
+    init.enable_ptd = 1;
+    init.tuning_info = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+    init.encode_config = encode_config;
+    if cfg.slices > 1 {
+        // reportSliceOffsets (bit 0) + enableSubFrameWrite (bit 1).
+        init.bitfields |= 0b11;
+    }
+    init
 }
 
 /// Transmute a function-list slot the spike left untyped into a real signature.

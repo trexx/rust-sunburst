@@ -42,7 +42,7 @@ use sunburst_capture::{CaptureError, Frame, select};
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{Header, Seq16};
 use sunburst_encode::convert::Converter;
-use sunburst_encode::encoder::{Codec, Encoder};
+use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
 use sunburst_encode::nvenc::Nvenc;
 use sunburst_net::{Consumer, Packetizer, Producer, packet_ring};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
@@ -234,15 +234,10 @@ fn gpu_loop(
                 let device: ID3D11Device =
                     unsafe { tf.texture.GetDevice() }.map_err(|e| e.to_string())?;
                 let hdr_meta = capture.caps().hdr_metadata;
-                let built = Encoder::new(
-                    &nvenc,
-                    device.as_raw(),
-                    w,
-                    h,
-                    cfg.codec,
-                    cfg.slices,
-                    hdr_meta,
-                )?;
+                let mut ecfg = EncoderConfig::new(cfg.codec, w, h);
+                ecfg.slices = cfg.slices;
+                ecfg.hdr = hdr_meta;
+                let built = Encoder::new(&nvenc, device.as_raw(), &ecfg)?;
                 let e = encoder.insert(built);
                 let sequence = match cfg.codec {
                     Codec::Hevc => e.sequence_header()?,
@@ -263,7 +258,11 @@ fn gpu_loop(
         need_keyframe = false;
         packetizer.begin_frame(fid, qpc, keyframe);
         // Each slice/tile: packetize and push to the send thread as it completes.
-        enc.encode_slices(p010_raw, |unit| {
+        let req = PicRequest {
+            timestamp: fid.0 as u64,
+            force_idr: keyframe,
+        };
+        enc.encode_slices(p010_raw, req, |unit| {
             instr::record(Stage::EncodeUnitOut, fid.0 as u32);
             packetizer.push_unit(unit, |pkt| {
                 producer.push(pkt);

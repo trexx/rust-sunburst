@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use sunburst_capture::tocuda::NvFbcCapture;
     use sunburst_capture::{Capture, Frame};
     use sunburst_encode::cuda_convert::CudaConverter;
-    use sunburst_encode::encoder::{Codec, Encoder};
+    use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
     use sunburst_encode::nvenc::Nvenc;
 
     let frame_count: u32 = std::env::args()
@@ -57,18 +57,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // converter. NvFBC's caps carry no HDR metadata yet, so `None`.
         let enc = match &mut encoder {
             Some(e) => e,
-            None => encoder.insert(Encoder::new_cuda(
-                &nvenc,
-                context,
-                w,
-                h,
-                codec,
-                slices,
-                None,
-                conv.pitch(),
-            )?),
+            None => {
+                let mut ecfg = EncoderConfig::new(codec, w, h);
+                ecfg.slices = slices;
+                encoder.insert(Encoder::new_cuda(&nvenc, context, &ecfg, conv.pitch())?)
+            }
         };
-        enc.encode_slices(p010 as *mut c_void, |slice| {
+        let req = PicRequest {
+            timestamp: written as u64,
+            force_idr: written == 0,
+        };
+        enc.encode_slices(p010 as *mut c_void, req, |slice| {
             bytes += slice.len();
             let _ = file.write_all(slice);
         })?;

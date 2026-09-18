@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use sunburst_capture::{Frame, select};
     use sunburst_encode::convert::Converter;
-    use sunburst_encode::encoder::{Codec, Encoder};
+    use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
     use sunburst_encode::nvenc::Nvenc;
     use windows::Win32::Graphics::Direct3D11::ID3D11Device;
     use windows::core::Interface;
@@ -65,18 +65,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => {
                 // SAFETY: a captured texture always has a live device.
                 let device: ID3D11Device = unsafe { tf.texture.GetDevice() }?;
-                encoder.insert(Encoder::new(
-                    &nvenc,
-                    device.as_raw(),
-                    w,
-                    h,
-                    codec,
-                    slices,
-                    hdr,
-                )?)
+                let mut ecfg = EncoderConfig::new(codec, w, h);
+                ecfg.slices = slices;
+                ecfg.hdr = hdr;
+                encoder.insert(Encoder::new(&nvenc, device.as_raw(), &ecfg)?)
             }
         };
-        enc.encode_slices(p010_raw, |slice| {
+        // A keyframe on the first frame; the rest predict from it.
+        let req = PicRequest {
+            timestamp: written as u64,
+            force_idr: written == 0,
+        };
+        enc.encode_slices(p010_raw, req, |slice| {
             bytes += slice.len();
             let _ = file.write_all(slice);
         })?;
