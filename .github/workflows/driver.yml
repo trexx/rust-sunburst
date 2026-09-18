@@ -59,7 +59,9 @@ jobs:
           $core = $env:CORE_DLL
           $fs = [System.IO.File]::OpenRead((Resolve-Path $core))
           $pe = New-Object System.Reflection.PortableExecutable.PEReader($fs)
-          $md = $pe.GetMetadataReader()
+          # GetMetadataReader is a C# extension method (PEReaderExtensions), which
+          # PowerShell cannot dispatch as an instance method — call the static form.
+          $md = [System.Reflection.Metadata.PEReaderExtensions]::GetMetadataReader($pe)
           $base = $pe.PEHeaders.CorHeader.ResourcesDirectory.RelativeVirtualAddress
           New-Item -ItemType Directory -Force -Path extracted | Out-Null
           $count = 0
