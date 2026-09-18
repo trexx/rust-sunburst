@@ -10,30 +10,43 @@
 //! Input is the exception. It is forwarded to a sink the server supplies,
 //! because injecting it is the one genuinely platform-bound part.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
-use sunburst_core::proto::{AppListing, Hello, InputEvent, PairRequest, SessionKey};
+use sunburst_core::proto::{
+    AppListing, DecoderQuirks, Feedback, Hello, InputEvent, PairRequest, Seq16, SessionConfig,
+    SessionKey,
+};
 // Re-exported so callers of this crate do not need to reach past it for the
-// seam its own handler is generic over.
+// seams its own handler is generic over.
 use sunburst_net::{ControlHandler, Outbound};
-pub use sunburst_net::{InputSink, NoInput};
+pub use sunburst_net::{InputSink, NoInput, NoStream, StreamControl};
 
 use crate::api::AppState;
 use crate::client::QuirksRecord;
 
-pub struct WebHandler<S: InputSink> {
+/// Wires the control channel to [`AppState`] (`ControlHandler`), the input
+/// injector (`InputSink`), and the video-session manager (`StreamControl`). The
+/// last is generic so the Windows `SessionManager` and the test `NoStream` both
+/// slot in without this crate depending on either.
+pub struct WebHandler<S: InputSink, T: StreamControl> {
     state: Arc<AppState>,
     input: S,
+    stream: T,
 }
 
-impl<S: InputSink> WebHandler<S> {
-    pub fn new(state: Arc<AppState>, input: S) -> WebHandler<S> {
-        WebHandler { state, input }
+impl<S: InputSink, T: StreamControl> WebHandler<S, T> {
+    pub fn new(state: Arc<AppState>, input: S, stream: T) -> WebHandler<S, T> {
+        WebHandler {
+            state,
+            input,
+            stream,
+        }
     }
 }
 
-impl<S: InputSink> ControlHandler for WebHandler<S> {
+impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
     fn pairing_armed(&self, now: u64) -> bool {
         self.state.pairing_armed(now)
     }
@@ -65,8 +78,41 @@ impl<S: InputSink> ControlHandler for WebHandler<S> {
         self.state.client_keys()
     }
 
-    fn on_hello(&mut self, client: u32, _hello: Hello) {
+    fn client_secret(&self, client: u32) -> Option<[u8; 32]> {
+        self.state.client_secret(client)
+    }
+
+    fn on_hello(&mut self, client: u32, from: SocketAddr, hello: Hello) -> Option<SessionConfig> {
         self.state.touch_last_seen(client, unix_now());
+        // Seed the session with the quirks recorded at pairing; a fresh
+        // `DecoderQuirks` message can refine them afterwards.
+        let quirks = self.state.client_quirks(client).unwrap_or_default();
+        self.stream.session_start(client, from, &hello, quirks)
+    }
+
+    fn on_quirks(&mut self, client: u32, quirks: DecoderQuirks) {
+        self.state.touch_last_seen(client, unix_now());
+        self.stream.on_quirks(client, quirks);
+    }
+
+    fn on_request_idr(&mut self, client: u32) {
+        self.stream.on_request_idr(client);
+    }
+
+    fn on_resize(&mut self, client: u32, width: u32, height: u32, refresh_mhz: u32) {
+        self.stream.on_resize(client, width, height, refresh_mhz);
+    }
+
+    fn on_nack(&mut self, client: u32, frame_id: Seq16, body: &[u8]) {
+        self.stream.on_nack(client, frame_id, body);
+    }
+
+    fn on_feedback(&mut self, client: u32, feedback: Feedback) {
+        self.stream.on_feedback(client, feedback);
+    }
+
+    fn session_stop(&mut self, client: u32) {
+        self.stream.session_stop(client);
     }
 
     fn on_app_list(&mut self) -> Vec<AppListing> {
@@ -102,12 +148,16 @@ impl<S: InputSink> ControlHandler for WebHandler<S> {
 
     fn on_bye(&mut self, client: u32) {
         self.state.touch_last_seen(client, unix_now());
+        self.stream.session_stop(client);
     }
 
-    /// The output effects the injector has produced since the last tick — rumble
-    /// and rich pad output a game wrote to the virtual controllers.
+    /// Everything the server originates since the last tick: the injector's
+    /// rumble and pad output, plus the session manager's `CodecPrivate`, cursor
+    /// updates and `SecureDesktop`.
     fn drain_outbound(&mut self) -> Vec<Outbound> {
-        self.input.drain_outbound()
+        let mut out = self.input.drain_outbound();
+        out.append(&mut self.stream.drain_outbound());
+        out
     }
 }
 

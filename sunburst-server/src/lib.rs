@@ -25,7 +25,7 @@ use sunburst_encode::encoder::Codec;
 use sunburst_input::Injector;
 use sunburst_net::Endpoint;
 use sunburst_web::api::AppState;
-use sunburst_web::{Store, WebHandler, http};
+use sunburst_web::{NoStream, Store, WebHandler, http};
 
 /// Load state, bind, and serve until the process ends.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,7 +55,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // injector maps sections but does not create device nodes.
     let driver_inf = std::env::var_os("SUNBURST_DRIVER_INF").map(std::path::PathBuf::from);
     let injector = Injector::start(driver_inf)?;
-    let mut endpoint = Endpoint::bind(stream_addr, WebHandler::new(Arc::clone(&state), injector))?;
+    let mut endpoint = Endpoint::bind(
+        stream_addr,
+        WebHandler::new(Arc::clone(&state), injector, NoStream),
+    )?;
 
     // Bring-up hook for the frame path. There is no session-negotiation signal
     // yet — the client-connected event and codec negotiation land with

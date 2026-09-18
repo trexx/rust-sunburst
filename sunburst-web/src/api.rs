@@ -206,6 +206,18 @@ impl AppState {
             .map(|c| c.secret)
     }
 
+    /// The decoder quirks a client reported at pairing, for seeding a session
+    /// before any fresh `DecoderQuirks` message arrives.
+    pub fn client_quirks(&self, client_id: u32) -> Option<sunburst_core::proto::DecoderQuirks> {
+        self.inner
+            .lock()
+            .expect("not poisoned")
+            .clients
+            .iter()
+            .find(|c| c.id == client_id)
+            .map(|c| c.quirks.into())
+    }
+
     /// Whether pairing is open. Consulted before any unauthenticated packet is
     /// looked at.
     pub fn pairing_armed(&self, now: u64) -> bool {

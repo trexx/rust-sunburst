@@ -24,7 +24,9 @@ pub mod spsc;
 pub mod video;
 
 pub use endpoint::{ClientEndpoint, Endpoint, MAX_CONTROL_PAYLOAD};
-pub use handler::{ControlHandler, InputSink, NoInput, Outbound, Recording};
+pub use handler::{
+    ControlHandler, InputSink, NoInput, NoStream, Outbound, Recording, StreamControl,
+};
 pub use owd::{OwdGradient, TickUnwrap};
 pub use rate::{Bounds, RateController};
 pub use refinval::{Av1RefState, HevcRefState, IntraRefresh, Recovery, RefState};

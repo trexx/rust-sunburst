@@ -68,7 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream_addr = SocketAddr::new(web.bind, config.stream.port);
     let mut endpoint = Endpoint::bind(
         stream_addr,
-        WebHandler::new(Arc::clone(&state), sunburst_web::NoInput),
+        WebHandler::new(
+            Arc::clone(&state),
+            sunburst_web::NoInput,
+            sunburst_web::NoStream,
+        ),
     )?;
     let stop = Box::leak(Box::new(AtomicBool::new(false)));
     std::thread::spawn(move || {

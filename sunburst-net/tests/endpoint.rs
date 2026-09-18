@@ -630,3 +630,176 @@ fn a_forged_rumble_does_not_verify() {
         "a rumble packet verified under the wrong key"
     );
 }
+
+// ---- Session-key handshake and the data channel -------------------------
+
+use sunburst_core::proto::{Feedback, Nack, Seq16, SessionConfig, StreamCodec, codecs};
+
+const PAIR_SECRET: [u8; 32] = [0x5C; 32];
+const CLIENT_NONCE: [u8; NONCE_LEN] = [0x9A; NONCE_LEN];
+const SERVER_NONCE: [u8; NONCE_LEN] = [0x3B; NONCE_LEN];
+
+fn session_config() -> SessionConfig {
+    SessionConfig {
+        session_id: 1,
+        codec: StreamCodec::Hevc,
+        width: 3840,
+        height: 2160,
+        fps_mhz: 59_940,
+        bitrate_kbps: 120_000,
+        hdr: None,
+        intra_refresh: false,
+        ref_invalidation: true,
+        slices: 4,
+        server_nonce: SERVER_NONCE,
+        qpc_freq_hz: 10_000_000,
+        server_ns: 0,
+        hello_delay_ns: 0,
+    }
+}
+
+fn hello_with(nonce: [u8; NONCE_LEN]) -> Hello {
+    Hello {
+        client_id: 3,
+        name: "Living room".into(),
+        abi: "arm64-v8a".into(),
+        width: 3840,
+        height: 2160,
+        refresh_mhz: 59_940,
+        client_nonce: nonce,
+        clock_offset_ns: 0,
+        codecs: codecs::HEVC_MAIN10,
+    }
+}
+
+/// Pair a client by secret, complete the Hello→SessionConfig handshake, and
+/// return a client whose input is signed with the derived session key.
+fn switched_client(server: &Server) -> ClientEndpoint {
+    let mut client = ClientEndpoint::connect_paired(server.addr, PAIR_SECRET).expect("connect");
+    client.send_hello(hello_with(CLIENT_NONCE)).expect("hello");
+    // Receiving the config is what switches the client's key.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::SessionConfig(_)) = client.recv_control().expect("recv") {
+            break;
+        }
+        client.tick().expect("tick");
+        assert!(Instant::now() < deadline, "no SessionConfig arrived");
+    }
+    client
+}
+
+#[test]
+fn hello_offers_a_session_and_input_switches_to_the_session_key() {
+    let server = Server::start(
+        Recording::new()
+            .with_secret(3, PAIR_SECRET)
+            .with_session_config(session_config()),
+    );
+    let mut client = switched_client(&server);
+
+    server.wait_for("the hello", |r| !r.hellos.is_empty());
+    server.recording(|r| {
+        assert_eq!(r.hellos[0].0, 3);
+        assert_eq!(r.hellos[0].2.client_nonce, CLIENT_NONCE);
+    });
+
+    // Input is now signed with the derived session key; the server verifies it
+    // against the same key it installed.
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("session-key input", |r| r.inputs.len() == 1);
+    server.recording(|r| assert_eq!(r.inputs[0].0, 3));
+}
+
+#[test]
+fn once_switched_a_pairing_key_input_is_refused() {
+    let server = Server::start(
+        Recording::new()
+            .with_secret(3, PAIR_SECRET)
+            .with_session_config(session_config()),
+    );
+    let mut client = switched_client(&server);
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the switched input", |r| r.inputs.len() == 1);
+
+    // A packet signed with the long-lived pairing key, as a captured
+    // pre-switch packet or a naive forger would produce. The session has
+    // switched, so the data channel no longer accepts it.
+    let pairing = ClientEndpoint::connect(server.addr, Some(SessionKey::from_bytes(PAIR_SECRET)))
+        .expect("connect");
+    let mut impostor = pairing;
+    impostor
+        .send_input(&InputPacket {
+            input_seq: 2,
+            event: press(),
+        })
+        .expect("send");
+    std::thread::sleep(Duration::from_millis(200));
+    server.recording(|r| {
+        assert_eq!(
+            r.inputs.len(),
+            1,
+            "a pairing-key input was accepted after the session key switch"
+        );
+    });
+}
+
+#[test]
+fn nack_and_feedback_reach_the_handler() {
+    // A session that never switched (no Hello) uses the pairing key on the data
+    // channel, which is enough to exercise the NACK/feedback routing.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("establish the session");
+    server.wait_for("the session", |r| r.inputs.len() == 1);
+
+    client.send_nack(Seq16(42), &[1, 5, 9]).expect("nack");
+    client.send_nack(Seq16(7), &[]).expect("abandon");
+    client
+        .send_feedback(&Feedback {
+            recv_timestamp: 123,
+            frames_received: 60,
+            frames_dropped: 0,
+            jitter_buffer_ms: 4,
+            decode_p99_us: 9000,
+            owd_gradient: -250,
+        })
+        .expect("feedback");
+
+    server.wait_for("nack + feedback", |r| {
+        r.nacks.len() == 2 && !r.feedbacks.is_empty()
+    });
+    server.recording(|r| {
+        assert_eq!(r.nacks[0].0, 3);
+        assert_eq!(r.nacks[0].1, Seq16(42));
+        let nack = Nack::decode(&r.nacks[0].2).expect("a nack body");
+        assert_eq!(nack.missing().collect::<Vec<_>>(), vec![1, 5, 9]);
+        assert!(Nack::decode(&r.nacks[1].2).unwrap().is_abandon());
+        assert_eq!(r.feedbacks[0].1.owd_gradient, -250);
+    });
+}
+
+#[test]
+fn an_unauthenticated_nack_is_dropped() {
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+    // No key, so the NACK is unsigned.
+    let client = ClientEndpoint::connect(server.addr, None).expect("connect");
+    client.send_nack(Seq16(1), &[0]).expect("send");
+    std::thread::sleep(Duration::from_millis(200));
+    server.recording(|r| assert!(r.nacks.is_empty(), "an unsigned NACK was honoured"));
+}
