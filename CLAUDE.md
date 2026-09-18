@@ -51,11 +51,20 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   DDA goes black on DRM-protected content and dies on the secure desktop. It is
   0.86–0.94× DDA on throughput and **1.2–1.5ms worse on latency**, so it is not
   kept for speed; that was the open question and it has been answered.
-- **The `Capture` trait yields a D3D11 texture**, whatever produced it. NvFBC
-  hands back a CUDA device pointer, so that backend registers it with
-  `cuGraphicsD3D11RegisterResource` and copies device-to-device. One HLSL shader,
-  one NVENC session type, one frame path — the interop copy is a cost only the
-  opt-in backend pays.
+- **The `Capture` trait yields a backend-tagged frame** — `Frame::Texture` (a
+  D3D11 texture, from DDA/WGC) or `Frame::Cuda` (a CUDA surface, from NvFBC).
+  Each backend then takes its **shortest path** to NVENC: DDA/WGC → HLSL convert →
+  NVENC DirectX input; **NvFBC stays CUDA-native** → a CUDA convert kernel → NVENC
+  `CUDADEVICEPTR` input, never bounced through D3D11. This revises the original
+  "the trait yields a D3D11 texture whatever produced it; NvFBC copies device-to-
+  device via `cuGraphicsD3D11RegisterResource`": DDA/WGC and NvFBC are mutually
+  exclusive at runtime, so unifying them onto one D3D11 path bought no sharing and
+  only added a device-to-device copy on the opt-in resilience backend. The cost of
+  the split, paid deliberately: the scRGB→P010 convert exists twice (an HLSL
+  compute shader for the D3D11 backends, a P010 CUDA kernel for NvFBC) and the
+  encoder registers two NVENC input types. (NvFBC's own convert kernel + NVENC-CUDA
+  session is the one remaining piece; the D3D11 path — `sunburst-capture` DDA/WGC,
+  `sunburst-encode::convert` HLSL, `sunburst-encode::encoder` HEVC — is built.)
 - **Render the cursor client-side** from separately-delivered shape data. Removes
   the network round-trip from perceived pointer latency. Biggest single
   responsiveness win in the system.

@@ -11,3 +11,27 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# DDA/WGC yield an ID3D11Texture2D; NvFBC yields a CUDA pointer via nvcuda.dll.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    # DXGI_OUTPUT_DESC{,1} carry an HMONITOR, a GDI type.
+    "Win32_Graphics_Gdi",
+    # NvFBC / nvcuda.dll are loaded at runtime (no build dep).
+    "Win32_System_LibraryLoader",
+    # WGC (Windows.Graphics.Capture) + its Win32 interop.
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
+    # Backend selection: DPI awareness + reliable OS version.
+    "Win32_UI_HiDpi",
+    "Win32_System_SystemInformation",
+    "Wdk_System_SystemServices",
+] }
