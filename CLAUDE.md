@@ -164,7 +164,8 @@ sunburst-net/      UDP, pacing, NACK, rate control
 sunburst-server/   orchestration; tokio lives here and only here
 sunburst-web/      management API: clients, sessions, config, apps. Cross-platform.
 sunburst-android/  cdylib + JNI shim
-android/           Gradle project; Kotlin owns Activity + SurfaceView only
+android/           Gradle project; Kotlin owns Activity + SurfaceView, and
+                   forwards the input and platform queries with no NDK equivalent
 web/               Vite + React + TS management UI
 tools/             development tools. Kept, unlike spikes/.
 spikes/            Phase 0 throwaway. Deletable by design -- with one exception, below.

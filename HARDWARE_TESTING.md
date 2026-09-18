@@ -965,12 +965,52 @@ fakeclient stream --server <box>:47811 --codecs hevc --out a.265 --secs 60 --sta
       device" criterion.
 - [ ] The instrumentation Section 4 rows for env S can be filled from these runs.
 
-Not covered here, and why: **client-side cursor rendering** is deferred to the
-Phase 5 Android client that renders it -- the `CursorShape`/`CursorPosition` wire
-messages exist, but the server-side GDI capture cannot be validated without the
-consumer. **HDR mastering in `SessionConfig`** is `None` for now; the encoder
+Not covered here, and why: **client-side cursor rendering** landed in Phase 5
+(server-side GDI capture and the client overlay both), validated in §10 rather
+than here. **HDR mastering in `SessionConfig`** is `None` for now; the encoder
 writes the ST 2086 metadata into the bitstream, and populating the handshake
 block from the display is a Phase 5 refinement.
+
+---
+
+## 10. Phase 5 — the Android client, glass to glass (env A and B)
+
+The client is built, packaged and clippy-linted for both ABIs, but nothing here
+is measured. Sideload the debug APK on the Shield (HEVC) and the Homatics (AV1),
+server on the 4070, wired LAN.
+
+- [ ] **Pairs from the TV.** Arm pairing in the web UI; the app shows a PIN; type
+      it into the UI; the client stores the secret and reconnects paired after a
+      restart. A wrong PIN fails to stream (the derived secrets differ).
+- [ ] **Streams and decodes.** 4K60 to the `SurfaceView`: HEVC on the Shield, AV1
+      on the Homatics. Watch for the av1C silent-failure (configures, outputs
+      nothing) — a black screen with no decoder error is that.
+- [ ] **HDR end to end.** `Display.HdrCapabilities` positive, the panel enters
+      HDR, colours and highlights correct, no UI-text chroma fringing. (The
+      mastering rides in the bitstream today; `SessionConfig.hdr` is not yet
+      populated server-side — that is the KEY_HDR_STATIC_INFO path, ready and
+      inert.)
+- [ ] **No microstutter over 30 minutes** — the vsync-timed `releaseOutputBuffer`,
+      not immediate release. If it stutters, revisit the present timestamp and
+      the jitter-buffer min depth.
+- [ ] **Input in a real game.** Keyboard, mouse (relative via captured pointer,
+      wheel, buttons), and a gamepad all work in Steam Big Picture. Enhanced
+      Pointer Precision off on the server (CLAUDE.md).
+- [ ] **Glass-to-glass measured** (high-speed camera or LED-on-input rig), within
+      the 60–100 ms budget. The §4 client instrumentation rows
+      (recv/jitter/dec-submit/dec-out/present) fill from the same runs.
+- [ ] **Cursor renders client-side** from the server's CursorShape/CursorPosition
+      and tracks; a changed shape (pointer/hand/text) updates. Monochrome cursors
+      and no-alpha shapes are the ones to eye. Local prediction (moving the
+      overlay from the client's own mouse deltas) is the refinement if the
+      round-tripped position feels laggy.
+- [ ] **Decoder quirks.** These are not probeable (decoder behaviour, not
+      capability): confirm the Shield takes reference invalidation and the
+      Homatics AV1 takes intra-refresh; on the Homatics HEVC, retest with periodic
+      IDR before concluding the decoder is broken (CLAUDE.md). Set the enabling
+      quirks per device once confirmed.
+- [ ] **PerformanceHintManager** keeps the client thread on a fast core on the
+      Amlogic — check for a frame-time improvement with it on vs. off.
 
 ---
 

@@ -224,6 +224,19 @@ converges within 2s of a bandwidth change and does not oscillate.
 
 First glass-to-glass number.
 
+**Status: landed, box-validation pending.** The client is built and packaged:
+the Rust cdylib for both ABIs inside the APK, pairing from the TV, decode to a
+`SurfaceView` via the `ndk` crate's AMediaCodec, vsync-timed present,
+keyboard/mouse/gamepad input, HDR static info, `setFrameRate`, a
+`PerformanceHintManager` session, and client-side cursor rendering from
+server-side capture. What remains is the box run — HARDWARE_TESTING §10. The
+pure maps (keycode/axis/HDR/PIN) are host-tested; the device work is
+`cargo xwin`/`assembleDebug`-verified and clippy-linted on the Android target,
+not yet measured. **Build tooling:** the `rust-android-gradle` plugin turned out
+incompatible with the latest AGP (it uses the removed `AppExtension`), so a small
+hand-rolled Gradle task runs the same `cargo build` CI uses and stages the `.so`;
+AGP is on 9.4.0.
+
 - Rust `cdylib`, both ABIs. Network, depacketization, jitter buffer, decode
   driving all in Rust via the `ndk` crate. Kotlin owns only Activity + `SurfaceView`.
 - Codec selection from the Phase 0 enumeration; quirks sent at handshake.
