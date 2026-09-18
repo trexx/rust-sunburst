@@ -1,0 +1,22 @@
+//
+// PLACEHOLDER — regenerate with .github/workflows/cuda-kernel.yml
+// (`nvcc -ptx argb10_to_p010.cu`). This checked-in copy is a valid but **no-op**
+// stub: it lets the crate compile and the module load, but converts nothing, so a
+// build without the CI-generated PTX produces a black frame rather than a crash.
+// The real kernel is a vendored artifact, like the driver DLLs.
+//
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry argb10_to_p010(
+    .param .u64 _p0,
+    .param .u32 _p1,
+    .param .u64 _p2,
+    .param .u32 _p3,
+    .param .u32 _p4,
+    .param .u32 _p5
+)
+{
+    ret;
+}

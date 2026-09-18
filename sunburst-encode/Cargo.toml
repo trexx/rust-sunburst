@@ -11,3 +11,18 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
+# The encoder consumes the capture layer's Frame (D3D11 texture / CUDA surface).
+sunburst-capture.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# NVENC is loaded at runtime from nvEncodeAPI64.dll (no build dep); the convert
+# stage compiles its HLSL via D3DCompile at runtime too.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    # The scRGB→P010 convert stage: a D3D11 compute shader, runtime-compiled.
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi_Common",
+] }

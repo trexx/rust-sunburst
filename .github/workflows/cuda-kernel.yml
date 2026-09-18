@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Compile the NvFBC path's ARGB10->P010 CUDA kernel to PTX — an artifact a
+# CUDA toolkit produces that the Linux dev host and the `cargo xwin` build do not
+# have (the project uses the driver API, nvcuda.dll, with no toolkit at runtime).
+# The driver JITs the PTX at load, so it is forward-compatible across GPUs.
+#
+# Manual-only (workflow_dispatch): not part of the CI gate. Download the artifact
+# and vendor it over sunburst-encode/cuda/argb10_to_p010.ptx (the checked-in copy
+# is a no-op placeholder), then commit it with the toolkit version + SHA-256.
+
+name: CUDA kernel PTX
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: PTX virtual arch to target (JITs up to the runtime GPU)
+        default: compute_75
+
+jobs:
+  ptx:
+    name: nvcc -ptx argb10_to_p010.cu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the CUDA toolkit (nvcc)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nvidia-cuda-toolkit
+          nvcc --version
+
+      - name: Compile to PTX
+        run: |
+          set -euo pipefail
+          cd sunburst-encode/cuda
+          nvcc -ptx -arch=${{ github.event.inputs.arch }} \
+            argb10_to_p010.cu -o argb10_to_p010.ptx
+          echo "== head of generated PTX =="
+          head -12 argb10_to_p010.ptx
+          sha256sum argb10_to_p010.ptx | tee SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: argb10_to_p010-ptx-${{ github.event.inputs.arch }}
+          path: |
+            sunburst-encode/cuda/argb10_to_p010.ptx
+            sunburst-encode/cuda/SHA256SUMS.txt
+          if-no-files-found: error

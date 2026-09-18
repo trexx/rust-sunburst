@@ -30,6 +30,8 @@ repository = "https://github.com/trexx/sunburst"
 
 [workspace.dependencies]
 sunburst-core = { path = "sunburst-core" }
+sunburst-capture = { path = "sunburst-capture" }
+sunburst-encode = { path = "sunburst-encode" }
 sunburst-net = { path = "sunburst-net" }
 sunburst-web = { path = "sunburst-web" }
 sunburst-input = { path = "sunburst-input" }
