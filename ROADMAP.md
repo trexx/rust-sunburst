@@ -13,7 +13,9 @@ committing to any of them.
 
 One piece is no longer throwaway: `spikes/probe-windows`'s NvFBC implementation
 is the only working copy in the project and has to be promoted into
-`sunburst-capture` in Phase 3 before this directory is deleted.
+`sunburst-capture` in Phase 3 before this directory is deleted. **That promotion
+is done** (commit `dd805a7`), so `spikes/` is now deletable; the deletion itself
+is left as a deliberate step.
 
 ### 0.1 NvFBC availability — **closed: available, GPU-resident, kept as an option**
 NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
@@ -143,12 +145,14 @@ machine; ViGEm and `SendInput` are testable on none of it.
    reliable layer, the UDP endpoint, and the fake client.
 2. **Input injection** — scancode `SendInput`, mouse modes, desktop re-attach
    *(done)*. Attaches at the `on_input` seam in `sunburst_net::ControlHandler`.
-3. **Gamepad and rumble** — the driver question is settled (ViGEmBus, see
-   `HARDWARE_TESTING.md` §8); the code is not written. `inject.rs` drops `InputEvent::Gamepad` today, and
-   `rumble.rs` defines `Rumble`/`RumbleTracker` that nothing references. Rumble
-   also needs an outbound seam on `Endpoint` that does not exist — and should be
-   designed for Phase 3's four reserved server→client messages too, not for
-   rumble alone.
+3. **Gamepad and rumble** *(landed; driver decision reversed)* — the report
+   stack is ported (`sunburst-input/src/pad/`), `inject.rs` routes
+   `InputEvent::Gamepad`, and the `Outbound` seam on `Endpoint` carries rumble
+   and rich `PadOutput`. The driver question did **not** settle on ViGEmBus:
+   commit `b7d971f` stands up the HIDMaestro UMDF2 virtual-pad device nodes
+   instead ("No ViGEmBus fallback, by decision"), so a pad presents as its
+   native family rather than always an X360. Box validation (a real Steam game,
+   the UAC/lock cycle, Steam Input) is `HARDWARE_TESTING.md` §6/§8.
 
 **Acceptance:** gamepad, keyboard and mouse all work in a real Steam game launched
 from Big Picture. Input survives a UAC prompt and a lock/unlock cycle. Steam Input
@@ -184,6 +188,17 @@ and a Big Picture game launch/exit without a permanent stall.
 ---
 
 ## Phase 4 — Transport (2 weeks)
+
+**Status: landed, box-validation pending.** The protocol logic is host-tested
+(session negotiation and per-session keys, the zero-allocation reassembler and
+jitter buffer, NACK-driven retransmission, the HEVC/AV1 reference-invalidation
+state machines, delay-gradient rate control, the deadline pacer and USO
+batching). The encoder gained force-IDR, `inputTimeStamp`, invalidation and
+seamless bitrate reconfigure; the server starts a session on `Hello` and drives
+recovery, rate control and paced/offloaded send. `fakeclient stream` is the stub
+receiver and the play-on-TV dump. What remains is the box run — see
+`HARDWARE_TESTING.md` §9. Windows-only pieces are compile-verified via
+`cargo xwin`, not yet measured.
 
 - Packetization per PROTOCOL.md. MTU-safe, ≤1200 byte payload.
 - **USO send offload** (`WSASetSockopt(UDP_SEND_MSG_SIZE)`) and URO receive
@@ -302,9 +317,13 @@ about 450.
   the unit here is dead, and it must be reachable from the TV remote — needing a
   working pad to pair a pad defeats the point.
 
-**Scope is set by what survives the ViGEm X360 boundary:** four pads, buttons,
-sticks, triggers, rumble. Motion, trigger rumble and battery-to-host are out —
-XInput has nowhere to put them.
+**Scope is set by what survives the pad boundary:** four pads, buttons, sticks,
+triggers, rumble. Motion, trigger rumble and battery-to-host are out where the
+emulated pad cannot express them. *(This section predates the Phase 2 driver
+reversal: the server now emulates via HIDMaestro device nodes rather than a
+ViGEm X360 pad, so the "X360 boundary" below is the conservative floor, not a
+hard ceiling — a native family can carry more. The MT7612U radio and the
+GIP-from-spec work stand unchanged.)*
 
 **Two routes past that boundary were measured and both closed**
 (`HARDWARE_TESTING.md` §8). **USB/IP** would have forwarded the adapter to

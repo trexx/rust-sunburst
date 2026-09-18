@@ -62,9 +62,12 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   only added a device-to-device copy on the opt-in resilience backend. The cost of
   the split, paid deliberately: the scRGB→P010 convert exists twice (an HLSL
   compute shader for the D3D11 backends, a P010 CUDA kernel for NvFBC) and the
-  encoder registers two NVENC input types. (NvFBC's own convert kernel + NVENC-CUDA
-  session is the one remaining piece; the D3D11 path — `sunburst-capture` DDA/WGC,
-  `sunburst-encode::convert` HLSL, `sunburst-encode::encoder` HEVC — is built.)
+  encoder registers two NVENC input types. (The NvFBC CUDA-native spine —
+  convert kernel + NVENC-CUDA session — is now wired into
+  `sunburst-server::pipeline` beside the built D3D11 path; the one outstanding
+  piece is the real convert PTX that `cuda-kernel.yml` produces and a maintainer
+  vendors over the placeholder. Until then the CUDA path encodes a black frame,
+  by design.)
 - **Render the cursor client-side** from separately-delivered shape data. Removes
   the network round-trip from perceived pointer latency. Biggest single
   responsiveness win in the system.

@@ -921,6 +921,59 @@ exists.
 
 ---
 
+## 9. Phase 3/4 — capture → encode → transport (env S, receiver on the Linux box)
+
+The whole transport is host-tested and the Windows half compiles under
+`cargo xwin`, but nothing here is measured. These run the server on the 4070 and
+`fakeclient stream` on the Linux box across the wired LAN. Pair once, then:
+
+```
+fakeclient stream --server <box>:47811 --codecs hevc --out a.265 --secs 60 --stats
+```
+
+- [ ] **A session starts on `Hello`.** `SessionConfig` then `CodecPrivate`
+      arrive; the session-key switch holds (input still verifies afterwards); the
+      web UI Sessions panel shows it, and a UI disconnect stops it.
+- [ ] **Sustained 4K60 HEVC, 30 min:** 0 abandons, 0 keyframes after the first,
+      the instrumentation ring reports 0 dropped samples. Repeat `--codecs av1
+      --out a.ivf`.
+- [ ] **2% loss recovers by retransmission:** `--drop 2` -> 0 keyframes after the
+      first, abandons ~ 0. `--drop 2 --no-retransmit` -> abandons occur and the
+      server log shows invalidations, **not** forced IDRs, on HEVC at `dpb_depth
+      8`.
+- [ ] **Rate control converges and holds.** On the receiver:
+      `tc qdisc add dev <nic> root tbf rate 80mbit burst 32kbit latency 50ms`.
+      The bitrate `GET /api/sessions` reports falls under 80 Mbps within 2 s and
+      does not oscillate; removing the qdisc lets it climb back.
+- [ ] **USO on vs off:** the `send`-stage p99 with USO against
+      `SUNBURST_NO_USO=1`, and which path actually ran.
+- [ ] **PR-gate p99s** for the send, encode, capture and governor changes,
+      against the pre-merge baseline (Section 4). Noise floor ~3%: take more runs
+      or say "inconclusive" rather than quoting a 1% move.
+- [ ] **AccessLost and secure desktop.** Alt-tab into a fullscreen game and back:
+      the pipeline rebuilds and re-sends `CodecPrivate`, the stream continues.
+      Lock the screen: `SecureDesktop{active:1}` then `{0}` on unlock, and the
+      client never shows a frozen frame.
+- [ ] **NvFBC spine** (after the real PTX is vendored, `SUNBURST_NVFBC=1`): the
+      CUDA-native path streams. With the placeholder PTX it streams black -- the
+      documented behaviour.
+- [ ] **WGC frame-arrival wait:** confirm the event-signalled wait holds up under
+      a real 4K60 run -- no missed frames, no added latency versus the DDA path.
+- [ ] **Phase 3 playback:** mux the dumps (`ffmpeg -i a.265 -c copy a.mkv`; the
+      `.ivf` plays directly) and confirm they play on the Shield and the Homatics
+      with HDR active. This closes Phase 3's "both streams play on their target
+      device" criterion.
+- [ ] The instrumentation Section 4 rows for env S can be filled from these runs.
+
+Not covered here, and why: **client-side cursor rendering** is deferred to the
+Phase 5 Android client that renders it -- the `CursorShape`/`CursorPosition` wire
+messages exist, but the server-side GDI capture cannot be validated without the
+consumer. **HDR mastering in `SessionConfig`** is `None` for now; the encoder
+writes the ST 2086 metadata into the bitstream, and populating the handshake
+block from the display is a Phase 5 refinement.
+
+---
+
 ## Hardware still needed
 
 | Needed for | Hardware |
