@@ -11,18 +11,20 @@
 //! next [`Capture::acquire`] — the previous frame is held until then so the pool
 //! does not recycle its slot underneath the convert stage.
 //!
-//! WGC delivers frames by event; this pulls. [`Capture::acquire`] calls
-//! `TryGetNextFrame`, which returns `E_POINTER` when nothing is ready — polled
-//! within the timeout budget. (A `FrameArrived`-signalled wait is a later
-//! refinement; the poll keeps the first cut simple and correct.)
+//! WGC delivers frames by event. A `FrameArrived` handler signals a Win32
+//! auto-reset event, and [`Capture::acquire`] waits on it rather than
+//! sleep-polling `TryGetNextFrame` — the wait wakes the instant a frame lands,
+//! where a 1 ms poll adds up to a millisecond of avoidable latency.
 
 use std::time::{Duration, Instant};
 
+use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Foundation::{E_POINTER, POINT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
@@ -33,11 +35,12 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, IDXGIDevice,
 };
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::core::{HRESULT, Interface};
+use windows::core::{HRESULT, IInspectable, Interface};
 
 use crate::{Backend, Caps, Capture, CaptureError, Frame, FrameMeta, TextureFormat, TextureFrame};
 
@@ -51,6 +54,9 @@ pub struct WgcCapture {
     /// The frame handed out last, kept alive so the pool slot the caller is still
     /// reading is not recycled until the next `acquire`.
     current: Option<Direct3D11CaptureFrame>,
+    /// Auto-reset event the `FrameArrived` handler signals, so `acquire` blocks
+    /// until a frame is ready instead of polling.
+    frame_ready: HANDLE,
     caps: Caps,
 }
 
@@ -97,6 +103,24 @@ impl WgcCapture {
                 size,
             )
             .map_err(backend)?;
+            // Auto-reset, initially unsignalled: each successful wait consumes one
+            // arrival, and any missed signal is caught by the timeout in `acquire`.
+            let frame_ready = CreateEventW(None, false, false, None).map_err(backend)?;
+            // Signal the event from the frame-arrived callback. The handler is
+            // `'static`, so it carries the handle as a raw `isize` (a `HANDLE` is
+            // not `Send`); the pool holds the registration until it is dropped.
+            let raw = frame_ready.0 as isize;
+            let handler = TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
+                move |_pool, _args| {
+                    // `raw` is the live auto-reset event (already inside `new`'s
+                    // unsafe block); SetEvent only signals it, and the handler
+                    // lives no longer than the pool that holds it.
+                    let _ = SetEvent(HANDLE(raw as *mut core::ffi::c_void));
+                    Ok(())
+                },
+            );
+            pool.FrameArrived(&handler).map_err(backend)?;
+
             let session = pool.CreateCaptureSession(&item).map_err(backend)?;
             session.StartCapture().map_err(backend)?;
 
@@ -107,6 +131,7 @@ impl WgcCapture {
                 _session: session,
                 pool,
                 current: None,
+                frame_ready,
                 caps: Caps {
                     backend: Backend::Wgc,
                     // The FP16 pool carries scRGB; whether the output is true HDR
@@ -150,12 +175,19 @@ impl Capture for WgcCapture {
                         },
                     })));
                 }
-                // No frame ready yet — poll within the timeout budget.
+                // No frame ready yet — wait on the arrival event within the
+                // remaining budget rather than spinning.
                 Err(e) if e.code() == E_POINTER => {
-                    if Instant::now() >= deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return Ok(None);
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    let ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+                    // SAFETY: `frame_ready` is our live auto-reset event.
+                    let waited = unsafe { WaitForSingleObject(self.frame_ready, ms) };
+                    if waited != WAIT_OBJECT_0 {
+                        return Ok(None); // timed out; the caller reuses the last frame
+                    }
                 }
                 Err(e) if is_device_lost(e.code()) => return Err(CaptureError::AccessLost),
                 Err(e) => return Err(CaptureError::Backend(format!("TryGetNextFrame: {e}"))),
@@ -165,6 +197,16 @@ impl Capture for WgcCapture {
 
     fn caps(&self) -> Caps {
         self.caps
+    }
+}
+
+impl Drop for WgcCapture {
+    fn drop(&mut self) {
+        // SAFETY: our event handle, closed once; the pool (dropped with `self`)
+        // unregisters the handler that referenced it.
+        unsafe {
+            let _ = CloseHandle(self.frame_ready);
+        }
     }
 }
 
