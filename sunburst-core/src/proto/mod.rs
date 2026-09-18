@@ -24,8 +24,10 @@
 
 pub mod auth;
 pub mod control;
+pub mod feedback;
 pub mod header;
 pub mod input;
+pub mod nack;
 pub mod padoutput;
 pub mod pairing;
 pub mod rumble;
@@ -33,14 +35,17 @@ pub mod seq;
 
 pub use auth::{MAC_LEN, NONCE_LEN, SessionKey};
 pub use control::{
-    AppListing, ClientControl, ClientMessage, DecoderQuirks, Hello, PairRequest, ServerControl,
-    ServerMessage,
+    AppListing, CURSOR_CHUNK_MAX, CURSOR_FORMAT_BGRA32, ClientControl, ClientMessage, CursorChunk,
+    DecoderQuirks, HdrMastering, Hello, PairRequest, ServerControl, ServerMessage, SessionConfig,
+    StreamCodec, codecs,
 };
+pub use feedback::{FEEDBACK_BODY_LEN, Feedback};
 pub use header::{Flags, HEADER_LEN, Header, MAX_PAYLOAD, PacketType};
 pub use input::{
     Battery, Finger, GamepadState, Imu, InputEvent, InputKind, InputPacket, MouseButton,
     MouseMotion, Touchpad,
 };
+pub use nack::{NACK_MAX_MISSING, Nack};
 pub use padoutput::{PAD_OUTPUT_MAX_BODY, PadOutput, TriggerEffect};
 pub use pairing::{PIN_DIGITS, TAG_LEN, confirm_tag, derive_secret, tags_match};
 pub use rumble::{Rumble, RumbleTracker};

@@ -12,16 +12,19 @@
 //! desynchronising, which is what allows a client from a later build to talk to
 //! an older server without a version negotiation.
 //!
-//! # What is not implemented yet
+//! # Session negotiation
 //!
-//! `SessionConfig`, `CodecPrivate`, `CursorShape`, `CursorPosition` and
-//! `SecureDesktop` carry no payload here. Their fields depend on decisions
-//! Phases 3 and 5 have not made — `CodecPrivate` in particular is an av1C record
-//! whose construction PROTOCOL.md flags as a silent-failure point — and
-//! inventing their encodings now would mean inventing them twice. Their
-//! discriminants are reserved below so the numbering cannot shift under them,
-//! and they decode to [`ClientControl::Unhandled`] / [`ServerControl::Unhandled`]
-//! in the meantime.
+//! `Hello` (carrying the client's nonce and the codecs it can decode) is
+//! answered by [`SessionConfig`], which pins everything the client needs before
+//! the first frame: codec, geometry, rate, HDR mastering metadata, the server's
+//! nonce for the session key, and the clock facts that let a video header's
+//! `qpc_timestamp` be read on the other machine. [`ServerControl::CodecPrivate`]
+//! follows with the decoder configuration (VPS/SPS/PPS, or an av1C record) and
+//! is sent again whenever the encoder is rebuilt.
+//!
+//! A cursor bitmap is larger than one reliable message, so [`CursorChunk`]
+//! carries it in pieces. Every chunk repeats the shape's head, and the channel
+//! delivers in order, so the receiver appends and never has to reorder.
 
 use super::pairing::{NONCE_LEN, TAG_LEN};
 
@@ -229,12 +232,130 @@ pub struct Hello {
     pub refresh_mhz: u32,
     pub client_nonce: [u8; NONCE_LEN],
     pub clock_offset_ns: i64,
+    /// Bitmask of the codecs the client can decode — [`codecs::HEVC_MAIN10`],
+    /// [`codecs::AV1_MAIN10`] — from its `MediaCodecList` enumeration. The
+    /// server chooses among these; a client never receives a codec it did not
+    /// offer.
+    pub codecs: u8,
+}
+
+/// Bits of [`Hello::codecs`].
+pub mod codecs {
+    pub const HEVC_MAIN10: u8 = 1 << 0;
+    pub const AV1_MAIN10: u8 = 1 << 1;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppListing {
     pub id: u32,
     pub name: String,
+}
+
+/// The codec a session streams. The wire value of `SessionConfig.codec` and
+/// `CodecPrivate.codec`; the encoder crate maps its own `Codec` onto this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum StreamCodec {
+    /// HEVC Main10, subdivided into slices. The Shield's codec.
+    Hevc = 0,
+    /// AV1 Main10, subdivided into tiles. The Homatics' codec.
+    Av1 = 1,
+}
+
+impl StreamCodec {
+    pub const fn from_u8(v: u8) -> Option<StreamCodec> {
+        match v {
+            0 => Some(StreamCodec::Hevc),
+            1 => Some(StreamCodec::Av1),
+            _ => None,
+        }
+    }
+
+    /// The [`Hello::codecs`] bit that advertises this codec.
+    pub const fn hello_bit(self) -> u8 {
+        match self {
+            StreamCodec::Hevc => codecs::HEVC_MAIN10,
+            StreamCodec::Av1 => codecs::AV1_MAIN10,
+        }
+    }
+}
+
+/// HDR mastering metadata, in the SMPTE ST 2086 fixed-point units the
+/// bitstream itself carries: chromaticity in 0.00002 steps, luminance in
+/// 0.0001 cd/m². The client hands these to `MediaFormat.KEY_HDR_STATIC_INFO`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct HdrMastering {
+    /// Red, green, blue `[x, y]`.
+    pub primaries: [[u16; 2]; 3],
+    pub white: [u16; 2],
+    pub max_luminance: u32,
+    pub min_luminance: u32,
+    pub max_cll: u16,
+    pub max_fall: u16,
+}
+
+/// Everything the client needs before the first frame arrives. Sent reliably,
+/// once per session, signed with the pairing key because it carries the nonce
+/// the session key is derived from.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SessionConfig {
+    pub session_id: u32,
+    pub codec: StreamCodec,
+    pub width: u16,
+    pub height: u16,
+    /// Millihertz, the same unit as [`Hello::refresh_mhz`].
+    pub fps_mhz: u32,
+    /// The initial target; the rate controller moves it afterwards.
+    pub bitrate_kbps: u32,
+    /// Present when the stream is HDR (scRGB capture → BT.2020 PQ).
+    pub hdr: Option<HdrMastering>,
+    /// What the server will actually do, given the quirks the client reported
+    /// and what the encoder supports.
+    pub intra_refresh: bool,
+    pub ref_invalidation: bool,
+    /// HEVC slices per frame, or AV1 tiles per axis.
+    pub slices: u8,
+    pub server_nonce: [u8; NONCE_LEN],
+    /// Ticks per second of the clock behind every video header's
+    /// `qpc_timestamp`, so the client can turn ticks into nanoseconds.
+    pub qpc_freq_hz: u64,
+    /// The server's clock, in nanoseconds, when this message was queued.
+    pub server_ns: i64,
+    /// Server time between receiving `Hello` and queuing this, so the client can
+    /// subtract it from its measured round trip: `offset ≈ server_ns −
+    /// t_hello_sent − (rtt − hello_delay_ns) / 2`.
+    pub hello_delay_ns: u32,
+}
+
+/// Pixel format of a [`CursorChunk`]. One value today; a byte on the wire so a
+/// second one never needs a new message kind.
+pub const CURSOR_FORMAT_BGRA32: u8 = 0;
+
+/// Largest `data` a [`CursorChunk`] carries. Well under the reliable channel's
+/// per-message payload once the envelope and the chunk head are counted;
+/// `sunburst-net` asserts that at compile time against its own frame overhead.
+pub const CURSOR_CHUNK_MAX: usize = 1024;
+
+/// One piece of a cursor bitmap. Every chunk repeats the shape's head so a
+/// receiver can start from any of them; the reliable channel's in-order
+/// delivery is what makes appending in arrival order correct.
+///
+/// A hidden cursor is a shape with `width == 0` and no data.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CursorChunk {
+    /// Increments per new shape; a chunk for a shape the receiver has already
+    /// completed is ignored.
+    pub shape_id: u32,
+    pub width: u16,
+    pub height: u16,
+    pub hotspot_x: u16,
+    pub hotspot_y: u16,
+    pub format: u8,
+    /// Pixel bytes for the whole shape.
+    pub total_len: u32,
+    /// This chunk's byte offset into the shape.
+    pub offset: u32,
+    pub data: Vec<u8>,
 }
 
 /// A decoded client → server message.
@@ -278,6 +399,29 @@ pub enum ServerControl {
         server_nonce: [u8; NONCE_LEN],
     },
     AppList(Vec<AppListing>),
+    SessionConfig(SessionConfig),
+    /// The decoder configuration: HEVC VPS/SPS/PPS (Annex-B), or the AV1 av1C
+    /// record (`csd-0`). PROTOCOL.md flags av1C as a silent-failure point — a
+    /// wrong record configures fine and outputs nothing — so the bytes are the
+    /// encoder's own, never re-derived here.
+    CodecPrivate {
+        codec: StreamCodec,
+        data: Vec<u8>,
+    },
+    CursorShape(CursorChunk),
+    /// Sent when the server-observed pointer position should override the
+    /// client's own — a warp, or a switch into absolute mode. Throttled.
+    CursorPosition {
+        /// 0–65535, normalised to the captured monitor.
+        x: u16,
+        y: u16,
+        visible: bool,
+    },
+    /// Capture is unavailable (UAC prompt, lock screen, DRM). The client shows
+    /// a placeholder rather than the last frame; `active: false` ends it.
+    SecureDesktop {
+        active: bool,
+    },
     Bye,
     Unhandled(u8),
 }
@@ -351,6 +495,7 @@ impl ClientControl {
                 b.extend_from_slice(&h.refresh_mhz.to_le_bytes());
                 b.extend_from_slice(&h.client_nonce);
                 b.extend_from_slice(&h.clock_offset_ns.to_le_bytes());
+                b.push(h.codecs);
             }
             ClientControl::Quirks(q) => {
                 b.push(q.flags());
@@ -415,6 +560,7 @@ impl ClientControl {
                 refresh_mhz: r.u32()?,
                 client_nonce: r.array::<NONCE_LEN>()?,
                 clock_offset_ns: r.u64()? as i64,
+                codecs: r.u8()?,
             }),
             ClientMessage::DecoderQuirks => {
                 ClientControl::Quirks(DecoderQuirks::from_flags(r.u8()?, r.u32()?))
@@ -444,6 +590,11 @@ impl ServerControl {
         Some(match self {
             ServerControl::PairChallenge { .. } => ServerMessage::PairChallenge,
             ServerControl::AppList(_) => ServerMessage::AppList,
+            ServerControl::SessionConfig(_) => ServerMessage::SessionConfig,
+            ServerControl::CodecPrivate { .. } => ServerMessage::CodecPrivate,
+            ServerControl::CursorShape(_) => ServerMessage::CursorShape,
+            ServerControl::CursorPosition { .. } => ServerMessage::CursorPosition,
+            ServerControl::SecureDesktop { .. } => ServerMessage::SecureDesktop,
             ServerControl::Bye => ServerMessage::Bye,
             ServerControl::Unhandled(_) => return None,
         })
@@ -474,6 +625,65 @@ impl ServerControl {
                     }
                 }
             }
+            ServerControl::SessionConfig(c) => {
+                b.extend_from_slice(&c.session_id.to_le_bytes());
+                b.push(c.codec as u8);
+                b.extend_from_slice(&c.width.to_le_bytes());
+                b.extend_from_slice(&c.height.to_le_bytes());
+                b.extend_from_slice(&c.fps_mhz.to_le_bytes());
+                b.extend_from_slice(&c.bitrate_kbps.to_le_bytes());
+                let flags = u8::from(c.hdr.is_some())
+                    | u8::from(c.intra_refresh) << 1
+                    | u8::from(c.ref_invalidation) << 2;
+                b.push(flags);
+                b.push(c.slices);
+                b.extend_from_slice(&c.server_nonce);
+                b.extend_from_slice(&c.qpc_freq_hz.to_le_bytes());
+                b.extend_from_slice(&c.server_ns.to_le_bytes());
+                b.extend_from_slice(&c.hello_delay_ns.to_le_bytes());
+                if let Some(h) = &c.hdr {
+                    for [x, y] in h.primaries.iter().chain(core::iter::once(&h.white)) {
+                        b.extend_from_slice(&x.to_le_bytes());
+                        b.extend_from_slice(&y.to_le_bytes());
+                    }
+                    b.extend_from_slice(&h.max_luminance.to_le_bytes());
+                    b.extend_from_slice(&h.min_luminance.to_le_bytes());
+                    b.extend_from_slice(&h.max_cll.to_le_bytes());
+                    b.extend_from_slice(&h.max_fall.to_le_bytes());
+                }
+            }
+            ServerControl::CodecPrivate { codec, data } => {
+                b.push(*codec as u8);
+                match u16::try_from(data.len()) {
+                    Ok(len) => {
+                        b.extend_from_slice(&len.to_le_bytes());
+                        b.extend_from_slice(data);
+                    }
+                    Err(_) => err = Err(ControlError::OutOfRange("codec private data")),
+                }
+            }
+            ServerControl::CursorShape(c) => {
+                b.extend_from_slice(&c.shape_id.to_le_bytes());
+                b.extend_from_slice(&c.width.to_le_bytes());
+                b.extend_from_slice(&c.height.to_le_bytes());
+                b.extend_from_slice(&c.hotspot_x.to_le_bytes());
+                b.extend_from_slice(&c.hotspot_y.to_le_bytes());
+                b.push(c.format);
+                b.extend_from_slice(&c.total_len.to_le_bytes());
+                b.extend_from_slice(&c.offset.to_le_bytes());
+                if c.data.len() > CURSOR_CHUNK_MAX {
+                    err = Err(ControlError::OutOfRange("cursor chunk"));
+                } else {
+                    b.extend_from_slice(&(c.data.len() as u16).to_le_bytes());
+                    b.extend_from_slice(&c.data);
+                }
+            }
+            ServerControl::CursorPosition { x, y, visible } => {
+                b.extend_from_slice(&x.to_le_bytes());
+                b.extend_from_slice(&y.to_le_bytes());
+                b.push(u8::from(*visible));
+            }
+            ServerControl::SecureDesktop { active } => b.push(u8::from(*active)),
             ServerControl::Bye | ServerControl::Unhandled(_) => {}
         });
 
@@ -505,12 +715,96 @@ impl ServerControl {
                 ServerControl::AppList(apps)
             }
             ServerMessage::Bye => ServerControl::Bye,
-            // Reserved: known to exist, not decoded until its phase.
-            ServerMessage::SessionConfig
-            | ServerMessage::CodecPrivate
-            | ServerMessage::CursorShape
-            | ServerMessage::CursorPosition
-            | ServerMessage::SecureDesktop => ServerControl::Unhandled(kind),
+            ServerMessage::SessionConfig => {
+                let session_id = r.u32()?;
+                let codec =
+                    StreamCodec::from_u8(r.u8()?).ok_or(ControlError::OutOfRange("codec"))?;
+                let width = r.u16()?;
+                let height = r.u16()?;
+                let fps_mhz = r.u32()?;
+                let bitrate_kbps = r.u32()?;
+                let flags = r.u8()?;
+                let slices = r.u8()?;
+                let server_nonce = r.array::<NONCE_LEN>()?;
+                let qpc_freq_hz = r.u64()?;
+                let server_ns = r.u64()? as i64;
+                let hello_delay_ns = r.u32()?;
+                let hdr = if flags & 1 != 0 {
+                    let mut xy = [[0u16; 2]; 4];
+                    for pair in &mut xy {
+                        pair[0] = r.u16()?;
+                        pair[1] = r.u16()?;
+                    }
+                    Some(HdrMastering {
+                        primaries: [xy[0], xy[1], xy[2]],
+                        white: xy[3],
+                        max_luminance: r.u32()?,
+                        min_luminance: r.u32()?,
+                        max_cll: r.u16()?,
+                        max_fall: r.u16()?,
+                    })
+                } else {
+                    None
+                };
+                ServerControl::SessionConfig(SessionConfig {
+                    session_id,
+                    codec,
+                    width,
+                    height,
+                    fps_mhz,
+                    bitrate_kbps,
+                    hdr,
+                    intra_refresh: flags & 2 != 0,
+                    ref_invalidation: flags & 4 != 0,
+                    slices,
+                    server_nonce,
+                    qpc_freq_hz,
+                    server_ns,
+                    hello_delay_ns,
+                })
+            }
+            ServerMessage::CodecPrivate => {
+                let codec =
+                    StreamCodec::from_u8(r.u8()?).ok_or(ControlError::OutOfRange("codec"))?;
+                let len = r.u16()? as usize;
+                ServerControl::CodecPrivate {
+                    codec,
+                    data: r.take(len)?.to_vec(),
+                }
+            }
+            ServerMessage::CursorShape => {
+                let shape_id = r.u32()?;
+                let width = r.u16()?;
+                let height = r.u16()?;
+                let hotspot_x = r.u16()?;
+                let hotspot_y = r.u16()?;
+                let format = r.u8()?;
+                let total_len = r.u32()?;
+                let offset = r.u32()?;
+                let len = r.u16()? as usize;
+                if len > CURSOR_CHUNK_MAX {
+                    return Err(ControlError::OutOfRange("cursor chunk"));
+                }
+                ServerControl::CursorShape(CursorChunk {
+                    shape_id,
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                    format,
+                    total_len,
+                    offset,
+                    data: r.take(len)?.to_vec(),
+                })
+            }
+            ServerMessage::CursorPosition => ServerControl::CursorPosition {
+                x: r.u16()?,
+                y: r.u16()?,
+                visible: r.u8()? != 0,
+            },
+            ServerMessage::SecureDesktop => ServerControl::SecureDesktop {
+                active: r.u8()? != 0,
+            },
         };
         Ok((message, consumed))
     }

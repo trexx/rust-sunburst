@@ -225,6 +225,7 @@ fn an_authenticated_client_is_recognised_by_its_key_alone() {
             refresh_mhz: 59_940,
             client_nonce: [1; NONCE_LEN],
             clock_offset_ns: 0,
+            codecs: sunburst_core::proto::codecs::HEVC_MAIN10,
         }))
         .expect("send");
 

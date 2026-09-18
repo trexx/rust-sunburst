@@ -26,7 +26,7 @@ All integers little-endian. Payload ≤1200 bytes to stay under path MTU.
 ```
 
 `type`: 0=Video 1=Audio 2=Input 3=Control 4=Nack 5=Feedback 6=Rumble
-7=PadOutput
+7=PadOutput. Every type except Video and Audio carries a MAC.
 
 `flags`: bit0 keyframe/IDR, bit1 last-packet-of-frame, bit2 unit-boundary
 (NAL for HEVC, OBU for AV1), bit3 intra-refresh-active, bits4-7 reserved.
@@ -88,12 +88,15 @@ floor, accepted. Both sides send a random 128-bit nonce during the handshake and
 derive
 
 ```
-session_key = BLAKE3::derive_key("sunburst session v1",
+session_key = BLAKE3::derive_key("sunburst 2026 session key v1",
                                  pairing_secret ‖ client_nonce ‖ server_nonce)
 ```
 
 Captured packets then fail verification in any later session. Held in memory
-only.
+only. `Hello` carries `client_nonce`; `SessionConfig` carries `server_nonce`, so
+`SessionConfig` itself — and any retransmit of it — is signed with the pairing
+key, and both ends switch once it has crossed. How the switch is sequenced is
+under *Which key verifies a packet* below.
 
 **Verify the MAC before the replay window**, not after. Checking the sequence
 first looks like a cheap DoS filter but inverts the ordering that matters, and
@@ -202,7 +205,10 @@ Client → server:
 - `PairConfirm` — `request_id`, `tag`. Also unauthenticated.
 - `ListApps` — ask for the catalogue
 - `LaunchApp` — `app_id` from the last `AppList`
-- `Hello` — client capabilities, ABI, display info, `client_nonce`, `clock_offset_ns`
+- `Hello` — client capabilities, ABI, display info, `client_nonce`, `clock_offset_ns`,
+  and `codecs`, a bitmask of what the client can decode (bit0 HEVC Main10,
+  bit1 AV1 Main10) from its `MediaCodecList` enumeration. The server never
+  picks a codec the client did not offer.
 - `DecoderQuirks` — the quirks struct (see CLAUDE.md); server adapts encoder config
 - `RequestIdr` — last resort only; prefer NACK + reference invalidation
 - `Resize` — client resolution/refresh change
@@ -221,15 +227,56 @@ Server → client:
 - `PairChallenge` — `request_id`, `server_nonce`. Unauthenticated.
 - `AppList` — `(app_id, name)` pairs. **Names and ids only:** box art is a later
   phase, and a reliable control channel is the wrong carrier for image payloads.
-- `SessionConfig` — codec, resolution, fps, bitrate, HDR metadata, `server_nonce`,
-  `clock_offset_ns`
-- `CodecPrivate` — VPS/SPS/PPS or av1C record. Client cannot configure MediaCodec
-  without this. **av1C construction is a known silent-failure point:** wrong record
-  means the decoder configures successfully and outputs nothing.
-- `CursorShape` — bitmap + hotspot, for client-side cursor rendering
-- `CursorPosition` — sent on absolute-mode changes only
-- `SecureDesktop` — capture unavailable; client shows a placeholder rather than a
-  frozen frame
+- `SessionConfig` — everything the client needs before the first frame. Sent
+  once per session, signed with the pairing key (it carries the nonce the
+  session key derives from):
+
+  ```
+  u32  session_id
+  u8   codec           0 = HEVC Main10, 1 = AV1 Main10
+  u16  width, u16 height
+  u32  fps_mhz         millihertz, same unit as Hello.refresh_mhz
+  u32  bitrate_kbps    initial target; the rate controller moves it afterwards
+  u8   flags           bit0 hdr, bit1 intra_refresh_on, bit2 ref_invalidation_on
+  u8   slices          HEVC slices per frame / AV1 tiles per axis
+  [16] server_nonce
+  u64  qpc_freq_hz     ticks per second behind the video header's qpc_timestamp
+  i64  server_ns       server clock when this was queued
+  u32  hello_delay_ns  server time between Hello receipt and this message
+  -- if hdr: ST 2086 mastering block, chromaticity in 0.00002 steps, luminance in 0.0001 cd/m²
+  u16  rx ry gx gy bx by wx wy   u32 max_lum  u32 min_lum   u16 max_cll  u16 max_fall
+  ```
+
+  `flags` bits 1–2 say what the server will *actually do*, which is the quirks
+  the client reported intersected with what the encoder supports. The clock
+  fields are what make `clock_offset_ns` derivable: the client subtracts
+  `hello_delay_ns` from its measured Hello→SessionConfig round trip, so server
+  processing time (building the encoder) does not inflate the estimate.
+- `CodecPrivate` — `u8 codec, u16 len, bytes`: VPS/SPS/PPS (Annex-B) or the
+  av1C record. Sent after `SessionConfig` and **again after any encoder
+  rebuild**. Client cannot configure MediaCodec without this. **av1C
+  construction is a known silent-failure point:** wrong record means the decoder
+  configures successfully and outputs nothing.
+- `CursorShape` — for client-side cursor rendering. A bitmap is larger than one
+  reliable message, so it is **chunked**; every chunk repeats the head, and the
+  in-order channel means the receiver appends and never reorders:
+
+  ```
+  u32  shape_id        increments per new shape; width = 0 means hidden
+  u16  width, u16 height, u16 hotspot_x, u16 hotspot_y
+  u8   format          0 = BGRA32 premultiplied
+  u32  total_len       pixel bytes for the whole shape
+  u32  offset          this chunk's byte offset
+  u16  chunk_len       ≤ 1024
+  ...  chunk
+  ```
+- `CursorPosition` — `u16 x, u16 y` (0–65535, normalised to the captured
+  monitor), `u8 visible`. A correction, not the primary source: the client moves
+  its own cursor from its own input, and this arrives when the server-observed
+  position disagrees (a warp, or absolute mode). Throttled to ≤10/s.
+- `SecureDesktop` — `u8 active`. Capture unavailable (UAC, lock screen, DRM);
+  the client shows a placeholder rather than a frozen frame, and `active = 0`
+  ends it.
 - `Bye`
 
 `clock_offset_ns` is estimated from the handshake round trip, accurate to about
@@ -351,22 +398,40 @@ against reordering. Simple pads use `Rumble`; rich pads use this.
 
 ---
 
-## NACK
+## NACK (client → server, unreliable, authenticated)
 
 ```
-common header (type=4)
-u16  frame_id
-u16  count
+common header (type=4, frame_id = the frame in question)
+u16  count               0 = abandoned (see below)
 u16  missing_pkt_idx[count]
+u64  mac
 ```
 
-Server responds by calling `NvEncInvalidateRefFrames` for the affected frame and
-continuing from the last client-confirmed reference — **not** by emitting an IDR.
-This is the core latency advantage over stock Moonlight: recovery becomes nearly
-invisible instead of a bitrate spike and visible hitch.
+Two meanings, by `count`:
 
-Suppressed when `DecoderQuirks.ref_invalidation == false` (Amlogic decoders are
-known to mishandle it); fall back to `RequestIdr` on those devices.
+- **`count > 0` — retransmit.** The client has the terminator (so it knows the
+  total) or a gap below the highest index seen, and lists what is missing. The
+  server resends those packets from a cache of the last few frames. At sub-ms
+  LAN round trips the resend lands well inside the jitter-buffer deadline, so the
+  frame still displays on time and the encoder is never involved. This is the
+  common case and it costs nothing visible.
+- **`count == 0` — abandoned.** The client gave up on the frame: the jitter
+  buffer stepped over it, or it was evicted before completing. The server calls
+  `NvEncInvalidateRefFrames` for that frame **and every frame encoded since**,
+  and continues from the last good reference — **not** by emitting an IDR. It
+  forces an IDR only when nothing decodable is left in the DPB. This is the core
+  latency advantage over stock Moonlight: recovery becomes nearly invisible
+  instead of a bitrate spike and visible hitch.
+
+Authenticated because an abandon makes the encoder do work; an unauthenticated
+one would let anyone on the network force IDRs at will. There is no sequence
+number: a NACK for a frame older than the cache is simply unanswerable, and a
+replayed abandon at worst repeats an invalidation the state machine already
+ignores.
+
+Invalidation is suppressed when `DecoderQuirks.ref_invalidation == false`
+(Amlogic decoders are known to mishandle it); an abandon then forces an IDR
+instead. Retransmit is never suppressed.
 
 HEVC and AV1 need **separate** invalidation state machines. AV1's reference model
 — 8 slots with explicit signalling — is different enough that sharing the
@@ -374,17 +439,24 @@ implementation will produce subtle corruption.
 
 ---
 
-## Feedback (client → server, every 100ms)
+## Feedback (client → server, every 100ms, authenticated)
 
 ```
 common header (type=5)
-u32  recv_timestamp      client QPC-equivalent
+u32  recv_timestamp      client clock, ns, low 32 bits
 u32  frames_received
 u32  frames_dropped
 u16  jitter_buffer_ms
 u16  decode_p99_us
 i32  owd_gradient        one-way delay gradient, µs/s
+u64  mac
 ```
+
+`owd_gradient` is the least-squares slope of `(recv_ns − send_ns)` over the last
+window, where `send_ns` is the video header's `qpc_timestamp` converted with
+`SessionConfig.qpc_freq_hz`. A constant clock offset between the machines
+differentiates to zero, which is why no shared epoch is needed. Authenticated
+because a forged feedback could drive the bitrate to the floor.
 
 Drives rate control. **Delay gradient, not loss** — the gradient rises as queues
 build, before any packet is dropped, so the controller reacts earlier. Applies via

@@ -32,7 +32,34 @@ fn hello() -> ClientControl {
         refresh_mhz: 59_940,
         client_nonce: [9; NONCE_LEN],
         clock_offset_ns: -1_234_567,
+        codecs: codecs::HEVC_MAIN10,
     })
+}
+
+fn session_config(hdr: bool) -> SessionConfig {
+    SessionConfig {
+        session_id: 12,
+        codec: StreamCodec::Av1,
+        width: 3840,
+        height: 2160,
+        fps_mhz: 59_940,
+        bitrate_kbps: 90_000,
+        hdr: hdr.then_some(HdrMastering {
+            primaries: [[35_400, 14_600], [8_500, 39_850], [6_550, 2_300]],
+            white: [15_635, 16_450],
+            max_luminance: 10_000_000,
+            min_luminance: 50,
+            max_cll: 1_000,
+            max_fall: 400,
+        }),
+        intra_refresh: true,
+        ref_invalidation: false,
+        slices: 2,
+        server_nonce: [4; NONCE_LEN],
+        qpc_freq_hz: 10_000_000,
+        server_ns: -5,
+        hello_delay_ns: 120_000_000,
+    }
 }
 
 fn round_trip_client(message: ClientControl) {
@@ -101,6 +128,104 @@ fn every_implemented_server_message_round_trips() {
     ]));
     round_trip_server(ServerControl::Bye);
     round_trip_server(ServerControl::AppList(Vec::new()));
+    round_trip_server(ServerControl::SessionConfig(session_config(true)));
+    round_trip_server(ServerControl::SessionConfig(session_config(false)));
+    round_trip_server(ServerControl::CodecPrivate {
+        codec: StreamCodec::Hevc,
+        data: vec![0, 0, 0, 1, 0x40, 0x01, 0x0C],
+    });
+    round_trip_server(ServerControl::CodecPrivate {
+        codec: StreamCodec::Av1,
+        data: Vec::new(),
+    });
+    round_trip_server(ServerControl::CursorShape(CursorChunk {
+        shape_id: 7,
+        width: 32,
+        height: 32,
+        hotspot_x: 3,
+        hotspot_y: 1,
+        format: CURSOR_FORMAT_BGRA32,
+        total_len: 4096,
+        offset: 1024,
+        data: vec![0xAB; CURSOR_CHUNK_MAX],
+    }));
+    round_trip_server(ServerControl::CursorShape(CursorChunk {
+        shape_id: 8,
+        width: 0,
+        height: 0,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        format: CURSOR_FORMAT_BGRA32,
+        total_len: 0,
+        offset: 0,
+        data: Vec::new(),
+    }));
+    round_trip_server(ServerControl::CursorPosition {
+        x: 65_535,
+        y: 0,
+        visible: true,
+    });
+    round_trip_server(ServerControl::SecureDesktop { active: true });
+    round_trip_server(ServerControl::SecureDesktop { active: false });
+}
+
+#[test]
+fn session_config_flags_are_independent() {
+    // Three bits in one byte; a shift slip would silently enable the wrong
+    // recovery mode on one codec.
+    for bits in 0..8u8 {
+        let mut c = session_config(bits & 1 != 0);
+        c.intra_refresh = bits & 2 != 0;
+        c.ref_invalidation = bits & 4 != 0;
+        round_trip_server(ServerControl::SessionConfig(c));
+    }
+}
+
+#[test]
+fn a_session_config_with_an_unknown_codec_is_refused() {
+    let mut encoded = ServerControl::SessionConfig(session_config(false))
+        .encode()
+        .expect("encode");
+    encoded[ENVELOPE_LEN + 4] = 9; // the codec byte follows session_id
+    assert_eq!(
+        ServerControl::decode(&encoded),
+        Err(ControlError::OutOfRange("codec"))
+    );
+}
+
+#[test]
+fn an_oversized_cursor_chunk_is_refused_at_encode() {
+    let chunk = CursorChunk {
+        shape_id: 1,
+        width: 64,
+        height: 64,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        format: CURSOR_FORMAT_BGRA32,
+        total_len: 16_384,
+        offset: 0,
+        data: vec![0; CURSOR_CHUNK_MAX + 1],
+    };
+    assert_eq!(
+        ServerControl::CursorShape(chunk).encode(),
+        Err(ControlError::OutOfRange("cursor chunk"))
+    );
+}
+
+#[test]
+fn hello_advertises_codecs_and_the_bits_map_to_stream_codecs() {
+    let ClientControl::Hello(mut h) = hello() else {
+        unreachable!()
+    };
+    h.codecs = codecs::HEVC_MAIN10 | codecs::AV1_MAIN10;
+    round_trip_client(ClientControl::Hello(h.clone()));
+    assert_eq!(StreamCodec::Hevc.hello_bit(), codecs::HEVC_MAIN10);
+    assert_eq!(StreamCodec::Av1.hello_bit(), codecs::AV1_MAIN10);
+    assert_eq!(
+        StreamCodec::from_u8(StreamCodec::Av1 as u8),
+        Some(StreamCodec::Av1)
+    );
+    assert_eq!(StreamCodec::from_u8(2), None);
 }
 
 #[test]
@@ -156,9 +281,25 @@ fn an_unknown_kind_is_skipped_with_its_length() {
 }
 
 #[test]
-fn a_reserved_server_kind_decodes_as_unhandled() {
-    // SessionConfig and friends are known but not decoded yet. They must skip
-    // cleanly rather than being mistaken for something else.
+fn an_unknown_server_kind_is_skipped_with_its_length() {
+    // Same property as the client direction: a kind from a newer server is
+    // stepped over, and the message behind it still decodes.
+    let mut stream = vec![200u8];
+    stream.extend_from_slice(&4u16.to_le_bytes());
+    stream.extend_from_slice(&[1, 2, 3, 4]);
+    stream.extend_from_slice(&ServerControl::Bye.encode().expect("encode"));
+
+    let (decoded, used) = ServerControl::decode(&stream).expect("decode");
+    assert_eq!(decoded, ServerControl::Unhandled(200));
+    assert_eq!(used, 7);
+    let (next, _) = ServerControl::decode(&stream[used..]).expect("decode next");
+    assert_eq!(next, ServerControl::Bye);
+}
+
+#[test]
+fn every_server_kind_is_now_decoded() {
+    // The five kinds that used to decode to Unhandled carry payloads now; a
+    // truncated one must fail rather than silently decode to Unhandled.
     for kind in [
         ServerMessage::SessionConfig,
         ServerMessage::CodecPrivate,
@@ -166,13 +307,12 @@ fn a_reserved_server_kind_decodes_as_unhandled() {
         ServerMessage::CursorPosition,
         ServerMessage::SecureDesktop,
     ] {
-        let mut stream = vec![kind as u8];
-        stream.extend_from_slice(&4u16.to_le_bytes());
-        stream.extend_from_slice(&[1, 2, 3, 4]);
-
-        let (decoded, used) = ServerControl::decode(&stream).expect("decode");
-        assert_eq!(decoded, ServerControl::Unhandled(kind as u8));
-        assert_eq!(used, 7);
+        let stream = [kind as u8, 0, 0];
+        assert_eq!(
+            ServerControl::decode(&stream),
+            Err(ControlError::Truncated),
+            "{kind:?}"
+        );
     }
 }
 
@@ -185,6 +325,10 @@ fn discriminants_are_pinned() {
     assert_eq!(ClientMessage::PairRequest as u8, 7);
     assert_eq!(ClientMessage::LaunchApp as u8, 10);
     assert_eq!(ServerMessage::SessionConfig as u8, 0);
+    assert_eq!(ServerMessage::CodecPrivate as u8, 1);
+    assert_eq!(ServerMessage::CursorShape as u8, 2);
+    assert_eq!(ServerMessage::CursorPosition as u8, 3);
+    assert_eq!(ServerMessage::SecureDesktop as u8, 4);
     assert_eq!(ServerMessage::PairChallenge as u8, 6);
     assert_eq!(ServerMessage::AppList as u8, 7);
 }
@@ -225,6 +369,17 @@ fn truncation_is_refused_rather_than_panicking() {
         );
     }
     assert!(ClientControl::decode(&encoded).is_ok());
+
+    let encoded = ServerControl::SessionConfig(session_config(true))
+        .encode()
+        .expect("encode");
+    for len in 0..encoded.len() {
+        assert!(
+            ServerControl::decode(&encoded[..len]).is_err(),
+            "a {len}-byte prefix decoded"
+        );
+    }
+    assert!(ServerControl::decode(&encoded).is_ok());
 }
 
 #[test]

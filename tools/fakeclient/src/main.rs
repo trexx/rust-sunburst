@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use sunburst_core::proto::codecs;
 use sunburst_core::proto::input::buttons;
 use sunburst_core::proto::pairing::{NONCE_LEN, PIN_DIGITS, confirm_tag, derive_secret};
 use sunburst_core::proto::{
@@ -249,6 +250,8 @@ fn hello(client_nonce: [u8; NONCE_LEN]) -> ClientControl {
         refresh_mhz: 60_000,
         client_nonce,
         clock_offset_ns: 0,
+        // A stub decoder: it can "decode" either, so the server picks by preference.
+        codecs: codecs::HEVC_MAIN10 | codecs::AV1_MAIN10,
     })
 }
 
