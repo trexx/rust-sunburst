@@ -23,4 +23,4 @@ pub use endpoint::{ClientEndpoint, Endpoint, MAX_CONTROL_PAYLOAD};
 pub use handler::{ControlHandler, InputSink, NoInput, Outbound, Recording};
 pub use reliable::{Reliable, ReliableError};
 pub use spsc::{Consumer, Producer, SLOT_BYTES, packet_ring};
-pub use video::{Accept, FrameAssembly, JitterBuffer, Packetizer, Reassembler};
+pub use video::{Accept, FrameRef, JitterBuffer, Packetizer, Reassembler, Released};
