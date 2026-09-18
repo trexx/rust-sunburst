@@ -15,3 +15,12 @@ workspace = true
 [dependencies]
 sunburst-core.workspace = true
 sunburst-net.workspace = true
+
+# The JNI shim, decode driving and logging are Android-only. On the host the
+# crate compiles to an (empty) cdylib, so `cargo test`/clippy stay green while
+# the real client is built and cross-compiled for the two ABIs.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+log = "0.4"
+android_logger = "0.14"

@@ -1,0 +1,10 @@
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<!-- Leanback launcher banner (320x180). A placeholder mark until real art. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <path android:fillColor="#0B0B1A" android:pathData="M0,0h320v180h-320z" />
+    <path android:fillColor="#FFB020" android:pathData="M160,90m-34,0a34,34 0,1 1,68 0a34,34 0,1 1,-68 0" />
+</vector>
