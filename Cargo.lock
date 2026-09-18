@@ -610,6 +610,8 @@ version = "0.1.0"
 dependencies = [
  "sunburst-core",
  "thiserror",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
