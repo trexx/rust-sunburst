@@ -803,3 +803,58 @@ fn an_unauthenticated_nack_is_dropped() {
     std::thread::sleep(Duration::from_millis(200));
     server.recording(|r| assert!(r.nacks.is_empty(), "an unsigned NACK was honoured"));
 }
+
+#[test]
+fn a_control_burst_larger_than_the_window_is_queued_and_delivered_in_order() {
+    // A cursor bitmap is several reliable messages; a burst can exceed the
+    // window (8..16). None may be dropped, and order must hold.
+    use sunburst_core::proto::StreamCodec;
+    use sunburst_net::Outbound;
+
+    let server = Server::start(Recording::new().with_key(2, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    // Establish the session so the endpoint knows the return address.
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the session", |r| r.inputs.len() == 1);
+
+    // Queue 40 distinguishable control messages at once — well past the window.
+    const N: u8 = 40;
+    {
+        let mut rec = server.recording.lock().expect("not poisoned");
+        for i in 0..N {
+            rec.outbound.push(Outbound::Control {
+                client: 2,
+                message: ServerControl::CodecPrivate {
+                    codec: StreamCodec::Hevc,
+                    data: vec![i],
+                },
+            });
+        }
+    }
+
+    // Collect them; they must arrive in order and none be lost.
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < N as usize {
+        if let Some(ServerControl::CodecPrivate { data, .. }) = client.recv_control().expect("recv")
+        {
+            got.push(data[0]);
+        }
+        client.tick().expect("tick");
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {N} arrived",
+            got.len()
+        );
+    }
+    assert_eq!(
+        got,
+        (0..N).collect::<Vec<_>>(),
+        "burst reordered or dropped"
+    );
+}

@@ -104,6 +104,11 @@ struct Session {
     reliable: Reliable,
     replay: ReplayWindow,
     last_seen_ms: u64,
+    /// Control messages that did not fit the reliable window when produced;
+    /// drained in order as the window frees. A cursor bitmap is several chunks,
+    /// so a burst can exceed the window, and dropping a chunk would corrupt the
+    /// shape — the queue is what makes reliable delivery hold under a burst.
+    pending_out: VecDeque<ServerControl>,
 }
 
 impl Session {
@@ -300,6 +305,7 @@ impl<H: ControlHandler> Endpoint<H> {
                             reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
                             replay: ReplayWindow::new(),
                             last_seen_ms: now_ms,
+                            pending_out: VecDeque::new(),
                         },
                     );
                 }
@@ -519,23 +525,43 @@ impl<H: ControlHandler> Endpoint<H> {
     }
 
     fn send_to_client(&mut self, client: u32, message: &ServerControl) {
-        let Ok(encoded) = message.encode() else {
-            return;
-        };
-        let now_ms = self.now_ms();
+        if let Some(session) = self.sessions.get_mut(&client) {
+            session.pending_out.push_back(message.clone());
+        }
+        self.flush_control(client);
+    }
 
+    /// Send as many queued control messages as the reliable window allows, in
+    /// order. Stops at the first `WouldBlock`; `tick` retries as the window
+    /// frees. Control is signed with the pairing key throughout (see `Channel`).
+    fn flush_control(&mut self, client: u32) {
+        let now_ms = self.now_ms();
         let Some(session) = self.sessions.get_mut(&client) else {
             return;
         };
         let addr = session.addr;
-        // Control is signed with the pairing key throughout (see `Channel`).
         let key = session.pairing_key.clone();
-        // A full window or an oversized message is a bug on this side, not
-        // something the peer can fix by waiting.
-        let Ok(frame) = session.reliable.send(&encoded, now_ms) else {
-            return;
-        };
-        self.transmit(addr, &frame, Some(&key), PacketType::Control);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Some(message) = session.pending_out.front() {
+            let Ok(encoded) = message.encode() else {
+                // Unencodable is our bug, not the peer's; drop it and move on.
+                session.pending_out.pop_front();
+                continue;
+            };
+            match session.reliable.send(&encoded, now_ms) {
+                Ok(frame) => {
+                    frames.push(frame);
+                    session.pending_out.pop_front();
+                }
+                Err(ReliableError::WouldBlock) => break,
+                Err(_) => {
+                    session.pending_out.pop_front();
+                }
+            }
+        }
+        for frame in frames {
+            self.transmit(addr, &frame, Some(&key), PacketType::Control);
+        }
     }
 
     fn send_pending(&mut self, to: SocketAddr, message: &ServerControl) {
@@ -669,6 +695,11 @@ impl<H: ControlHandler> Endpoint<H> {
 
         for (addr, frame, key) in send {
             self.transmit(addr, &frame, key.as_ref(), PacketType::Control);
+        }
+        // Push out anything that was waiting on window space.
+        let clients: Vec<u32> = self.sessions.keys().copied().collect();
+        for client in clients {
+            self.flush_control(client);
         }
         for client in drop_clients {
             self.forget(client);
