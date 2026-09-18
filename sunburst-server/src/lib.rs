@@ -8,6 +8,7 @@
 //! `cargo xwin check --target x86_64-pc-windows-msvc` checks the real thing.
 //! Neither command lies about the other.
 
+pub mod cursor;
 pub mod pipeline;
 pub mod realtime;
 pub mod session;

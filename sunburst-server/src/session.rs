@@ -28,6 +28,7 @@ use sunburst_net::{Bounds, Outbound, RateController, StreamControl};
 use sunburst_web::host::SessionSummary;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 
+use crate::cursor::CursorPoller;
 use crate::pipeline::{CodecHeaders, Pipeline, PipelineParams, StreamShared, retransmit_ring};
 
 /// The configured stream defaults the manager applies to every session.
@@ -102,6 +103,8 @@ struct Active {
     retransmit: sunburst_net::Producer,
     headers_sent: bool,
     secure_sent: bool,
+    cursor: CursorPoller,
+    last_cursor_ms: u64,
 }
 
 pub struct SessionManager {
@@ -266,6 +269,8 @@ impl StreamControl for SessionManager {
             retransmit: retransmit_tx,
             headers_sent: false,
             secure_sent: false,
+            cursor: CursorPoller::new(),
+            last_cursor_ms: 0,
         });
 
         // HDR mastering rides in the bitstream (the encoder's output flags), so
@@ -365,6 +370,26 @@ impl StreamControl for SessionManager {
             out.push(Outbound::Control {
                 client: a.client,
                 message: ServerControl::SecureDesktop { active: secure },
+            });
+        }
+
+        // Cursor: the shape (reliably) whenever it changes, the position
+        // throttled to ~10/s. The client renders it, so it never rides the
+        // video and never re-encodes.
+        let update = a.cursor.poll();
+        for chunk in update.shape {
+            out.push(Outbound::Control {
+                client: a.client,
+                message: ServerControl::CursorShape(chunk),
+            });
+        }
+        let now = now_ms();
+        if now.saturating_sub(a.last_cursor_ms) >= 100 {
+            a.last_cursor_ms = now;
+            let (x, y, visible) = update.position;
+            out.push(Outbound::Control {
+                client: a.client,
+                message: ServerControl::CursorPosition { x, y, visible },
             });
         }
 
