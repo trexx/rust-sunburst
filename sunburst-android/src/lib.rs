@@ -19,12 +19,15 @@ mod client;
 #[cfg(target_os = "android")]
 mod decode;
 #[cfg(target_os = "android")]
+mod input;
+#[cfg(target_os = "android")]
 mod jni_bridge;
 #[cfg(target_os = "android")]
 mod pair;
 
 // Pure, host-testable logic (no platform); public so the host build does not
-// see it as dead when its only caller (`pair`) is Android-gated.
+// see it as dead when its only caller is Android-gated.
+pub mod input_map;
 pub mod pin;
 
 #[cfg(target_os = "android")]

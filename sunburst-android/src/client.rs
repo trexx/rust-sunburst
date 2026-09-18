@@ -8,18 +8,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use ndk::native_window::NativeWindow;
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{
-    Feedback, Hello, Seq16, ServerControl, StreamCodec, pairing::NONCE_LEN,
+    Feedback, Hello, InputPacket, Seq16, ServerControl, StreamCodec, pairing::NONCE_LEN,
 };
 use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
 };
 
 use crate::decode::Decoder;
+use crate::input_map::{ClientInput, InputAccumulator};
 
 /// CLOCK_MONOTONIC nanoseconds — the base `MediaCodec` release timestamps and
 /// `System.nanoTime()` share.
@@ -46,8 +48,9 @@ pub fn run(
     codecs: u8,
     window: NativeWindow,
     stop: Arc<AtomicBool>,
+    input_rx: Receiver<ClientInput>,
 ) {
-    if let Err(e) = run_inner(server, secret, codecs, &window, &stop) {
+    if let Err(e) = run_inner(server, secret, codecs, &window, &stop, &input_rx) {
         log::error!("client stopped: {e}");
     }
 }
@@ -58,6 +61,7 @@ fn run_inner(
     codecs: u8,
     window: &NativeWindow,
     stop: &AtomicBool,
+    input_rx: &Receiver<ClientInput>,
 ) -> Result<(), String> {
     let mut client = ClientEndpoint::connect_paired(server, secret).map_err(|e| e.to_string())?;
 
@@ -133,6 +137,8 @@ fn run_inner(
     let mut received = 0u32;
     let mut dropped = 0u32;
     let mut last_feedback = Instant::now();
+    let mut input_acc = InputAccumulator::new();
+    let mut input_seq: u32 = 1;
 
     while !stop.load(Ordering::Relaxed) {
         match client.recv().map_err(|e| e.to_string())? {
@@ -202,6 +208,16 @@ fn run_inner(
         let a = reassembler.drain_abandoned(&mut abandoned);
         for id in &abandoned[..a] {
             let _ = client.send_nack(*id, &[]);
+        }
+
+        // Drain queued input and send it, mapped to wire events. The session
+        // key is installed, so the sequence starts at 1 each session.
+        while let Ok(raw) = input_rx.try_recv() {
+            if let Some(event) = input_acc.apply(raw)
+                && client.send_input(&InputPacket { input_seq, event }).is_ok()
+            {
+                input_seq = input_seq.wrapping_add(1);
+            }
         }
 
         if last_feedback.elapsed() >= Duration::from_millis(100) {

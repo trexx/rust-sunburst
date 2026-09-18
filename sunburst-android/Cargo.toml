@@ -15,6 +15,9 @@ workspace = true
 [dependencies]
 sunburst-core.workspace = true
 sunburst-net.workspace = true
+# For the modifier-bit contract (keymap::modifiers); cross-platform, its Windows
+# injector is gated off and not pulled in on Android.
+sunburst-input.workspace = true
 # Used by the host-testable PIN module and the Android pairing path.
 getrandom = "0.4"
 

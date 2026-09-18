@@ -5,31 +5,37 @@ import android.app.Activity
 import android.content.Intent
 import android.media.MediaCodecList
 import android.os.Bundle
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
 
 /**
- * The streaming activity: a full-screen [SurfaceView] whose surface is handed to
- * the Rust client, which owns the network, decode and present. Kotlin keeps only
- * the Activity + surface lifecycle and the platform queries with no NDK
- * equivalent (here, the codec-support probe); input and HDR arrive in later
- * commits.
- *
- * `SurfaceView`, never `TextureView` — TextureView costs a full frame of
- * compositing (CLAUDE.md).
+ * The streaming activity: a full-screen [SurfaceView] handed to the Rust client,
+ * which owns network, decode and present. Kotlin keeps the surface lifecycle and
+ * forwards the input the platform only exposes through View callbacks — captured
+ * relative mouse, keyboard (before the IME), and gamepad — to Rust, which maps
+ * and sends it.
  */
 class StreamActivity : Activity(), SurfaceHolder.Callback {
     private var handle: Long = 0
     private var surface: Surface? = null
+    private lateinit var view: SurfaceView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val view = SurfaceView(this)
+        view = SurfaceView(this)
         view.holder.addCallback(this)
+        view.isFocusable = true
+        view.isFocusableInTouchMode = true
+        // Relative mouse: captured-pointer deltas rather than absolute positions.
+        view.setOnCapturedPointerListener { _, e -> onCapturedPointer(e) }
         setContentView(view)
+        view.requestFocus()
     }
 
     override fun onResume() {
@@ -37,25 +43,14 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         maybeStart()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) view.requestPointerCapture()
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {
         surface = holder.surface
         maybeStart()
-    }
-
-    /** Start streaming once the surface is ready and the device is paired; if it
-     *  is not paired, open the pairing screen instead. */
-    private fun maybeStart() {
-        if (handle != 0L) return
-        val s = surface ?: return
-        val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
-        val secret = prefs.getString("secret_hex", "")!!
-        if (secret.isEmpty()) {
-            startActivity(Intent(this, PairActivity::class.java))
-            return
-        }
-        val host = prefs.getString("server_host", "192.168.1.10")!!
-        val port = prefs.getInt("server_port", 47811)
-        handle = nativeStart(s, host, port, secret, supportedCodecs())
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -70,8 +65,86 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    /** The codecs this device can decode, as the protocol's `Hello.codecs` bits:
-     *  bit0 HEVC Main10, bit1 AV1 Main10. The server negotiates one of them. */
+    private fun maybeStart() {
+        if (handle != 0L) return
+        val s = surface ?: return
+        val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
+        val secret = prefs.getString("secret_hex", "")!!
+        if (secret.isEmpty()) {
+            startActivity(Intent(this, PairActivity::class.java))
+            return
+        }
+        val host = prefs.getString("server_host", "192.168.1.10")!!
+        val port = prefs.getInt("server_port", 47811)
+        handle = nativeStart(s, host, port, secret, supportedCodecs())
+    }
+
+    // --- Input -------------------------------------------------------------
+
+    private fun isGamepad(event: KeyEvent): Boolean =
+        (event.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+
+    // The stream activity has no IME, so Activity-level key callbacks see every
+    // key; repeats are dropped (the server holds key state).
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean = key(keyCode, event, true) || super.onKeyDown(keyCode, event)
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean = key(keyCode, event, false) || super.onKeyUp(keyCode, event)
+
+    private fun key(keyCode: Int, event: KeyEvent, down: Boolean): Boolean {
+        if (handle == 0L || event.repeatCount > 0) return false
+        if (isGamepad(event)) {
+            nativePadButton(handle, keyCode, down)
+        } else {
+            nativeKey(handle, keyCode, down, event.metaState)
+        }
+        return true
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (handle == 0L) return super.onGenericMotionEvent(event)
+        val src = event.source
+        if (src and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK) {
+            nativePadAxis(
+                handle,
+                event.getAxisValue(MotionEvent.AXIS_X),
+                event.getAxisValue(MotionEvent.AXIS_Y),
+                event.getAxisValue(MotionEvent.AXIS_Z),
+                event.getAxisValue(MotionEvent.AXIS_RZ),
+                event.getAxisValue(MotionEvent.AXIS_LTRIGGER),
+                event.getAxisValue(MotionEvent.AXIS_RTRIGGER),
+                event.getAxisValue(MotionEvent.AXIS_HAT_X),
+                event.getAxisValue(MotionEvent.AXIS_HAT_Y),
+            )
+            return true
+        }
+        if (src and InputDevice.SOURCE_CLASS_POINTER == InputDevice.SOURCE_CLASS_POINTER) {
+            val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+            val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
+            if (v != 0f) nativeWheel(handle, v, false)
+            if (h != 0f) nativeWheel(handle, h, true)
+            return true
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
+    private fun onCapturedPointer(event: MotionEvent): Boolean {
+        if (handle == 0L) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE ->
+                nativeMouseMove(handle, event.x, event.y) // captured: x/y are deltas
+            MotionEvent.ACTION_BUTTON_PRESS ->
+                nativeMouseButton(handle, event.actionButton, true)
+            MotionEvent.ACTION_BUTTON_RELEASE ->
+                nativeMouseButton(handle, event.actionButton, false)
+            MotionEvent.ACTION_SCROLL -> {
+                val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+                if (v != 0f) nativeWheel(handle, v, false)
+            }
+        }
+        return true
+    }
+
+    /** Codecs this device can decode, as Hello.codecs bits (bit0 HEVC, bit1 AV1). */
     private fun supportedCodecs(): Int {
         var bits = 0
         for (info in MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos) {
@@ -86,16 +159,17 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         return bits
     }
 
-    private external fun nativeStart(
-        surface: Surface,
-        host: String,
-        port: Int,
-        secretHex: String,
-        codecs: Int,
-    ): Long
-
+    private external fun nativeStart(surface: Surface, host: String, port: Int, secretHex: String, codecs: Int): Long
     private external fun nativeStop(handle: Long)
     private external fun nativeSurfaceChanged(handle: Long, surface: Surface)
+    private external fun nativeKey(handle: Long, code: Int, down: Boolean, meta: Int)
+    private external fun nativeMouseMove(handle: Long, dx: Float, dy: Float)
+    private external fun nativeMouseButton(handle: Long, code: Int, down: Boolean)
+    private external fun nativeWheel(handle: Long, delta: Float, horizontal: Boolean)
+    private external fun nativePadButton(handle: Long, code: Int, down: Boolean)
+    private external fun nativePadAxis(
+        handle: Long, lx: Float, ly: Float, rx: Float, ry: Float, lt: Float, rt: Float, hatX: Float, hatY: Float,
+    )
 
     companion object {
         init {

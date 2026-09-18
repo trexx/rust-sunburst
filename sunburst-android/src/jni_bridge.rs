@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use jni::JNIEnv;
@@ -20,11 +21,22 @@ use jni::sys::{jint, jlong};
 use ndk::native_window::NativeWindow;
 
 use crate::client;
+use crate::input_map::ClientInput;
 
-/// A running client: the stop flag its thread polls, and the join handle.
+/// A running client: the stop flag its thread polls, the join handle, and the
+/// channel input callbacks push onto (drained and sent by the client thread, so
+/// the socket is touched from one place).
 pub struct Client {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    input_tx: Sender<ClientInput>,
+}
+
+impl Client {
+    /// Enqueue a raw input event for the client thread to map and send.
+    pub fn push_input(&self, input: ClientInput) {
+        let _ = self.input_tx.send(input);
+    }
 }
 
 static LOG_INIT: Once = Once::new();
@@ -100,13 +112,18 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let codecs = codecs as u8;
+    let (input_tx, input_rx) = mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("sunburst-client".into())
-        .spawn(move || client::run(server, secret, codecs, window, thread_stop))
+        .spawn(move || client::run(server, secret, codecs, window, thread_stop, input_rx))
         .ok();
 
     log::info!("client started for {server}");
-    Box::into_raw(Box::new(Client { stop, thread })) as jlong
+    Box::into_raw(Box::new(Client {
+        stop,
+        thread,
+        input_tx,
+    })) as jlong
 }
 
 /// Stop and free a client started by `nativeStart`.

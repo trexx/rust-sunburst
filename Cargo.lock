@@ -758,6 +758,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "sunburst-core",
+ "sunburst-input",
  "sunburst-net",
 ]
 
