@@ -15,6 +15,9 @@
 //! Pairing prints the PIN it generated. Type that into the web UI — it is never
 //! transmitted, and both ends derive the same secret from it independently.
 
+mod ivf;
+mod stream;
+
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -54,6 +57,7 @@ fn main() -> ExitCode {
         Some("pair") => pair(server, &secrets),
         Some("apps") => apps(server, &secrets),
         Some("input") => input(server, &secrets, option(&refs, "--script")),
+        Some("stream") => stream_cmd(server, &secrets, &refs),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -71,9 +75,12 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  fakeclient pair  [--server host:port] [--state path]
-  fakeclient apps  [--server host:port] [--state path]
-  fakeclient input [--server host:port] [--state path] [--script name]
+  fakeclient pair   [--server host:port] [--state path]
+  fakeclient apps   [--server host:port] [--state path]
+  fakeclient input  [--server host:port] [--state path] [--script name]
+  fakeclient stream [--server host:port] [--state path] [--codecs hevc,av1]
+                    [--out file.265|file.ivf] [--drop PCT] [--no-retransmit]
+                    [--secs N] [--stats]
 
 scripts: gamepad-sweep (default), gamepad-rich, keyboard, mouse
 
@@ -319,6 +326,39 @@ fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<()
         stored.next_input_seq
     );
     Ok(())
+}
+
+fn stream_cmd(server: SocketAddr, state: &PathBuf, refs: &[&str]) -> Result<(), String> {
+    use sunburst_core::proto::codecs;
+    let stored = load_state(state)?;
+
+    let codecs = match option(refs, "--codecs") {
+        None => codecs::HEVC_MAIN10 | codecs::AV1_MAIN10,
+        Some(list) => {
+            let mut bits = 0u8;
+            for c in list.split(',') {
+                match c.trim() {
+                    "hevc" => bits |= codecs::HEVC_MAIN10,
+                    "av1" => bits |= codecs::AV1_MAIN10,
+                    other => return Err(format!("unknown codec {other}")),
+                }
+            }
+            bits
+        }
+    };
+    let opts = stream::StreamOpts {
+        codecs,
+        out: option(refs, "--out").map(str::to_owned),
+        drop_pct: option(refs, "--drop")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        retransmit: !refs.contains(&"--no-retransmit"),
+        secs: option(refs, "--secs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+        stats: refs.contains(&"--stats"),
+    };
+    stream::stream(server, stored.secret, opts)
 }
 
 fn gamepad_sweep() -> Vec<InputEvent> {

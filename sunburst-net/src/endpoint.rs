@@ -47,7 +47,7 @@
 //! armed, only for those two kinds, and dropped silently otherwise. Those peers
 //! are tracked by address, because they have no identity yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -692,7 +692,22 @@ pub struct ClientEndpoint {
     /// Signs outgoing input/NACK/feedback once `SessionConfig` has arrived. Until
     /// then those use [`key`](Self::key), matching the server's data channel.
     session_key: Option<SessionKey>,
+    /// Control messages decoded from a single datagram but not yet returned:
+    /// one reliable frame can carry several, and [`recv`](Self::recv) hands them
+    /// out one at a time.
+    pending_control: VecDeque<ServerControl>,
     origin: Instant,
+}
+
+/// One thing that arrived on the client's socket, demultiplexed by packet type.
+#[derive(Debug)]
+pub enum Inbound {
+    /// A decoded, authenticated control message.
+    Control(ServerControl),
+    /// A raw video packet (header included), for the reassembler to decode.
+    Video(Vec<u8>),
+    /// A rumble or pad-output packet, or anything the stub receiver ignores.
+    Other,
 }
 
 impl ClientEndpoint {
@@ -712,6 +727,7 @@ impl ClientEndpoint {
             secret: None,
             client_nonce: None,
             session_key: None,
+            pending_control: VecDeque::new(),
             origin: Instant::now(),
         })
     }
@@ -869,6 +885,63 @@ impl ClientEndpoint {
             }
         }
         Ok(None)
+    }
+
+    /// Receive one datagram and demultiplex it: a control message (verified and
+    /// framed like [`recv_control`](Self::recv_control), switching the session
+    /// key on `SessionConfig`), a raw video packet for the reassembler, or
+    /// something the stub receiver ignores. `None` on the read timeout.
+    ///
+    /// Control frames can carry several messages; the extras are queued and
+    /// returned by later calls before the socket is read again.
+    pub fn recv(&mut self) -> io::Result<Option<Inbound>> {
+        if let Some(msg) = self.pending_control.pop_front() {
+            return Ok(Some(Inbound::Control(msg)));
+        }
+        let mut buf = [0u8; HEADER_LEN + MAX_PAYLOAD];
+        let len = match self.socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let datagram = &buf[..len];
+        let Some(header) = Header::decode(datagram) else {
+            return Ok(Some(Inbound::Other));
+        };
+
+        match header.packet_type {
+            PacketType::Video => Ok(Some(Inbound::Video(datagram.to_vec()))),
+            PacketType::Control => {
+                let mut body = &datagram[HEADER_LEN..];
+                if let Some(key) = &self.key {
+                    match key.verify_packet(datagram) {
+                        Some(_) => body = &body[..body.len().saturating_sub(MAC_LEN)],
+                        None => return Ok(Some(Inbound::Other)),
+                    }
+                }
+                for message in self.reliable.on_frame(body) {
+                    if let Ok((decoded, _)) = ServerControl::decode(&message) {
+                        if let ServerControl::SessionConfig(config) = &decoded
+                            && let (Some(secret), Some(cn)) = (self.secret, self.client_nonce)
+                        {
+                            self.session_key =
+                                Some(SessionKey::derive(&secret, &cn, &config.server_nonce));
+                        }
+                        self.pending_control.push_back(decoded);
+                    }
+                }
+                Ok(self.pending_control.pop_front().map(Inbound::Control))
+            }
+            _ => Ok(Some(Inbound::Other)),
+        }
     }
 
     /// Emit retransmits and owed acks.
