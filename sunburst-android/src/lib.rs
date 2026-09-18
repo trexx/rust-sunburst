@@ -15,6 +15,10 @@
 //! compiles and unit-tests. The device work is exercised on the two TVs.
 
 #[cfg(target_os = "android")]
+mod client;
+#[cfg(target_os = "android")]
+mod decode;
+#[cfg(target_os = "android")]
 mod jni_bridge;
 
 #[cfg(target_os = "android")]

@@ -2,6 +2,7 @@
 package com.trexx.sunburst
 
 import android.app.Activity
+import android.media.MediaCodecList
 import android.os.Bundle
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -11,8 +12,9 @@ import android.view.WindowManager
 /**
  * The streaming activity: a full-screen [SurfaceView] whose surface is handed to
  * the Rust client, which owns the network, decode and present. Kotlin keeps only
- * the Activity + surface lifecycle here; input and platform queries arrive in
- * later commits.
+ * the Activity + surface lifecycle and the platform queries with no NDK
+ * equivalent (here, the codec-support probe); input and HDR arrive in later
+ * commits.
  *
  * `SurfaceView`, never `TextureView` — TextureView costs a full frame of
  * compositing (CLAUDE.md).
@@ -30,7 +32,13 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         if (handle == 0L) {
-            handle = nativeStart(holder.surface, serverHost(), serverPort())
+            val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
+            val host = prefs.getString("server_host", "192.168.1.10")!!
+            val port = prefs.getInt("server_port", 47811)
+            // The pairing secret is provisioned by the pairing screen (a later
+            // commit); until then this is empty and the client declines to start.
+            val secret = prefs.getString("secret_hex", "")!!
+            handle = nativeStart(holder.surface, host, port, secret, supportedCodecs())
         }
     }
 
@@ -45,12 +53,30 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    // The server address is provisioned by the pairing/settings screen in a later
-    // commit; hard-coded here so the foundation is runnable on the bench.
-    private fun serverHost(): String = "192.168.1.10"
-    private fun serverPort(): Int = 47811
+    /** The codecs this device can decode, as the protocol's `Hello.codecs` bits:
+     *  bit0 HEVC Main10, bit1 AV1 Main10. The server negotiates one of them. */
+    private fun supportedCodecs(): Int {
+        var bits = 0
+        for (info in MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos) {
+            if (info.isEncoder) continue
+            for (type in info.supportedTypes) {
+                when (type.lowercase()) {
+                    "video/hevc" -> bits = bits or 0x1
+                    "video/av01" -> bits = bits or 0x2
+                }
+            }
+        }
+        return bits
+    }
 
-    private external fun nativeStart(surface: Surface, host: String, port: Int): Long
+    private external fun nativeStart(
+        surface: Surface,
+        host: String,
+        port: Int,
+        secretHex: String,
+        codecs: Int,
+    ): Long
+
     private external fun nativeStop(handle: Long)
     private external fun nativeSurfaceChanged(handle: Long, surface: Surface)
 

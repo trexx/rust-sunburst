@@ -21,6 +21,10 @@ sunburst-net.workspace = true
 # the real client is built and cross-compiled for the two ABIs.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+ndk = { version = "0.9", features = ["media", "api-level-30"] }
+ndk-sys = "0.6"
 ndk-context = "0.1"
+libc = "0.2"
+getrandom = "0.4"
 log = "0.4"
 android_logger = "0.14"
