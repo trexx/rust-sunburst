@@ -11,10 +11,13 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use jni::JavaVM;
+use jni::objects::{GlobalRef, JValue};
 use ndk::native_window::NativeWindow;
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{
-    Feedback, Hello, InputPacket, Seq16, ServerControl, StreamCodec, pairing::NONCE_LEN,
+    CursorChunk, Feedback, Hello, InputPacket, Seq16, ServerControl, StreamCodec,
+    pairing::NONCE_LEN,
 };
 use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
@@ -40,8 +43,94 @@ fn mono_ns() -> i64 {
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
 }
 
+/// Upcalls into the Kotlin activity from the client thread (attached to the JVM
+/// per call — cursor events are infrequent). The activity draws the cursor
+/// overlay, so the pointer never rides the video.
+pub struct Callbacks {
+    pub vm: JavaVM,
+    pub activity: GlobalRef,
+}
+
+impl Callbacks {
+    fn cursor_shape(&self, bgra: &[u8], w: i32, h: i32, hx: i32, hy: i32) {
+        if let Ok(mut env) = self.vm.attach_current_thread()
+            && let Ok(arr) = env.byte_array_from_slice(bgra)
+        {
+            let _ = env.call_method(
+                &self.activity,
+                "onCursorShape",
+                "([BIIII)V",
+                &[
+                    JValue::Object(&arr),
+                    JValue::Int(w),
+                    JValue::Int(h),
+                    JValue::Int(hx),
+                    JValue::Int(hy),
+                ],
+            );
+        }
+    }
+
+    fn cursor_position(&self, x: i32, y: i32, visible: bool) {
+        if let Ok(mut env) = self.vm.attach_current_thread() {
+            let _ = env.call_method(
+                &self.activity,
+                "onCursorPosition",
+                "(IIZ)V",
+                &[JValue::Int(x), JValue::Int(y), JValue::Bool(visible as u8)],
+            );
+        }
+    }
+}
+
+/// Reassembles the chunked cursor bitmap; the reliable channel delivers chunks
+/// in order, so this appends. A `width == 0` chunk means the cursor is hidden.
+#[derive(Default)]
+struct CursorReassembler {
+    shape_id: u32,
+    buf: Vec<u8>,
+    got: usize,
+    w: i32,
+    h: i32,
+    hx: i32,
+    hy: i32,
+}
+
+impl CursorReassembler {
+    /// Feed a chunk; returns `(bgra, w, h, hotspot_x, hotspot_y)` when a shape
+    /// completes (a hidden cursor completes immediately with `w == 0`).
+    fn push(&mut self, c: &CursorChunk) -> Option<(Vec<u8>, i32, i32, i32, i32)> {
+        if c.shape_id != self.shape_id || c.offset == 0 {
+            self.shape_id = c.shape_id;
+            self.buf = vec![0u8; c.total_len as usize];
+            self.got = 0;
+            self.w = c.width as i32;
+            self.h = c.height as i32;
+            self.hx = c.hotspot_x as i32;
+            self.hy = c.hotspot_y as i32;
+        }
+        if c.width == 0 {
+            return Some((Vec::new(), 0, 0, 0, 0));
+        }
+        let end = (c.offset as usize + c.data.len()).min(self.buf.len());
+        let start = (c.offset as usize).min(end);
+        self.buf[start..end].copy_from_slice(&c.data[..end - start]);
+        self.got += end - start;
+        (self.got >= self.buf.len() && !self.buf.is_empty()).then(|| {
+            (
+                std::mem::take(&mut self.buf),
+                self.w,
+                self.h,
+                self.hx,
+                self.hy,
+            )
+        })
+    }
+}
+
 /// Run the client until `stop` is set. `codecs` is the bitmask the device can
 /// decode (`sunburst_core::proto::codecs`); the server negotiates one of them.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     server: SocketAddr,
     secret: [u8; 32],
@@ -50,12 +139,15 @@ pub fn run(
     stop: Arc<AtomicBool>,
     input_rx: Receiver<ClientInput>,
     client_tid: Arc<AtomicI32>,
+    callbacks: Callbacks,
 ) {
     // Publish our tid so the Java PerformanceHintManager can target this thread.
     // SAFETY: gettid takes no arguments and cannot fail.
     let tid = unsafe { libc::gettid() };
     client_tid.store(tid, Ordering::Relaxed);
-    if let Err(e) = run_inner(server, secret, codecs, &window, &stop, &input_rx) {
+    if let Err(e) = run_inner(
+        server, secret, codecs, &window, &stop, &input_rx, &callbacks,
+    ) {
         log::error!("client stopped: {e}");
     }
 }
@@ -67,6 +159,7 @@ fn run_inner(
     window: &NativeWindow,
     stop: &AtomicBool,
     input_rx: &Receiver<ClientInput>,
+    callbacks: &Callbacks,
 ) -> Result<(), String> {
     let mut client = ClientEndpoint::connect_paired(server, secret).map_err(|e| e.to_string())?;
 
@@ -145,6 +238,7 @@ fn run_inner(
     let mut last_feedback = Instant::now();
     let mut input_acc = InputAccumulator::new();
     let mut input_seq: u32 = 1;
+    let mut cursor = CursorReassembler::default();
 
     while !stop.load(Ordering::Relaxed) {
         match client.recv().map_err(|e| e.to_string())? {
@@ -178,6 +272,14 @@ fn run_inner(
                     }
                     Accept::Ignored => {}
                 }
+            }
+            Some(Inbound::Control(ServerControl::CursorShape(c))) => {
+                if let Some((bgra, w, h, hx, hy)) = cursor.push(&c) {
+                    callbacks.cursor_shape(&bgra, w, h, hx, hy);
+                }
+            }
+            Some(Inbound::Control(ServerControl::CursorPosition { x, y, visible })) => {
+                callbacks.cursor_position(x as i32, y as i32, visible);
             }
             Some(_) => {}
             None => client.tick().map_err(|e| e.to_string())?,

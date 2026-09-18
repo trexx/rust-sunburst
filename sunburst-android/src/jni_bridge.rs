@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
+use crate::client::Callbacks;
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
@@ -72,7 +73,7 @@ fn parse_secret(hex: &str) -> Option<[u8; 32]> {
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
     mut env: JNIEnv,
-    _class: JClass,
+    activity: JObject,
     surface: JObject,
     host: JString,
     port: jint,
@@ -112,6 +113,20 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
         return 0;
     };
 
+    // Capture the JVM and a global ref to the activity for cursor upcalls.
+    let Ok(vm) = env.get_java_vm() else {
+        log::error!("no JavaVM");
+        return 0;
+    };
+    let Ok(activity_ref) = env.new_global_ref(&activity) else {
+        log::error!("global ref failed");
+        return 0;
+    };
+    let callbacks = Callbacks {
+        vm,
+        activity: activity_ref,
+    };
+
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let codecs = codecs as u8;
@@ -129,6 +144,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
                 thread_stop,
                 input_rx,
                 thread_tid,
+                callbacks,
             )
         })
         .ok();

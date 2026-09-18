@@ -3,6 +3,9 @@ package com.trexx.sunburst
 
 import android.app.Activity
 import android.content.Intent
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.media.MediaCodecList
 import android.os.Build
 import android.os.Bundle
@@ -14,6 +17,8 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
+import android.widget.FrameLayout
 import android.view.WindowManager
 
 /**
@@ -28,6 +33,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     private var surface: Surface? = null
     private lateinit var view: SurfaceView
     private var hintSession: Session? = null
+    private lateinit var cursorView: CursorView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,7 +44,11 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         view.isFocusableInTouchMode = true
         // Relative mouse: captured-pointer deltas rather than absolute positions.
         view.setOnCapturedPointerListener { _, e -> onCapturedPointer(e) }
-        setContentView(view)
+        cursorView = CursorView(this)
+        val frame = FrameLayout(this)
+        frame.addView(view)
+        frame.addView(cursorView) // drawn above the video
+        setContentView(frame)
         view.requestFocus()
     }
 
@@ -177,6 +187,66 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         return bits
+    }
+
+    // --- Cursor (called from the client thread; marshalled to the UI thread) ---
+
+    /** A new cursor shape as BGRA bytes with its hotspot; `width == 0` hides it. */
+    fun onCursorShape(bgra: ByteArray, width: Int, height: Int, hotspotX: Int, hotspotY: Int) {
+        val bitmap = if (width == 0 || height == 0) {
+            null
+        } else {
+            val px = IntArray(width * height)
+            var i = 0
+            while (i < px.size) {
+                val b = bgra[i * 4].toInt() and 0xFF
+                val g = bgra[i * 4 + 1].toInt() and 0xFF
+                val r = bgra[i * 4 + 2].toInt() and 0xFF
+                val a = bgra[i * 4 + 3].toInt() and 0xFF
+                px[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                i++
+            }
+            Bitmap.createBitmap(px, width, height, Bitmap.Config.ARGB_8888)
+        }
+        runOnUiThread { cursorView.setShape(bitmap, hotspotX, hotspotY) }
+    }
+
+    /** A cursor position, normalised 0..65535 across the server's monitor. */
+    fun onCursorPosition(x: Int, y: Int, visible: Boolean) {
+        runOnUiThread { cursorView.setPosition(x, y, visible) }
+    }
+
+    /** Draws the server's cursor above the video, so the pointer is not encoded
+     *  into the stream and its shape has no network round trip. */
+    private class CursorView(context: Context) : View(context) {
+        private var bitmap: Bitmap? = null
+        private var hotspotX = 0
+        private var hotspotY = 0
+        private var normX = 0
+        private var normY = 0
+        private var visible = false
+
+        fun setShape(bmp: Bitmap?, hx: Int, hy: Int) {
+            bitmap = bmp
+            hotspotX = hx
+            hotspotY = hy
+            invalidate()
+        }
+
+        fun setPosition(x: Int, y: Int, vis: Boolean) {
+            normX = x
+            normY = y
+            visible = vis
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val bmp = bitmap ?: return
+            if (!visible) return
+            val px = normX.toLong() * width / 65535L - hotspotX
+            val py = normY.toLong() * height / 65535L - hotspotY
+            canvas.drawBitmap(bmp, px.toFloat(), py.toFloat(), null)
+        }
     }
 
     private external fun nativeStart(surface: Surface, host: String, port: Int, secretHex: String, codecs: Int): Long
