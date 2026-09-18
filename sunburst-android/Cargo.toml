@@ -15,6 +15,8 @@ workspace = true
 [dependencies]
 sunburst-core.workspace = true
 sunburst-net.workspace = true
+# Used by the host-testable PIN module and the Android pairing path.
+getrandom = "0.4"
 
 # The JNI shim, decode driving and logging are Android-only. On the host the
 # crate compiles to an (empty) cdylib, so `cargo test`/clippy stay green while
@@ -25,6 +27,5 @@ ndk = { version = "0.9", features = ["media", "api-level-30"] }
 ndk-sys = "0.6"
 ndk-context = "0.1"
 libc = "0.2"
-getrandom = "0.4"
 log = "0.4"
 android_logger = "0.14"

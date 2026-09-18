@@ -32,6 +32,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Pairing screen, opened by the stream activity when unpaired. -->
+        <activity
+            android:name=".PairActivity"
+            android:exported="false"
+            android:label="Sunburst pairing" />
+
         <!-- Phase 0 decoder probe, kept for adb-driven enumeration; no longer the
              launcher. Start with: adb shell am start -n com.trexx.sunburst/.probe.DecoderProbeActivity -->
         <activity

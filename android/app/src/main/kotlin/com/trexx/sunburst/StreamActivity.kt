@@ -2,6 +2,7 @@
 package com.trexx.sunburst
 
 import android.app.Activity
+import android.content.Intent
 import android.media.MediaCodecList
 import android.os.Bundle
 import android.view.Surface
@@ -21,6 +22,7 @@ import android.view.WindowManager
  */
 class StreamActivity : Activity(), SurfaceHolder.Callback {
     private var handle: Long = 0
+    private var surface: Surface? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -30,16 +32,30 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         setContentView(view)
     }
 
+    override fun onResume() {
+        super.onResume()
+        maybeStart()
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {
-        if (handle == 0L) {
-            val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
-            val host = prefs.getString("server_host", "192.168.1.10")!!
-            val port = prefs.getInt("server_port", 47811)
-            // The pairing secret is provisioned by the pairing screen (a later
-            // commit); until then this is empty and the client declines to start.
-            val secret = prefs.getString("secret_hex", "")!!
-            handle = nativeStart(holder.surface, host, port, secret, supportedCodecs())
+        surface = holder.surface
+        maybeStart()
+    }
+
+    /** Start streaming once the surface is ready and the device is paired; if it
+     *  is not paired, open the pairing screen instead. */
+    private fun maybeStart() {
+        if (handle != 0L) return
+        val s = surface ?: return
+        val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
+        val secret = prefs.getString("secret_hex", "")!!
+        if (secret.isEmpty()) {
+            startActivity(Intent(this, PairActivity::class.java))
+            return
         }
+        val host = prefs.getString("server_host", "192.168.1.10")!!
+        val port = prefs.getInt("server_port", 47811)
+        handle = nativeStart(s, host, port, secret, supportedCodecs())
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -47,6 +63,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        surface = null
         if (handle != 0L) {
             nativeStop(handle)
             handle = 0

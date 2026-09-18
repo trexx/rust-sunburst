@@ -20,6 +20,12 @@ mod client;
 mod decode;
 #[cfg(target_os = "android")]
 mod jni_bridge;
+#[cfg(target_os = "android")]
+mod pair;
+
+// Pure, host-testable logic (no platform); public so the host build does not
+// see it as dead when its only caller (`pair`) is Android-gated.
+pub mod pin;
 
 #[cfg(target_os = "android")]
 pub use jni_bridge::*;
