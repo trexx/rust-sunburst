@@ -516,6 +516,45 @@ impl Reassembler {
         n
     }
 
+    /// What to NACK for a pending frame, written to `out`; returns how many.
+    ///
+    /// Every hole below the terminator's count once that has arrived, or below
+    /// the highest index seen before it. When the count is still unknown and
+    /// a newer frame has already begun arriving (`newer_seen`), the lost
+    /// packet may be the terminator itself, which no hole can name — so the
+    /// index after the highest seen is asked for too. The server either has it
+    /// or it is a harmless cache miss.
+    pub fn nack_targets(&self, frame_id: Seq16, newer_seen: bool, out: &mut [u16]) -> usize {
+        let mut n = self.missing(frame_id, out);
+        if newer_seen
+            && self.expected_count(frame_id).is_none()
+            && n < out.len()
+            && let Some(hw) = self.high_water(frame_id)
+            && (hw as usize) < MAX_PKTS_PER_FRAME
+        {
+            out[n] = hw;
+            n += 1;
+        }
+        n
+    }
+
+    /// One past the highest index stored for a frame still being assembled.
+    pub fn high_water(&self, frame_id: Seq16) -> Option<u16> {
+        self.frames
+            .iter()
+            .find(|s| s.state == SlotState::Partial && s.frame_id == frame_id)
+            .map(|s| s.high_water as u16)
+    }
+
+    /// The terminator's packet count for a frame still being assembled, once
+    /// it has arrived — the point at which a NACK can name every hole.
+    pub fn expected_count(&self, frame_id: Seq16) -> Option<u16> {
+        self.frames
+            .iter()
+            .find(|s| s.state == SlotState::Partial && s.frame_id == frame_id)
+            .and_then(|s| s.pkt_count)
+    }
+
     /// Whether `frame_id` is still being assembled.
     pub fn is_pending(&self, frame_id: Seq16) -> bool {
         self.frames
@@ -699,6 +738,9 @@ pub struct JitterBuffer {
     /// [`MAX_DEPTH_NS`], or half the frame interval if that is smaller — at
     /// 120 Hz an 8 ms cushion would be a whole frame.
     max_depth_ns: u64,
+    /// A floor under the cushion: a NACK round trip, so a retransmit has a
+    /// chance to land before the frame behind the hole is due.
+    min_depth_ns: u64,
     last_arrival_ns: Option<u64>,
     mean_interval_ns: f64,
     jitter_ns: f64,
@@ -719,6 +761,7 @@ impl JitterBuffer {
             next_expected: None,
             target_depth_ns: 0,
             max_depth_ns: MAX_DEPTH_NS,
+            min_depth_ns: 0,
             last_arrival_ns: None,
             mean_interval_ns: 0.0,
             jitter_ns: 0.0,
@@ -731,7 +774,21 @@ impl JitterBuffer {
     /// frame late at 120 Hz.
     pub fn set_frame_interval_ns(&mut self, interval_ns: u64) {
         self.max_depth_ns = MAX_DEPTH_NS.min(interval_ns / 2).max(1);
-        self.target_depth_ns = self.target_depth_ns.min(self.max_depth_ns);
+        self.min_depth_ns = self.min_depth_ns.min(self.max_depth_ns);
+        self.target_depth_ns = self
+            .target_depth_ns
+            .clamp(self.min_depth_ns, self.max_depth_ns);
+    }
+
+    /// Never release sooner than this after arrival: the time a NACK round
+    /// trip takes, so a hole can be filled before the frame behind it is due.
+    /// A steady stream would otherwise cushion nothing and step over every
+    /// loss. Capped by the depth ceiling.
+    pub fn set_min_depth_ns(&mut self, min_ns: u64) {
+        self.min_depth_ns = min_ns.min(self.max_depth_ns);
+        self.target_depth_ns = self
+            .target_depth_ns
+            .clamp(self.min_depth_ns, self.max_depth_ns);
     }
 
     /// Enqueue a complete frame that arrived at `now_ns`. A frame that is late
@@ -833,7 +890,8 @@ impl JitterBuffer {
                 self.jitter_ns += (deviation - self.jitter_ns) / EWMA_SHIFT;
                 self.mean_interval_ns += (delta - self.mean_interval_ns) / EWMA_SHIFT;
             }
-            self.target_depth_ns = ((JITTER_K * self.jitter_ns) as u64).min(self.max_depth_ns);
+            self.target_depth_ns =
+                ((JITTER_K * self.jitter_ns) as u64).clamp(self.min_depth_ns, self.max_depth_ns);
         }
         self.last_arrival_ns = Some(now_ns);
     }
@@ -1221,6 +1279,32 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_terminator_is_asked_for_once_a_newer_frame_shows_up() {
+        let pkts = packetize(Seq16(7), 0, false, &[&[4u8; 1500][..]]); // 0, 1, term 2
+        let mut r = Reassembler::new();
+        r.push(&pkts[0]);
+        r.push(&pkts[1]);
+        let mut out = [0u16; 8];
+        assert_eq!(
+            r.nack_targets(Seq16(7), false, &mut out),
+            0,
+            "nothing to name yet"
+        );
+        let n = r.nack_targets(Seq16(7), true, &mut out);
+        assert_eq!(&out[..n], &[2], "the index after the highest seen");
+        // With a hole as well, both are named.
+        let pkts = packetize(Seq16(8), 0, false, &[&[4u8; 2500][..]]); // 0, 1, 2, term 3
+        r.push(&pkts[0]);
+        r.push(&pkts[2]);
+        let n = r.nack_targets(Seq16(8), true, &mut out);
+        assert_eq!(&out[..n], &[1, 3]);
+        // Once the terminator is in, only holes are named.
+        r.push(&pkts[3]);
+        let n = r.nack_targets(Seq16(8), true, &mut out);
+        assert_eq!(&out[..n], &[1]);
+    }
+
+    #[test]
     fn a_copy_into_a_short_buffer_is_refused() {
         let pkts = packetize(Seq16(1), 0, false, &[&[1u8; 2500][..]]);
         let mut r = Reassembler::new();
@@ -1358,6 +1442,23 @@ mod tests {
         }
         assert!(j.target_depth_ns() <= 4_166_666);
         assert!(j.target_depth_ns() > 0);
+    }
+
+    #[test]
+    fn a_minimum_depth_holds_a_steady_stream_for_a_round_trip() {
+        let mut j = JitterBuffer::new();
+        j.set_min_depth_ns(2 * MS);
+        let mut t = 0u64;
+        for k in 0..20u16 {
+            t += 16 * MS;
+            j.push(frame(k), t).unwrap();
+            assert!(j.pop(t + MS).is_none(), "released before the floor");
+            assert!(j.pop(t + 2 * MS).is_some());
+        }
+        assert_eq!(j.target_depth_ns(), 2 * MS);
+        // The floor never exceeds the ceiling.
+        j.set_frame_interval_ns(2 * MS);
+        assert_eq!(j.target_depth_ns(), MS);
     }
 
     #[test]

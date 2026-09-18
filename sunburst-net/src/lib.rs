@@ -15,12 +15,20 @@
 
 pub mod endpoint;
 pub mod handler;
+pub mod owd;
+pub mod rate;
+pub mod refinval;
 pub mod reliable;
+pub mod retransmit;
 pub mod spsc;
 pub mod video;
 
 pub use endpoint::{ClientEndpoint, Endpoint, MAX_CONTROL_PAYLOAD};
 pub use handler::{ControlHandler, InputSink, NoInput, Outbound, Recording};
+pub use owd::{OwdGradient, TickUnwrap};
+pub use rate::{Bounds, RateController};
+pub use refinval::{Av1RefState, HevcRefState, IntraRefresh, Recovery, RefState};
 pub use reliable::{Reliable, ReliableError};
+pub use retransmit::RetransmitCache;
 pub use spsc::{Consumer, Producer, SLOT_BYTES, packet_ring};
 pub use video::{Accept, FrameRef, JitterBuffer, Packetizer, Reassembler, Released};
