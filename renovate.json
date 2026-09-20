@@ -1,0 +1,40 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "labels": ["dependencies"],
+  "prConcurrentLimit": 5,
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Cut PR noise: one grouped PR for all non-major bumps across Cargo, npm and Gradle. Majors stay separate so they get reviewed on their own.",
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchManagers": ["cargo", "npm", "gradle"],
+      "groupName": "non-major dependencies"
+    },
+    {
+      "description": "GitHub Actions are pinned to commit digests (see helpers:pinGitHubActionDigests); group their updates into one PR.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "The Rust crypto/USB stack behind sunburst-gip-bridge touches the pad security handshake; never auto-merge, and keep it its own PR for review.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["rsa", "p256", "sha2", "hmac", "rand_core", "getrandom"],
+      "groupName": "gip-bridge crypto",
+      "automerge": false
+    }
+  ],
+  "ignorePaths": [
+    "sunburst-gip-bridge/vendor/**",
+    "spikes/**"
+  ]
+}

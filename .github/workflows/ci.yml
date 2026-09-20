@@ -126,14 +126,26 @@ jobs:
       - name: armeabi-v7a (Homatics)
         run: cargo build -p sunburst-android --target armv7-linux-androideabi
 
-      # Fetch the MT7612U dongle firmware and bundle it into the APK on every
-      # build (PRs included), so the firmware path is always exercised and the
-      # APK is complete. The firmware is Microsoft's and never committed (CLAUDE.md
-      # "Licensing"); fetch-firmware.sh extracts it into the gitignored asset path
-      # so the assembleDebug below packages it, and verifies it against the hash
-      # pinned in the script — the download is plain http, so the hash is what
-      # rejects a reissued or tampered package.
+      # Cache the hash-verified firmware so most builds skip the Microsoft
+      # download entirely; it is fetched only on a cold miss. The key is tied to
+      # fetch-firmware.sh, so changing the pinned hash or the URL invalidates the
+      # cache and forces a fresh, re-verified fetch. Repo-private CI storage, not
+      # a public artifact.
+      - name: Cache the dongle firmware
+        id: fw-cache
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/assets/xone_dongle_fw.bin
+          key: xone-dongle-fw-${{ hashFiles('scripts/fetch-firmware.sh') }}
+
+      # The firmware is Microsoft's and never committed (CLAUDE.md "Licensing").
+      # On a cache miss, fetch-firmware.sh downloads Microsoft's driver package,
+      # extracts the blob into the gitignored asset path so the assembleDebug below
+      # packages it, and verifies it against the hash pinned in the script — the
+      # download is plain http, so the hash is what rejects a reissued or tampered
+      # package. The cache then serves it to later builds (PRs included).
       - name: Fetch the dongle firmware (bundled into the APK)
+        if: steps.fw-cache.outputs.cache-hit != 'true'
         env:
           # Overrides the hash pinned in the script, should Microsoft reissue it.
           # Unset (incl. on fork PRs, where secrets are withheld) → the pinned hash.
