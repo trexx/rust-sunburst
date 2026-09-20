@@ -65,6 +65,19 @@ pub enum Backend {
     NvFbc,
 }
 
+/// Which monitor a backend captures.
+///
+/// `Primary` is the default and the historical behaviour (DXGI output 0 /
+/// `MONITOR_DEFAULTTOPRIMARY`). `Index(n)` selects the n-th DXGI output on the
+/// first adapter — used to capture a virtual display (the opt-in MTT VDD) when
+/// it is not the primary monitor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OutputSelect {
+    #[default]
+    Primary,
+    Index(u32),
+}
+
 /// Per-frame metadata carried alongside whichever surface a backend produced.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameMeta {

@@ -16,15 +16,18 @@ use std::sync::Arc;
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{
     AppListing, DecoderQuirks, Feedback, Hello, InputEvent, PairRequest, Seq16, SessionConfig,
-    SessionKey,
+    SessionKey, StreamCodec,
 };
 // Re-exported so callers of this crate do not need to reach past it for the
 // seams its own handler is generic over.
-use sunburst_net::{ControlHandler, Outbound};
+use sunburst_net::{
+    CaptureBackend as NetBackend, ControlHandler, InputSettings, Outbound, SessionSettings,
+};
 pub use sunburst_net::{InputSink, NoInput, NoStream, StreamControl};
 
 use crate::api::AppState;
 use crate::client::QuirksRecord;
+use crate::config::{CaptureBackend, CodecPreference, RateControl};
 
 /// Wires the control channel to [`AppState`] (`ControlHandler`), the input
 /// injector (`InputSink`), and the video-session manager (`StreamControl`). The
@@ -87,7 +90,53 @@ impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
         // Seed the session with the quirks recorded at pairing; a fresh
         // `DecoderQuirks` message can refine them afterwards.
         let quirks = self.state.client_quirks(client).unwrap_or_default();
-        self.stream.session_start(client, from, &hello, quirks)
+        // Resolve the whole effective stream config for this session (global
+        // defaults + the running app's overrides) so every knob is live.
+        let e = self.state.effective_stream_config();
+        let settings = SessionSettings {
+            codec: match e.codec {
+                CodecPreference::Auto => None,
+                CodecPreference::Hevc => Some(StreamCodec::Hevc),
+                CodecPreference::Av1 => Some(StreamCodec::Av1),
+                CodecPreference::H264 => Some(StreamCodec::H264),
+            },
+            bitrate_kbps: e.bitrate_kbps,
+            min_bitrate_kbps: e.min_bitrate_kbps,
+            max_bitrate_kbps: e.max_bitrate_kbps,
+            hdr: e.hdr,
+            preset: e.preset,
+            vbr: matches!(e.rate_control, RateControl::Vbr),
+            slices: e.slices,
+            idr_period: e.idr_period,
+            dpb_depth: e.dpb_depth,
+            capture_backend: match e.capture_backend {
+                CaptureBackend::Auto => NetBackend::Auto,
+                CaptureBackend::Wgc => NetBackend::Wgc,
+                CaptureBackend::Dda => NetBackend::Dda,
+                CaptureBackend::Nvfbc => NetBackend::Nvfbc,
+            },
+            capture_output: e.capture_output,
+            match_resolution: e.match_resolution,
+            virtual_display: e.virtual_display,
+            fps_cap: e.fps_cap,
+            audio: e.audio,
+            audio_device: e.audio_device.clone(),
+            mic_device: e.mic_device.clone(),
+            audio_bitrate_kbps: e.audio_bitrate_kbps,
+            audio_frame_us: e.audio_frame_us,
+            audio_fec: e.audio_fec,
+            audio_complexity: e.audio_complexity,
+            disable_epp: self.state.input_config().disable_epp,
+        };
+        // Push the input tuning to the injector (mouse sensitivity / deadzone are
+        // applied live; EPP is handled by the session guard via `settings`).
+        let input = self.state.input_config();
+        self.input.configure(InputSettings {
+            mouse_sensitivity: input.mouse_sensitivity,
+            gamepad_deadzone: input.gamepad_deadzone,
+        });
+        self.stream
+            .session_start(client, from, &hello, quirks, settings)
     }
 
     fn on_quirks(&mut self, client: u32, quirks: DecoderQuirks) {

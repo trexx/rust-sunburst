@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use sunburst_core::proto::pairing::{NONCE_LEN, confirm_tag, derive_secret};
 use sunburst_core::proto::{
     AppListing, ClientControl, GamepadState, Hello, InputEvent, InputPacket, PairRequest,
-    ServerControl, SessionKey,
+    Seq16, ServerControl, SessionKey,
 };
 use sunburst_net::endpoint::ClientEndpoint;
 use sunburst_net::{Endpoint, Recording};
@@ -226,6 +226,8 @@ fn an_authenticated_client_is_recognised_by_its_key_alone() {
             client_nonce: [1; NONCE_LEN],
             clock_offset_ns: 0,
             codecs: sunburst_core::proto::codecs::HEVC_MAIN10,
+            prefer_codec: None,
+            max_bitrate_kbps: 0,
         }))
         .expect("send");
 
@@ -310,6 +312,52 @@ fn input_reaches_the_handler_and_a_replay_does_not() {
         assert_eq!(r.inputs.len(), 3, "a replayed packet was delivered again");
         assert!(r.inputs.iter().all(|(client, _)| *client == 3));
     });
+}
+
+#[test]
+fn pad_mic_audio_in_reaches_the_handler_and_carries_its_pad() {
+    // AudioIn is unauthenticated media, attributed by source address. So the
+    // client first sends a signed input (which teaches the endpoint its
+    // address), then an AudioIn frame from the same socket must route through.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+
+    client
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the address to be attributed", |r| !r.inputs.is_empty());
+
+    let opus = [0xABu8; 80];
+    client
+        .send_audio_in(2, Seq16(9), 0x1234_5678, &opus)
+        .expect("send audio-in");
+    server.wait_for("a pad-mic frame", |r| !r.audio_ins.is_empty());
+    server.recording(|r| {
+        assert_eq!(r.audio_ins.len(), 1);
+        let (client_id, pad, seq, payload) = &r.audio_ins[0];
+        assert_eq!(*client_id, 3, "attributed to the paired client");
+        assert_eq!(*pad, 2, "the pad index rode in pkt_idx");
+        assert_eq!(*seq, Seq16(9));
+        assert_eq!(payload, &opus);
+    });
+}
+
+#[test]
+fn pad_mic_audio_in_from_an_unknown_address_is_dropped() {
+    // A stray host must not be able to inject microphone audio into a session it
+    // never joined: an AudioIn from an address the endpoint has not attributed
+    // to a client is ignored.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+    // A bare client that never authenticated — its address is unknown.
+    let stranger = ClientEndpoint::connect(server.addr, None).expect("connect");
+    stranger
+        .send_audio_in(0, Seq16(1), 0, &[0u8; 40])
+        .expect("send");
+    std::thread::sleep(Duration::from_millis(200));
+    server.recording(|r| assert!(r.audio_ins.is_empty(), "unattributed mic audio was accepted"));
 }
 
 #[test]
@@ -484,6 +532,8 @@ fn queued_rumble_reaches_the_client_signed_and_unreliable() {
         pad_index: 0,
         motor_low: 0xBEEF,
         motor_high: 0x1234,
+        trigger_left: 0xCAFE,
+        trigger_right: 0x0FF1,
         seq: 7,
     };
     server
@@ -609,6 +659,8 @@ fn a_forged_rumble_does_not_verify() {
                 pad_index: 0,
                 motor_low: 1,
                 motor_high: 1,
+                trigger_left: 0,
+                trigger_right: 0,
                 seq: 1,
             },
         });
@@ -633,7 +685,7 @@ fn a_forged_rumble_does_not_verify() {
 
 // ---- Session-key handshake and the data channel -------------------------
 
-use sunburst_core::proto::{Feedback, Nack, Seq16, SessionConfig, StreamCodec, codecs};
+use sunburst_core::proto::{Feedback, Nack, SessionConfig, StreamCodec, codecs};
 
 const PAIR_SECRET: [u8; 32] = [0x5C; 32];
 const CLIENT_NONCE: [u8; NONCE_LEN] = [0x9A; NONCE_LEN];
@@ -648,6 +700,7 @@ fn session_config() -> SessionConfig {
         fps_mhz: 59_940,
         bitrate_kbps: 120_000,
         hdr: None,
+        audio: None,
         intra_refresh: false,
         ref_invalidation: true,
         slices: 4,
@@ -669,6 +722,8 @@ fn hello_with(nonce: [u8; NONCE_LEN]) -> Hello {
         client_nonce: nonce,
         clock_offset_ns: 0,
         codecs: codecs::HEVC_MAIN10,
+        prefer_codec: None,
+        max_bitrate_kbps: 0,
     }
 }
 

@@ -80,6 +80,17 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   irrelevant if it did — Android decoders want 4:2:0. AV1 4:4:4 is absent too
   (HEVC 4:4:4 is present); also irrelevant, and noted only so its absence is
   never read as a finding.
+- **H.264 is an opt-in, low-latency, 8-bit SDR codec — never an HDR path.** NVENC
+  has no 10-bit H.264, so H.264 cannot carry HDR10; it exists because it encodes a
+  touch faster than HEVC and is the lowest-latency hardware decode on cheap SoCs.
+  `negotiate_codec` never auto-selects it over HEVC/AV1 (auto keeps HDR); it is
+  chosen only by an explicit codec preference or as a client's sole offer. It
+  reuses the HEVC packetizer (Annex-B NAL), the sequence-header path (SPS/PPS),
+  and HEVC's reference-invalidation `Window`. Its one new piece is an **8-bit SDR
+  pixel path**: a second convert — an scRGB→NV12 BT.709 HLSL shader and an
+  `argb_to_nv12` CUDA kernel, both with an ACES HDR→SDR tonemap so H.264 works
+  from an HDR desktop — feeding NVENC NV12 input instead of P010. HEVC/AV1 stay
+  10-bit P010 throughout.
 
 ## Hot path rules
 
@@ -157,12 +168,15 @@ Bitrate: HEVC 100–150 Mbps, AV1 70–100 Mbps. Shield's decoder caps out befor
 ```
 sunburst-core/     protocol types, packets, timestamps, instrumentation. no I/O.
 sunburst-capture/  Capture trait + 5 backends
-sunburst-encode/   NVENC FFI, HEVC + AV1
+sunburst-encode/   NVENC FFI, HEVC + AV1 (10-bit) + H.264 (8-bit SDR)
 sunburst-audio/    WASAPI loopback + Opus
 sunburst-input/    ViGEm + SendInput + session helper
 sunburst-net/      UDP, pacing, NACK, rate control
 sunburst-server/   orchestration; tokio lives here and only here
 sunburst-web/      management API: clients, sessions, config, apps. Cross-platform.
+sunburst-gip-bridge/ vendored xow/xone C++ (MT7612U radio + GIP + wired) + libusb
+                   + shim, behind a C FFI Rust calls. Host = pure-Rust stub; the
+                   real path is #[cfg(all(target_os="android", feature="vendored"))].
 sunburst-android/  cdylib + JNI shim
 android/           Gradle project; Kotlin owns Activity + SurfaceView, and
                    forwards the input and platform queries with no NDK equivalent
@@ -178,17 +192,42 @@ the vtable slot order and the CUDA teardown order are all things that were wrong
 at least once before they were right. **Promote it into `sunburst-capture` before
 deleting `spikes/`**, or that goes with it.
 
-`sunburst-capture`, `-encode`, `-audio` and `-server` are `#![cfg(windows)]` at
-the crate root, so they compile to nothing on a Linux host. `sunburst-core`,
-`-net` and `-web` are cross-platform: the client needs the protocol types and the
-receive half, and everything Windows-specific the web UI needs sits behind the
-`Host` trait in `sunburst-web/src/host.rs`.
+`sunburst-capture`, `-encode` and `-server` are `#![cfg(windows)]` at the crate
+root, so they compile to nothing on a Linux host. `sunburst-core`, `-net` and
+`-web` are cross-platform: the client needs the protocol types and the receive
+half, and everything Windows-specific the web UI needs sits behind the `Host`
+trait in `sunburst-web/src/host.rs`.
 
-`sunburst-input` is the interesting case — deliberately **not** Windows-only at
-the root. Its `keymap` module holds the decisions (scancode, extended flag,
-modifier reconciliation, `MOUSEEVENTF` bits) as pure functions with real tests,
-and only `inject` is gated. Those decisions are the part that is easy to get
-wrong, so they are tested on a machine where `SendInput` does not exist.
+`sunburst-input` and `sunburst-audio` are the interesting cases — deliberately
+**not** Windows-only at the root. `sunburst-input`'s `keymap` module holds the
+decisions (scancode, extended flag, modifier reconciliation, `MOUSEEVENTF` bits)
+as pure functions with real tests, and only `inject` is gated.
+`sunburst-audio`'s `codec` (a thin safe wrapper over `unsafe-libopus`, libopus
+transpiled to pure Rust) and `pcm` (float→i16, downmix, frame regrouping) are
+pure and host-tested, and the **client links the Opus decoder from the same
+crate**; only the WASAPI `capture`/`device` modules are `#[cfg(windows)]`. Those
+pure decisions are the part that is easy to get wrong, so they are tested on a
+machine where WASAPI and `SendInput` do not exist.
+
+**Audio wants the render endpoint at 48 kHz.** Loopback capture reads the
+endpoint's shared mix format, which cannot be changed; the code converts
+float32/16-bit and downmixes to stereo but does not resample, and warns if the
+endpoint is not 48 kHz. One checkbox per install, like Enhanced Pointer
+Precision. The capture device is selectable (`StreamConfig.audio_device`): the
+default endpoint leaves the host audible, "Steam Streaming Speakers" silences it
+by reusing Valve's signed sink rather than a driver of ours.
+
+**The pad-headset mic reuses the same posture, inbound.** An Xbox headset's mic
+(Phase 8) is forwarded to the server and rendered into a **consumed** virtual
+microphone — a signed "Steam Streaming Microphone" endpoint chosen by name
+(`StreamConfig.mic_device`, off by default), never a driver of ours and never
+VB-CABLE. The mic travels at its native capture rate (a chat headset is 24 kHz
+mono); the server's 48 kHz Opus decoder resamples on decode, so the no-resample
+rule above is untouched. Client-side, `audio_route` (TV / pad / both) and
+`pad_volume` on the TV settings screen decide where decoded audio *plays* — the mic
+is independent of the route: playback and mic capture share one headset-enablement
+gate (≤2 concurrent headsets, on the shared adapter's iso bandwidth), and the mic
+path enables a present headset itself, so it works even on a TV-only route.
 
 That trait is not abstraction for its own sake — it is what lets the entire
 management surface be tested on the Linux machine instead of the 4070 box.
@@ -211,6 +250,41 @@ would not have recovered anything.
 The session helper in the traps below is still needed for the *desktop* problem —
 re-attaching via `OpenInputDesktop`/`SetThreadDesktop` when the desktop switches
 — just not for a cross-session one.
+
+## Configuration surface
+
+The config is deliberately broad, not minimal: nearly every encoder, capture,
+audio and input knob is exposed through the web UI (an *Advanced* disclosure
+hides the ones most installs never touch) and persisted in `StreamConfig` /
+`InputConfig`. `SessionSettings` (in `sunburst-net`) is the seam — the web
+handler fills it from `Config::effective(running_app)` on every `Hello`, so a
+change takes effect on the **next session**, live, with no restart and nothing
+frozen at startup. Per-app overrides stay small on purpose: codec, bitrate and
+preset; everything else is global.
+
+The client asks, the server decides. The TV settings screen can request a codec
+and a bitrate ceiling (`Hello.prefer_codec` / `max_bitrate_kbps`, see
+PROTOCOL.md) and set purely-local presentation prefs (jitter depth, cursor
+overlay, performance hint). Requests are advisory: `negotiate_codec` only honours
+a preferred codec the device's `codecs` bitmask already offers, and the bitrate
+is the minimum of the server setting, the codec ceiling, and the client's ask.
+
+**Breadth stops exactly where the settled decisions are.** These are not missing
+knobs to be added later; they are the architecture above:
+
+- **No encryption toggle.** Video/audio are unencrypted by design (LAN-only, raw
+  UDP, no QUIC); input and control are always authenticated. There is nothing to
+  switch, so there is no switch.
+- **The NVENC preset knob is P1–P4, inside `TUNING_INFO_ULTRA_LOW_LATENCY`
+  only.** No UHQ, no B-frames, no lookahead — those buy compression with the
+  latency this project exists to remove. Rate control is CBR/VBR; both stay in
+  the ULL envelope.
+- **NvFBC stays opt-in** (`capture_backend`), never the auto default; `Auto` is
+  WGC/DDA per the OS.
+
+The whole surface is host-tested through the `Host` trait and `Fake` — the
+settings round-trip, the audio-device picker, the per-app override merge — so it
+is exercised on the Linux box, not only the 4070.
 
 ## Build and test
 
@@ -338,9 +412,17 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   that looks like our bug. Warn at startup if another session is detected.
 
 **HDR**
-- Windows 10 HDR is a **global display toggle**, not per-app like Win11. Toggle
-  via `DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE` in `SetDisplayConfig` around the
-  session, and restore on disconnect. Users will notice if you don't.
+- Windows 10 HDR is a **global display toggle**, not per-app like Win11. It is
+  toggled around the session and restored on disconnect by `DisplayGuard`
+  (`sunburst-server/src/display.rs`): `DisplayConfigSetDeviceInfo` with the
+  advanced-color-state packet on every active output, snapshotted and restored on
+  the guard's `Drop` so an abnormal teardown still restores it. Users notice if
+  it does not restore, which is why restore is in a guard, not a code path.
+  Resolution matching (`ChangeDisplaySettingsExW`) and the optional MikeTheTech
+  virtual display live in the same module, driven by the `match_resolution`,
+  `virtual_display` and `capture_output` config flags — the VDD is **consumed**
+  (device enable/disable via SetupAPI + capture output selection), never authored
+  or vendored, so there is no WDDM signing or GPL entanglement.
 - Capture yields scRGB linear FP16. Shader: normalise by 80 nits → BT.2020
   primaries → PQ EOTF⁻¹ → 4:2:0 subsample. Get chroma siting right or UI text fringes.
 
@@ -369,6 +451,31 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
 - Gate `PerformanceHintManager` (API 31) behind a version check. Real win on the
   Amlogic's small cores.
 - Enumerate `MediaCodecList` at startup. Never assume a codec exists.
+
+**Pads (Phase 8, `sunburst-gip-bridge`)**
+- **GIP is vendored, not authored.** The xow/xone C++ (MT7612U radio + GIP +
+  wired) is proven against this exact adapter and the pad-audio security handshake
+  is unverifiable off-hardware — "vendor now, Rustify later", the same
+  consume-a-driver posture as HDR/VDD/NvFBC. Don't re-transcribe it from the spec;
+  the Rust rewrite is a deferred follow-up against a *captured corpus*.
+- **The seam is a C FFI Rust calls, not JNI.** Kotlin owns only the Activity and
+  the `UsbManager` fd; the driver's JNI upcalls were replaced by a C++ `GipSink`.
+  The GIP handshake crypto (RSA-PKCS#1v1.5 + ECDH-P256) is reimplemented in Rust
+  (`crypto.rs`), host-tested byte-exact — no Java/mbedtls dependency remains.
+- **Firmware is fetched, never committed** (`scripts/fetch-firmware.sh`,
+  `FW_ACC_00U.bin`); the embedded blob is not vendored. GPL-2-or-later; provenance
+  in `sunburst-gip-bridge/vendor/UPSTREAM.md`. The four `[MS-GIPUSB]` defects the
+  original plan meant to fix in-place are **audited and resolved** there — three
+  were already fixed by the moonlight-trexx port (rumble percentage, extended
+  status, uniform signed sticks) and the fourth (host capability advertisement) is
+  not a spec requirement (§1.7 negotiation is "None").
+- **The headset mic is 24 kHz mono**, distinct from the 48 kHz-stereo speaker
+  (`[MS-GIPUSB]` §3.2.5.1.2 format codes); `audio_format(pad)` reports the render
+  format, `mic_format(pad)` the capture format. Don't assume they match. The mic is
+  Opus-encoded at its native rate and resampled by the server's decoder.
+- Rumble carries **four** motors (two rumble + the two Xbox impulse triggers); the
+  driver renders the pad's negotiated headset format itself, so `audio_out` takes
+  48 kHz stereo regardless.
 
 ## Decoder quirks table
 

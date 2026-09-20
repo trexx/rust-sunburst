@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use sunburst_core::proto::input::MAX_PADS;
 use sunburst_core::proto::{GamepadState, InputEvent, MouseMotion, PadOutput, TriggerEffect};
-use sunburst_net::{InputSink, Outbound};
+use sunburst_net::{InputSettings, InputSink, Outbound};
 
 use crate::pad::codec::DecodedValue;
 use crate::pad::outpolicy::RepeatPolicy;
@@ -48,6 +48,7 @@ use crate::pad::{device, gip, install, registry, shmem};
 /// one thread, so pad lifecycle rides the same channel as input.
 enum Msg {
     Input(InputEvent),
+    Config(InputSettings),
     PadConnected {
         client: u32,
         pad_index: u8,
@@ -152,6 +153,10 @@ impl InputSink for Injector {
         self.send(Msg::Input(event));
     }
 
+    fn configure(&mut self, settings: InputSettings) {
+        self.send(Msg::Config(settings));
+    }
+
     fn pad_connected(&mut self, client: u32, pad_index: u8, pad_type: u8, _capabilities: u16) {
         self.send(Msg::PadConnected {
             client,
@@ -231,17 +236,21 @@ fn run(
     let mut desktop = Desktop::default();
     let mut modifiers = Modifiers::new();
     let mut pads: [Option<PadState>; MAX_PADS as usize] = std::array::from_fn(|_| None);
+    let mut settings = InputSettings::default();
     let started = Instant::now();
     let mut last_ensure = started - DESKTOP_POLL;
 
     loop {
         match rx.recv_timeout(OUTPUT_POLL) {
+            Ok(Msg::Config(s)) => settings = s,
             // Gamepad goes to shared memory, not the desktop.
-            Ok(Msg::Input(InputEvent::Gamepad(state))) => submit_gamepad(&mut pads, &state),
+            Ok(Msg::Input(InputEvent::Gamepad(state))) => {
+                submit_gamepad(&mut pads, &state, settings.gamepad_deadzone)
+            }
             Ok(Msg::Input(event)) => {
                 desktop.ensure(stats);
                 last_ensure = Instant::now();
-                apply(event, &mut modifiers, stats);
+                apply(event, &mut modifiers, stats, settings.mouse_sensitivity);
             }
             Ok(Msg::PadConnected {
                 client,
@@ -332,9 +341,20 @@ fn connect_pad(
 }
 
 /// Encode a gamepad frame and submit it to the pad's driver section.
-fn submit_gamepad(pads: &mut [Option<PadState>], state: &GamepadState) {
+fn submit_gamepad(pads: &mut [Option<PadState>], state: &GamepadState, deadzone: f32) {
     let Some(Some(pad)) = pads.get_mut(state.pad_index as usize) else {
         return;
+    };
+    // Apply the extra radial deadzone to both sticks before emulating the pad.
+    let adjusted;
+    let state = if deadzone > 0.0 {
+        let mut s = *state;
+        (s.lx, s.ly) = keymap::apply_deadzone(s.lx, s.ly, deadzone);
+        (s.rx, s.ry) = keymap::apply_deadzone(s.rx, s.ry, deadzone);
+        adjusted = s;
+        &adjusted
+    } else {
+        state
     };
     // GIP first (its own borrow ends), copied to the stack to avoid an alloc.
     let gip = pad.session.gip(state).map(|g| {
@@ -446,7 +466,7 @@ fn build_pad_output(
     }
 }
 
-fn apply(event: InputEvent, modifiers: &mut Modifiers, stats: &Stats) {
+fn apply(event: InputEvent, modifiers: &mut Modifiers, stats: &Stats, mouse_sensitivity: f32) {
     match event {
         InputEvent::KeyDown { vk, modifiers: m } => {
             for action in modifiers.resolve(vk, true, m) {
@@ -459,7 +479,10 @@ fn apply(event: InputEvent, modifiers: &mut Modifiers, stats: &Stats) {
             }
         }
         InputEvent::MouseMove(MouseMotion::Relative { dx, dy }) => {
-            send_mouse(keymap::relative_action(dx, dy), stats);
+            send_mouse(
+                keymap::relative_action_scaled(dx, dy, mouse_sensitivity),
+                stats,
+            );
         }
         InputEvent::MouseMove(MouseMotion::Absolute { x, y }) => {
             send_mouse(keymap::absolute_action(x, y), stats);

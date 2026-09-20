@@ -16,25 +16,41 @@ use std::ffi::c_void;
 
 use sunburst_capture::cuda::{CUDA_SUCCESS, CuContext, CuDevicePtr, CuFunction, Cuda};
 
-/// The compiled convert kernel. The real bytes come from CI; see the module docs.
-const KERNEL_PTX: &[u8] = include_bytes!("../cuda/argb10_to_p010.ptx");
+use crate::convert::ConvertOutput;
 
-/// Converts ARGB10 CUDA buffers to P010, in a shared CUDA context.
+/// The compiled convert kernels. The real bytes come from CI; see the module docs.
+const KERNEL_PTX_P010: &[u8] = include_bytes!("../cuda/argb10_to_p010.ptx");
+const KERNEL_PTX_NV12: &[u8] = include_bytes!("../cuda/argb_to_nv12.ptx");
+
+/// Converts ARGB10 CUDA buffers to P010 (HEVC/AV1) or NV12 (H.264 SDR), in a
+/// shared CUDA context.
 pub struct CudaConverter {
     cuda: Cuda,
     kernel: CuFunction,
-    /// The P010 output buffer, reused each frame.
-    p010: CuDevicePtr,
-    /// P010 row pitch in bytes — pass to [`Encoder::new_cuda`](crate::encoder::Encoder::new_cuda).
+    /// The output buffer (P010 or NV12), reused each frame.
+    out_buf: CuDevicePtr,
+    /// Output row pitch in bytes — pass to [`Encoder::new_cuda`](crate::encoder::Encoder::new_cuda).
     pitch_bytes: u32,
+    /// Destination stride in *elements* (u16 for P010, u8 for NV12).
+    dst_pitch_elems: i32,
+    /// The kernel's name, for the launch-failure message.
+    kernel_name: &'static str,
     width: u32,
     height: u32,
 }
 
 impl CudaConverter {
-    /// Build a converter in NvFBC's CUDA `context`, allocating a P010 output for
-    /// `width`×`height`.
-    pub fn new(context: CuContext, width: u32, height: u32) -> Result<CudaConverter, String> {
+    /// Build a converter in NvFBC's CUDA `context`, allocating an `output` buffer
+    /// (P010 for HEVC/AV1, NV12 for H.264) for `width`×`height`. `hdr_source`
+    /// selects the tonemapping NV12 kernel for an HDR desktop; it is ignored by
+    /// the P010 kernel.
+    pub fn new(
+        context: CuContext,
+        width: u32,
+        height: u32,
+        output: ConvertOutput,
+        hdr_source: bool,
+    ) -> Result<CudaConverter, String> {
         let cuda = Cuda::load().map_err(|e| format!("cuda load: {e}"))?;
         // NvFBC already called cuInit; repeating it is harmless.
         if cuda.init() != CUDA_SUCCESS {
@@ -45,8 +61,35 @@ impl CudaConverter {
             return Err("cuCtxPushCurrent failed".into());
         }
 
+        // Pick the kernel, its output pitch/size, and destination element stride.
+        let (ptx_src, kernel_name, pitch_bytes, bytes) = match output {
+            ConvertOutput::P010 => (
+                KERNEL_PTX_P010,
+                "argb10_to_p010",
+                width * 2,
+                // Y plane (w·h·2) + interleaved UV (w·h) = w·h·3 bytes.
+                (width as usize) * (height as usize) * 3,
+            ),
+            ConvertOutput::Nv12 => (
+                KERNEL_PTX_NV12,
+                if hdr_source {
+                    "argb_to_nv12_tonemap"
+                } else {
+                    "argb_to_nv12"
+                },
+                width,
+                // Y plane (w·h) + interleaved UV (w·h/2) = w·h·3/2 bytes.
+                (width as usize) * (height as usize) * 3 / 2,
+            ),
+        };
+        // Elements: u16 for P010 (pitch/2), u8 for NV12 (pitch).
+        let dst_pitch_elems = match output {
+            ConvertOutput::P010 => (pitch_bytes / 2) as i32,
+            ConvertOutput::Nv12 => pitch_bytes as i32,
+        };
+
         // cuModuleLoadData wants NUL-terminated PTX text.
-        let mut ptx = KERNEL_PTX.to_vec();
+        let mut ptx = ptx_src.to_vec();
         ptx.push(0);
         let module = cuda
             .module_load_data(&ptx)
@@ -54,34 +97,34 @@ impl CudaConverter {
         // The module stays loaded in the context for the process's life; the
         // kernel handle keeps working without holding the module handle.
         let kernel = cuda
-            .module_get_function(module, "argb10_to_p010")
+            .module_get_function(module, kernel_name)
             .map_err(|s| format!("cuModuleGetFunction: {s}"))?;
 
-        let pitch_bytes = width * 2;
-        // Y plane (w·h·2 bytes) + interleaved UV plane (w·h bytes).
-        let bytes = (width as usize) * (height as usize) * 3;
-        let p010 = cuda
+        let out_buf = cuda
             .mem_alloc(bytes)
             .map_err(|s| format!("cuMemAlloc({bytes}): {s}"))?;
 
         Ok(CudaConverter {
             cuda,
             kernel,
-            p010,
+            out_buf,
             pitch_bytes,
+            dst_pitch_elems,
+            kernel_name,
             width,
             height,
         })
     }
 
-    /// Convert one ARGB10 device buffer to P010. `src_pitch` is the ARGB10 row
-    /// pitch (bytes). Returns the P010 device pointer, valid until the next call.
+    /// Convert one ARGB10 device buffer to the output format (P010/NV12).
+    /// `src_pitch` is the ARGB10 row pitch (bytes). Returns the output device
+    /// pointer, valid until the next call.
     pub fn convert(&self, argb10: CuDevicePtr, src_pitch: u32) -> Result<CuDevicePtr, String> {
         // Kernel args, held in locals so `params` can point at each.
         let mut src = argb10;
         let mut src_pitch_words = (src_pitch / 4) as i32;
-        let mut dst = self.p010;
-        let mut dst_pitch_elems = (self.pitch_bytes / 2) as i32;
+        let mut dst = self.out_buf;
+        let mut dst_pitch_elems = self.dst_pitch_elems;
         let mut width = self.width as i32;
         let mut height = self.height as i32;
         let mut params: [*mut c_void; 6] = [
@@ -105,12 +148,12 @@ impl CudaConverter {
             .launch_kernel(self.kernel, grid, block, &mut params)
             != CUDA_SUCCESS
         {
-            return Err("cuLaunchKernel(argb10_to_p010) failed".into());
+            return Err(format!("cuLaunchKernel({}) failed", self.kernel_name));
         }
         if self.cuda.ctx_synchronize() != CUDA_SUCCESS {
             return Err("cuCtxSynchronize failed".into());
         }
-        Ok(self.p010)
+        Ok(self.out_buf)
     }
 
     /// The P010 output's row pitch (bytes).
@@ -121,9 +164,9 @@ impl CudaConverter {
 
 impl Drop for CudaConverter {
     fn drop(&mut self) {
-        if self.p010 != 0 {
-            self.cuda.mem_free(self.p010);
-            self.p010 = 0;
+        if self.out_buf != 0 {
+            self.cuda.mem_free(self.out_buf);
+            self.out_buf = 0;
         }
         // The module is left loaded (process-lifetime); no cuModuleUnload wired.
     }

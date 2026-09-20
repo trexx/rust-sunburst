@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::Auth;
 use crate::client::{PairedClient, PublicClient};
-use crate::config::{AppEntry, Config, StreamConfig, WebConfig};
+use crate::config::{AppEntry, Config, InputConfig, StreamConfig, WebConfig};
 use crate::host::{Host, HostError, HostStatus, RunningApp, SessionSummary};
 use crate::metrics::MetricsRecord;
 use crate::pairing::{Pairing, PairingError};
@@ -197,8 +197,24 @@ impl AppState {
             .clone()
     }
 
+    /// The stream config for the session about to start: the global defaults with
+    /// the currently-running app's overrides merged in (`Config::effective`). A
+    /// launched game's bitrate/codec profile takes effect through this.
+    pub fn effective_stream_config(&self) -> StreamConfig {
+        // Query the host before taking the lock, so the two do not nest.
+        let running = self.host.running_app();
+        let inner = self.inner.lock().expect("not poisoned");
+        let app = running.and_then(|r| inner.config.app(r.app_id));
+        inner.config.effective(app)
+    }
+
     pub fn web_config(&self) -> WebConfig {
         self.inner.lock().expect("not poisoned").config.web.clone()
+    }
+
+    /// The server-side input tuning (mouse sensitivity, deadzone, EPP).
+    pub fn input_config(&self) -> InputConfig {
+        self.inner.lock().expect("not poisoned").config.input
     }
 
     pub fn host(&self) -> &Arc<dyn Host> {
@@ -339,6 +355,12 @@ struct StatusBody {
 pub struct SettingsBody {
     pub web: WebConfig,
     pub stream: StreamConfig,
+    pub input: InputConfig,
+}
+
+#[derive(Serialize)]
+struct AudioDevicesBody {
+    devices: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -396,6 +418,7 @@ pub fn dispatch(state: &AppState, req: &ApiRequest, now: u64) -> ApiResponse {
 
         ("GET", ["api", "config"]) => settings(state),
         ("PUT", ["api", "config"]) => update_settings(state, req),
+        ("GET", ["api", "audio-devices"]) => audio_devices(state),
 
         ("GET", ["api", "clients"]) => list_clients(state),
         ("DELETE", ["api", "clients", id]) => revoke_client(state, id),
@@ -449,6 +472,16 @@ fn settings(state: &AppState) -> ApiResponse {
     ApiResponse::ok(&SettingsBody {
         web: inner.config.web.clone(),
         stream: inner.config.stream.clone(),
+        input: inner.config.input,
+    })
+}
+
+/// The server's audio render endpoints, for the settings device picker. A name
+/// from this list, dropped into `StreamConfig.audio_device`, resolves back to
+/// the same endpoint via the substring match in `select_render_endpoint`.
+fn audio_devices(state: &AppState) -> ApiResponse {
+    ApiResponse::ok(&AudioDevicesBody {
+        devices: state.host.audio_devices(),
     })
 }
 
@@ -465,6 +498,7 @@ fn update_settings(state: &AppState, req: &ApiRequest) -> ApiResponse {
     let mut candidate = inner.config.clone();
     candidate.web = update.web;
     candidate.stream = update.stream;
+    candidate.input = update.input;
 
     if let Err(e) = state.store.save_config(&candidate) {
         return ApiResponse::error(400, e);
@@ -475,6 +509,7 @@ fn update_settings(state: &AppState, req: &ApiRequest) -> ApiResponse {
     ApiResponse::ok(&SettingsBody {
         web: inner.config.web.clone(),
         stream: inner.config.stream.clone(),
+        input: inner.config.input,
     })
 }
 

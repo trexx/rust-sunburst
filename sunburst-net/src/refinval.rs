@@ -161,6 +161,39 @@ impl RefState for HevcRefState {
     }
 }
 
+/// H.264: the same sliding-DPB model as HEVC (`num_ref_frames`), so it reuses the
+/// `Window`. H.264's reference management is close enough to HEVC's — a sliding
+/// set of short-term references plus IDR — that no separate machine is warranted,
+/// unlike AV1's explicit-slot model.
+pub struct H264RefState {
+    window: Window,
+    dpb_depth: u16,
+}
+
+impl H264RefState {
+    /// `dpb_depth` must match what the encoder was initialised with.
+    pub fn new(dpb_depth: u16) -> H264RefState {
+        H264RefState {
+            window: Window::new(),
+            dpb_depth: dpb_depth.max(2),
+        }
+    }
+}
+
+impl RefState for H264RefState {
+    fn on_encoded(&mut self, frame_id: Seq16, timestamp: u64, keyframe: bool) {
+        self.window.on_encoded(frame_id, timestamp, keyframe);
+    }
+
+    fn on_abandoned(&mut self, frame_id: Seq16) -> Recovery {
+        self.window.on_abandoned(frame_id, self.dpb_depth)
+    }
+
+    fn timestamp_of(&self, frame_id: Seq16) -> Option<u64> {
+        self.window.timestamp_of(frame_id)
+    }
+}
+
 /// AV1's reference model: eight slots, one of which is being written, so seven
 /// reconstructed frames are the most that can ever be referenced.
 pub const AV1_REF_SLOTS: u16 = 8;

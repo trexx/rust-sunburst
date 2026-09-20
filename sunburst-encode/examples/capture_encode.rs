@@ -13,8 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
-    use sunburst_capture::{Frame, select};
-    use sunburst_encode::convert::Converter;
+    use sunburst_capture::{Frame, OutputSelect, select};
+    use sunburst_encode::convert::{ConvertOutput, Converter};
     use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
     use sunburst_encode::nvenc::Nvenc;
     use windows::Win32::Graphics::Direct3D11::ID3D11Device;
@@ -27,12 +27,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Second arg picks the codec: `av1` → AV1, anything else → HEVC.
     let (codec, path) = match std::env::args().nth(2).as_deref() {
         Some("av1") => (Codec::Av1, "capture.obu"),
+        Some("h264") => (Codec::H264, "capture.264"),
         _ => (Codec::Hevc, "capture.265"),
     };
     let slices: u32 = if codec == Codec::Av1 { 2 } else { 4 }; // AV1: 2×2 tiles
 
     // hdr-preferred D3D11 capture (NvFBC off), the runtime NVENC, an output file.
-    let mut capture = select::build(false, true)?;
+    let mut capture = select::build(false, None, true, OutputSelect::Primary)?;
     let hdr = capture.caps().hdr_metadata; // the display's mastering metadata, if HDR
     let nvenc = Nvenc::load()?;
     let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
@@ -51,10 +52,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let (w, h) = (tf.meta.width, tf.meta.height);
 
-        // scRGB FP16 → P010, on the texture's own device.
+        // scRGB FP16 → P010 (HEVC/AV1) or NV12 (H.264), on the texture's device.
+        let output = if codec == Codec::H264 {
+            ConvertOutput::Nv12
+        } else {
+            ConvertOutput::P010
+        };
         let conv = match &mut converter {
             Some(c) => c,
-            None => converter.insert(Converter::new(&tf.texture)?),
+            None => converter.insert(Converter::new(&tf.texture, output, hdr.is_some())?),
         };
         let p010 = conv.convert(&tf.texture, w, h)?;
         let p010_raw = p010.as_raw();

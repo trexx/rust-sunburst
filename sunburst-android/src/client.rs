@@ -25,6 +25,31 @@ use sunburst_net::{
 
 use crate::decode::Decoder;
 use crate::input_map::{ClientInput, InputAccumulator};
+use crate::pad::{PadOutputRouter, PadSink};
+use sunburst_core::proto::input::GamepadState;
+use sunburst_core::proto::padoutput::PadOutput;
+use sunburst_core::proto::rumble::Rumble;
+use sunburst_gip_bridge::PadEvent;
+
+/// Where decoded server→client pad output goes: the physical controller, via the
+/// currently-attached GIP bridge. The bridge lives in a process global set by the
+/// USB attach ([`crate::usb`]), read here each call so it works whatever order the
+/// attach and the stream start happened in. A rumble with no pad attached is
+/// dropped rather than queued.
+struct BridgePadSink;
+
+impl PadSink for BridgePadSink {
+    fn rumble(&mut self, r: Rumble) {
+        if let Some(bridge) = crate::usb::current_bridge() {
+            bridge.rumble(r);
+        }
+    }
+    fn pad_output(&mut self, o: PadOutput) {
+        if let Some(bridge) = crate::usb::current_bridge() {
+            bridge.pad_output(o);
+        }
+    }
+}
 
 /// CLOCK_MONOTONIC nanoseconds — the base `MediaCodec` release timestamps and
 /// `System.nanoTime()` share.
@@ -128,6 +153,24 @@ impl CursorReassembler {
     }
 }
 
+/// Client-side stream preferences, set on the TV's settings screen and threaded
+/// down from `nativeStart`. All are requests the server is free to clamp:
+/// `prefer_codec` and `max_bitrate_kbps` ride in the `Hello`, and `jitter_min_ms`
+/// is a purely local floor on the adaptive jitter buffer.
+#[derive(Clone, Copy)]
+pub struct StreamPrefs {
+    /// Codec to ask the server for, or `None` to leave the choice to the server.
+    pub prefer_codec: Option<StreamCodec>,
+    /// Client-side bitrate ceiling in kbps; `0` means no client-imposed cap.
+    pub max_bitrate_kbps: u32,
+    /// Jitter-buffer minimum depth in milliseconds (smoothness vs. latency).
+    pub jitter_min_ms: u32,
+    /// Where decoded audio plays: `0` TV only, `1` pad headset only, `2` both.
+    pub audio_route: u8,
+    /// Pad headset volume, `0..=100`.
+    pub pad_volume: u8,
+}
+
 /// Run the client until `stop` is set. `codecs` is the bitmask the device can
 /// decode (`sunburst_core::proto::codecs`); the server negotiates one of them.
 #[allow(clippy::too_many_arguments)]
@@ -135,6 +178,7 @@ pub fn run(
     server: SocketAddr,
     secret: [u8; 32],
     codecs: u8,
+    prefs: StreamPrefs,
     window: NativeWindow,
     stop: Arc<AtomicBool>,
     input_rx: Receiver<ClientInput>,
@@ -146,16 +190,18 @@ pub fn run(
     let tid = unsafe { libc::gettid() };
     client_tid.store(tid, Ordering::Relaxed);
     if let Err(e) = run_inner(
-        server, secret, codecs, &window, &stop, &input_rx, &callbacks,
+        server, secret, codecs, prefs, &window, &stop, &input_rx, &callbacks,
     ) {
         log::error!("client stopped: {e}");
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     server: SocketAddr,
     secret: [u8; 32],
     codecs: u8,
+    prefs: StreamPrefs,
     window: &NativeWindow,
     stop: &AtomicBool,
     input_rx: &Receiver<ClientInput>,
@@ -176,6 +222,11 @@ fn run_inner(
             client_nonce,
             clock_offset_ns: 0,
             codecs,
+            // The client's requests from the TV settings screen; the server
+            // honours `prefer_codec` when the device can decode it and clamps
+            // `max_bitrate_kbps` to its own ceiling.
+            prefer_codec: prefs.prefer_codec,
+            max_bitrate_kbps: prefs.max_bitrate_kbps,
         })
         .map_err(|e| e.to_string())?;
 
@@ -219,11 +270,34 @@ fn run_inner(
         window,
     )?;
 
+    // Audio routing: 0 TV only, 1 pad headset only, 2 both.
+    let route_tv = prefs.audio_route != 1;
+    let route_pad = prefs.audio_route != 0;
+
+    // Start audio playback if the session carries it. Failure is non-fatal —
+    // video plays on without sound.
+    let mut audio_player = config.audio.and_then(|a| {
+        match crate::audio::AudioPlayer::new(a.sample_rate, a.channels, a.frame_samples, route_tv) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::warn!("audio playback unavailable: {e}");
+                None
+            }
+        }
+    });
+    // The pads' headsets, both directions behind one shared ≤2 cap: server audio
+    // forked to the headphones (when the route includes the pad) and the headset
+    // mic captured and sent. `capture` enables a headset itself, so the mic works
+    // on every audio route — including TV-only.
+    let mut headsets = crate::audio::PadHeadsets::new(prefs.pad_volume);
+
     let mut reassembler = Reassembler::new();
     let mut jitter = JitterBuffer::new();
     let frame_interval_ns = 1_000_000_000u64 / fps.max(1) as u64;
     jitter.set_frame_interval_ns(frame_interval_ns);
-    jitter.set_min_depth_ns(2_000_000);
+    // The TV setting is a floor in ms; default 2 ms reproduces the prior fixed
+    // value. The buffer still adapts upward from here under loss/jitter.
+    jitter.set_min_depth_ns(prefs.jitter_min_ms as u64 * 1_000_000);
     let mut owd = OwdGradient::new(100_000_000);
     let mut ticks = TickUnwrap::new(config.qpc_freq_hz);
 
@@ -239,6 +313,9 @@ fn run_inner(
     let mut input_acc = InputAccumulator::new();
     let mut input_seq: u32 = 1;
     let mut cursor = CursorReassembler::default();
+    // Server→client rumble/pad-output, deduplicated and timed out before it
+    // reaches the pad. The sink is a stub until the GIP bridge lands (Stage B).
+    let mut pad_out = PadOutputRouter::new(BridgePadSink);
 
     while !stop.load(Ordering::Relaxed) {
         match client.recv().map_err(|e| e.to_string())? {
@@ -281,6 +358,21 @@ fn run_inner(
             Some(Inbound::Control(ServerControl::CursorPosition { x, y, visible })) => {
                 callbacks.cursor_position(x as i32, y as i32, visible);
             }
+            Some(Inbound::Audio(pkt)) => {
+                if let Some(player) = audio_player.as_mut()
+                    && let Some((header, payload)) = sunburst_net::parse_audio_packet(&pkt)
+                {
+                    let id = header.frame_id.0 as u32;
+                    instr::record(Stage::AudioRecv, id);
+                    if let Some(pcm) = player.feed(payload, id)
+                        && route_pad
+                    {
+                        headsets.play(pcm);
+                    }
+                }
+            }
+            Some(Inbound::Rumble(r)) => pad_out.on_rumble(r, (mono_ns() / 1_000_000) as u32),
+            Some(Inbound::PadOutput(o)) => pad_out.on_pad_output(o),
             Some(_) => {}
             None => client.tick().map_err(|e| e.to_string())?,
         }
@@ -328,7 +420,45 @@ fn run_inner(
             }
         }
 
+        // Drain any Xbox pads on the GIP bridge into the same input stream, so the
+        // server creates and drives their emulated pads exactly as it does for a
+        // TV-native controller. `GamepadState` carries battery along for free.
+        if let Some(bridge) = crate::usb::current_bridge() {
+            while let Some(ev) = bridge.poll() {
+                let (index, state) = match ev {
+                    PadEvent::Input(state) => (state.pad_index, state),
+                    // A neutral state so the server releases held buttons/sticks.
+                    PadEvent::Disconnected { index } => (
+                        index,
+                        GamepadState {
+                            pad_index: index,
+                            ..Default::default()
+                        },
+                    ),
+                    PadEvent::Connected { index } => {
+                        log::info!("gip: pad {index} connected");
+                        continue;
+                    }
+                };
+                if let Some(event) = input_acc.apply(ClientInput::Pad { index, state })
+                    && client.send_input(&InputPacket { input_seq, event }).is_ok()
+                {
+                    input_seq = input_seq.wrapping_add(1);
+                }
+            }
+        }
+
+        // Drain any headset microphones and send them to the server. The mic
+        // timestamp is the client monotonic clock (the server renders mic audio
+        // immediately and does not use it for sync yet).
+        headsets.capture(|pad, seq, opus| {
+            let _ = client.send_audio_in(pad, seq, mono_ns() as u32, opus);
+        });
+
+        // Stop any motor that has gone unheard past the timeout (a lost final
+        // zero-level packet), on the same 100 ms cadence as feedback.
         if last_feedback.elapsed() >= Duration::from_millis(100) {
+            pad_out.tick((mono_ns() / 1_000_000) as u32);
             last_feedback = Instant::now();
             let _ = client.send_feedback(&Feedback {
                 recv_timestamp: mono_ns() as u32,

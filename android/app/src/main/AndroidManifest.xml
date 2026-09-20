@@ -10,6 +10,11 @@
     <uses-feature
         android:name="android.hardware.touchscreen"
         android:required="false" />
+    <!-- USB host mode for Xbox pads / the Wireless Adapter. Not required: the app
+         streams fine without a pad plugged in. -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
 
     <uses-permission android:name="android.permission.INTERNET" />
 
@@ -37,6 +42,30 @@
             android:name=".PairActivity"
             android:exported="false"
             android:label="Sunburst pairing" />
+
+        <!-- Settings screen, opened from the stream activity with the Menu key. -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Sunburst settings" />
+
+        <!-- Invisible: only carries the USB_DEVICE_ATTACHED filter so Android
+             offers "use by default for this USB device". It claims nothing and
+             finishes immediately; UsbBridge does the actual claiming. -->
+        <activity
+            android:name=".UsbAttachTrampoline"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
 
         <!-- Phase 0 decoder probe, kept for adb-driven enumeration; no longer the
              launcher. Start with: adb shell am start -n com.trexx.sunburst/.probe.DecoderProbeActivity -->

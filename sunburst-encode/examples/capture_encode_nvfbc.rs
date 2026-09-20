@@ -16,6 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use sunburst_capture::tocuda::NvFbcCapture;
     use sunburst_capture::{Capture, Frame};
+    use sunburst_encode::convert::ConvertOutput;
     use sunburst_encode::cuda_convert::CudaConverter;
     use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
     use sunburst_encode::nvenc::Nvenc;
@@ -49,7 +50,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ARGB10 → P010, in NvFBC's context.
         let conv = match &mut converter {
             Some(c) => c,
-            None => converter.insert(CudaConverter::new(context, w, h)?),
+            None => converter.insert(CudaConverter::new(
+                context,
+                w,
+                h,
+                ConvertOutput::P010,
+                false,
+            )?),
         };
         let p010 = conv.convert(cf.device_ptr, cf.pitch as u32)?;
 

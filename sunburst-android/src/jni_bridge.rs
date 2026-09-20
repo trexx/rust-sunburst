@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
-use crate::client::Callbacks;
+use crate::client::{Callbacks, StreamPrefs};
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
 use ndk::native_window::NativeWindow;
+use sunburst_core::proto::StreamCodec;
 
 use crate::client;
 use crate::input_map::ClientInput;
@@ -70,6 +71,12 @@ fn parse_secret(hex: &str) -> Option<[u8; 32]> {
 /// Start the client against `host:port` with `secretHex` (the paired secret) and
 /// the codecs the device can decode, rendering into `surface`. Returns an opaque
 /// handle, or 0 on failure — passed back exactly once to `nativeStop`.
+///
+/// `prefer_codec` is a `StreamCodec` discriminant (0 HEVC, 1 AV1, 2 H.264) or
+/// `-1` for "let the server choose"; `max_bitrate_kbps` is a client-side ceiling
+/// (`0` = none); `jitter_min_ms` is the jitter-buffer floor. All three come from
+/// the TV settings screen.
+#[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
     mut env: JNIEnv,
@@ -79,6 +86,11 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
     port: jint,
     secret_hex: JString,
     codecs: jint,
+    prefer_codec: jint,
+    max_bitrate_kbps: jint,
+    jitter_min_ms: jint,
+    audio_route: jint,
+    pad_volume: jint,
 ) -> jlong {
     init_logging();
 
@@ -130,6 +142,15 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let codecs = codecs as u8;
+    let prefs = StreamPrefs {
+        prefer_codec: u8::try_from(prefer_codec)
+            .ok()
+            .and_then(StreamCodec::from_u8),
+        max_bitrate_kbps: max_bitrate_kbps.max(0) as u32,
+        jitter_min_ms: jitter_min_ms.max(0) as u32,
+        audio_route: audio_route.clamp(0, 2) as u8,
+        pad_volume: pad_volume.clamp(0, 100) as u8,
+    };
     let (input_tx, input_rx) = mpsc::channel();
     let client_tid = Arc::new(AtomicI32::new(0));
     let thread_tid = Arc::clone(&client_tid);
@@ -140,6 +161,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
                 server,
                 secret,
                 codecs,
+                prefs,
                 window,
                 thread_stop,
                 input_rx,

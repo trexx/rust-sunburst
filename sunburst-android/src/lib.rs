@@ -15,6 +15,8 @@
 //! compiles and unit-tests. The device work is exercised on the two TVs.
 
 #[cfg(target_os = "android")]
+mod audio;
+#[cfg(target_os = "android")]
 mod client;
 #[cfg(target_os = "android")]
 mod decode;
@@ -24,11 +26,17 @@ mod input;
 mod jni_bridge;
 #[cfg(target_os = "android")]
 mod pair;
+#[cfg(target_os = "android")]
+pub mod usb;
 
 // Pure, host-testable logic (no platform); public so the host build does not
 // see it as dead when its only caller is Android-gated.
+pub mod audio_ring;
 pub mod hdr_static_info;
+pub mod headset;
 pub mod input_map;
+pub mod mic;
+pub mod pad;
 pub mod pin;
 
 #[cfg(target_os = "android")]

@@ -53,14 +53,19 @@ pub struct DdaCapture {
 }
 
 impl DdaCapture {
-    /// Build a duplication of the primary monitor.
-    pub fn new() -> Result<DdaCapture, CaptureError> {
+    /// Build a duplication of the selected monitor (`Primary` = output 0, the
+    /// historical default; `Index(n)` = the n-th output, for a virtual display).
+    pub fn new(output: crate::OutputSelect) -> Result<DdaCapture, CaptureError> {
+        let output_index = match output {
+            crate::OutputSelect::Primary => 0,
+            crate::OutputSelect::Index(n) => n,
+        };
         // SAFETY: standard DXGI/D3D11 entry points; every returned interface is
         // refcounted and released by `windows`.
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
             let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).map_err(backend)?;
-            let output = adapter.EnumOutputs(0).map_err(backend)?;
+            let output = adapter.EnumOutputs(output_index).map_err(backend)?;
 
             // Dimensions + HDR (and its mastering metadata) from the modern
             // output desc where available.

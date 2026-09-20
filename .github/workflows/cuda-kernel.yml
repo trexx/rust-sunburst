@@ -20,7 +20,7 @@ on:
 
 jobs:
   ptx:
-    name: nvcc -ptx argb10_to_p010.cu
+    name: nvcc -ptx (P010 + NV12 kernels)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -35,16 +35,22 @@ jobs:
         run: |
           set -euo pipefail
           cd sunburst-encode/cuda
+          # The HEVC/AV1 P010 kernel and the H.264 SDR NV12 kernel (two entry
+          # points, SDR + tonemap). Both are vendored over their checked-in no-op
+          # placeholders.
           nvcc -ptx -arch=${{ github.event.inputs.arch }} \
             argb10_to_p010.cu -o argb10_to_p010.ptx
+          nvcc -ptx -arch=${{ github.event.inputs.arch }} \
+            argb_to_nv12.cu -o argb_to_nv12.ptx
           echo "== head of generated PTX =="
           head -12 argb10_to_p010.ptx
-          sha256sum argb10_to_p010.ptx | tee SHA256SUMS.txt
+          sha256sum argb10_to_p010.ptx argb_to_nv12.ptx | tee SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: argb10_to_p010-ptx-${{ github.event.inputs.arch }}
+          name: cuda-ptx-${{ github.event.inputs.arch }}
           path: |
             sunburst-encode/cuda/argb10_to_p010.ptx
+            sunburst-encode/cuda/argb_to_nv12.ptx
             sunburst-encode/cuda/SHA256SUMS.txt
           if-no-files-found: error

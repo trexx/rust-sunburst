@@ -8,14 +8,17 @@
 //! `cargo xwin check --target x86_64-pc-windows-msvc` checks the real thing.
 //! Neither command lies about the other.
 
+pub mod audio_pipeline;
 pub mod cursor;
+pub mod mic_pipeline;
+pub mod display;
 pub mod pipeline;
 pub mod realtime;
 pub mod session;
 pub mod win_host;
 
 pub use pipeline::{CodecHeaders, Pipeline, PipelineParams};
-pub use session::{SessionManager, Sessions, StreamSettings};
+pub use session::{SessionManager, Sessions};
 pub use win_host::WindowsHost;
 
 use std::net::{SocketAddr, UdpSocket};
@@ -24,11 +27,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use sunburst_core::instr;
-use sunburst_core::proto::StreamCodec;
 use sunburst_input::Injector;
 use sunburst_net::Endpoint;
 use sunburst_web::api::AppState;
-use sunburst_web::config::CodecPreference;
 use sunburst_web::{Store, WebHandler, http};
 
 /// Load state, bind, and serve until the process ends.
@@ -66,8 +67,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // of the very same socket while the endpoint owns it for receive.
     let socket = UdpSocket::bind(stream_addr)?;
     let stream_socket = socket.try_clone()?;
-    let settings = stream_settings(&state);
-    let session_mgr = SessionManager::new(stream_socket, sessions, settings);
+    let session_mgr = SessionManager::new(stream_socket, sessions);
 
     let handler = WebHandler::new(Arc::clone(&state), injector, session_mgr);
     let mut endpoint = Endpoint::from_socket(socket, handler)?;
@@ -91,22 +91,4 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     http::serve(listener, state).await;
     Ok(())
-}
-
-/// The stream defaults from the stored config, mapped to what the session
-/// manager wants: the codec preference as an `Option`, and the target bitrate.
-/// HDR is on (the primary workload is 4K60 HDR10); the NvFBC backend is opt-in.
-fn stream_settings(state: &AppState) -> StreamSettings {
-    let cfg = state.stream_config();
-    let codec = match cfg.codec {
-        CodecPreference::Auto => None,
-        CodecPreference::Hevc => Some(StreamCodec::Hevc),
-        CodecPreference::Av1 => Some(StreamCodec::Av1),
-    };
-    StreamSettings {
-        codec,
-        bitrate_kbps: cfg.bitrate_kbps,
-        hdr: true,
-        nvfbc: std::env::var_os("SUNBURST_NVFBC").is_some(),
-    }
 }

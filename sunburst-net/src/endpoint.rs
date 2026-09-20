@@ -225,10 +225,28 @@ impl<H: ControlHandler> Endpoint<H> {
             PacketType::Input => self.on_input(datagram, body, from),
             PacketType::Nack => self.on_nack(datagram, header.frame_id, body, from),
             PacketType::Feedback => self.on_feedback(datagram, body, from),
+            PacketType::AudioIn => self.on_audio_in(datagram, from),
             // Video and audio flow the other way; rumble and pad output are
             // server-originated. Nothing else is expected inbound.
             _ => {}
         }
+    }
+
+    /// A pad's headset-mic Opus frame. Audio is unauthenticated (LAN, like the
+    /// outbound audio and video), so there is no MAC to verify; the sender is
+    /// attributed by source address to a client the endpoint already knows, and
+    /// dropped if the address is unrecognised — so a stray host cannot inject
+    /// microphone audio into a session it never joined.
+    fn on_audio_in(&mut self, datagram: &[u8], from: SocketAddr) {
+        let Some((pad_index, header, payload)) = crate::audio::parse_audio_in_packet(datagram)
+        else {
+            return;
+        };
+        let Some(&client) = self.by_addr.get(&from) else {
+            return;
+        };
+        self.handler
+            .on_audio_in(client, pad_index, header.frame_id, payload);
     }
 
     /// Identify the sender on `channel`, scanning the paired keys if the address
@@ -743,7 +761,17 @@ pub enum Inbound {
     Control(ServerControl),
     /// A raw video packet (header included), for the reassembler to decode.
     Video(Vec<u8>),
-    /// A rumble or pad-output packet, or anything the stub receiver ignores.
+    /// A raw audio packet (header included), for [`parse_audio_packet`](crate::parse_audio_packet)
+    /// and the Opus decoder. Unauthenticated, like video.
+    Audio(Vec<u8>),
+    /// A decoded, authenticated rumble frame — motor levels (incl. the Xbox
+    /// trigger motors) for a pad the client drives.
+    Rumble(Rumble),
+    /// A decoded, authenticated rich pad-output frame — motors, adaptive
+    /// triggers, and LED for a pad the client drives.
+    PadOutput(PadOutput),
+    /// Anything the receiver ignores (an unknown type, or a frame that failed to
+    /// authenticate or decode).
     Other,
 }
 
@@ -835,6 +863,25 @@ impl ClientEndpoint {
             .encode(&mut body)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input body too large"))?;
         self.transmit_data(PacketType::Input, Seq16(0), &body[..n])
+    }
+
+    /// Send one pad-mic Opus frame (`AudioIn`, tagged with `pad_index`). Like
+    /// the video/audio the server sends this way, it is **unauthenticated** —
+    /// media rides the LAN without a MAC — so it carries no key; the server
+    /// attributes it by source address, which is why it goes out this socket.
+    /// `qpc` is the frame's capture-time tick counter, low 32 bits.
+    pub fn send_audio_in(
+        &self,
+        pad_index: u8,
+        seq: Seq16,
+        qpc: u32,
+        opus: &[u8],
+    ) -> io::Result<()> {
+        let mut buf = [0u8; crate::audio::MAX_AUDIO_PACKET];
+        let n = crate::audio::encode_audio_in_packet(pad_index, seq, qpc, opus, &mut buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audio-in body too large"))?;
+        self.socket.send_to(&buf[..n], self.server)?;
+        Ok(())
     }
 
     /// Send a control packet, signed with the control key.
@@ -956,6 +1003,9 @@ impl ClientEndpoint {
 
         match header.packet_type {
             PacketType::Video => Ok(Some(Inbound::Video(datagram.to_vec()))),
+            // Audio is unauthenticated, like video: hand the raw datagram up for
+            // the Opus decoder with no MAC to verify.
+            PacketType::Audio => Ok(Some(Inbound::Audio(datagram.to_vec()))),
             PacketType::Control => {
                 let mut body = &datagram[HEADER_LEN..];
                 if let Some(key) = &self.key {
@@ -976,6 +1026,25 @@ impl ClientEndpoint {
                     }
                 }
                 Ok(self.pending_control.pop_front().map(Inbound::Control))
+            }
+            // Rumble and pad output are authenticated (they drive hardware), so
+            // verify the MAC before decoding — an unauthenticated one is dropped
+            // as `Other`, never applied to a controller.
+            PacketType::Rumble | PacketType::PadOutput => {
+                // Signed with the data key (the session key once derived, like
+                // the server's `session.data_key()`), not the control key.
+                let Some(key) = self.data_key() else {
+                    return Ok(Some(Inbound::Other));
+                };
+                let Some(verified) = key.verify_packet(datagram) else {
+                    return Ok(Some(Inbound::Other));
+                };
+                let body = &verified[HEADER_LEN..];
+                let inbound = match header.packet_type {
+                    PacketType::Rumble => Rumble::decode(body).map(Inbound::Rumble),
+                    _ => PadOutput::decode(body).map(Inbound::PadOutput),
+                };
+                Ok(Some(inbound.unwrap_or(Inbound::Other)))
             }
             _ => Ok(Some(Inbound::Other)),
         }

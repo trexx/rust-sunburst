@@ -33,18 +33,18 @@ use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use sunburst_capture::cuda::{CuContext, CuDevicePtr};
-use sunburst_capture::{CaptureError, Frame, select};
+use sunburst_capture::{CaptureError, Frame, OutputSelect, select};
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{Header, Nack, Seq16};
-use sunburst_encode::convert::Converter;
+use sunburst_encode::convert::{ConvertOutput, Converter};
 use sunburst_encode::cuda_convert::CudaConverter;
 use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
 use sunburst_encode::nvenc::Nvenc;
 use sunburst_net::send::Sender;
 use sunburst_net::send::windows::WsaSender;
 use sunburst_net::{
-    Av1RefState, Batch, Consumer, HevcRefState, Pacer, Packetizer, Producer, Recovery, RefState,
-    RetransmitCache, packet_ring,
+    Av1RefState, Batch, Consumer, H264RefState, HevcRefState, Pacer, Packetizer, Producer,
+    Recovery, RefState, RetransmitCache, packet_ring,
 };
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::core::Interface;
@@ -74,6 +74,16 @@ pub struct PipelineParams {
     pub ref_invalidation: bool,
     /// Use the NvFBC CUDA-native backend (opt-in resilience), else DDA/WGC.
     pub nvfbc: bool,
+    /// Force a specific D3D11 backend (WGC/DDA); `None` = the OS default.
+    pub force_backend: Option<sunburst_capture::Backend>,
+    /// Which monitor to capture — the primary, or a virtual display's output.
+    pub output: OutputSelect,
+    /// NVENC preset P1–P4 (1..=4), within the ULL tuning.
+    pub preset: u8,
+    /// Variable-bitrate rate control (else CBR).
+    pub vbr: bool,
+    /// Forced IDR period in frames; `0` = infinite GOP.
+    pub idr_period: u32,
 }
 
 /// The lock-free signals the control thread raises for the frame path. Read and
@@ -259,12 +269,19 @@ fn gpu_loop(
     let _rt = RealtimeThread::register();
     instr::register_thread("gpu");
 
-    let mut capture = select::build(params.nvfbc, params.hdr).map_err(|e| e.to_string())?;
+    let mut capture = select::build(
+        params.nvfbc,
+        params.force_backend,
+        params.hdr,
+        params.output,
+    )
+    .map_err(|e| e.to_string())?;
     let nvenc = Nvenc::load()?;
     let mut spine: Option<Spine> = None;
     let mut packetizer = Packetizer::new();
     let mut refs: Box<dyn RefState> = match params.codec {
         Codec::Hevc => Box::new(HevcRefState::new(params.dpb_depth as u16)),
+        Codec::H264 => Box::new(H264RefState::new(params.dpb_depth as u16)),
         Codec::Av1 => Box::new(Av1RefState::new()),
     };
     let mut frame_id = Seq16(0);
@@ -283,7 +300,13 @@ fn gpu_loop(
             Ok(Some(f)) => f,
             Ok(None) => continue,
             Err(CaptureError::AccessLost) => {
-                capture = select::build(params.nvfbc, params.hdr).map_err(|e| e.to_string())?;
+                capture = select::build(
+                    params.nvfbc,
+                    params.force_backend,
+                    params.hdr,
+                    params.output,
+                )
+                .map_err(|e| e.to_string())?;
                 spine = None;
                 need_keyframe = true;
                 continue;
@@ -317,7 +340,9 @@ fn gpu_loop(
         if first_build {
             let enc = spine.as_mut().expect("just built").encoder();
             let sequence = match params.codec {
-                Codec::Hevc => enc.sequence_header()?,
+                // HEVC and H.264 send their Annex-B parameter sets (VPS/SPS/PPS,
+                // or SPS/PPS); AV1 sends the av1C record.
+                Codec::Hevc | Codec::H264 => enc.sequence_header()?,
                 Codec::Av1 => enc.av1c()?,
             };
             let _ = headers.send(CodecHeaders {
@@ -400,7 +425,20 @@ fn build_and_convert<'a>(
     ecfg.slices = params.slices;
     ecfg.dpb_depth = params.dpb_depth;
     ecfg.intra_refresh = params.intra_refresh;
-    ecfg.hdr = capture.caps().hdr_metadata;
+    ecfg.preset = params.preset;
+    ecfg.vbr = params.vbr;
+    ecfg.idr_period = params.idr_period;
+    // H.264 is 8-bit SDR: no HDR mastering, and an NV12 (tonemapped) convert.
+    let hdr_source = capture.caps().hdr_metadata.is_some();
+    let (output, sdr) = match params.codec {
+        Codec::H264 => (ConvertOutput::Nv12, true),
+        Codec::Hevc | Codec::Av1 => (ConvertOutput::P010, false),
+    };
+    ecfg.hdr = if sdr {
+        None
+    } else {
+        capture.caps().hdr_metadata
+    };
 
     match frame {
         Frame::Texture(tf) => {
@@ -412,15 +450,15 @@ fn build_and_convert<'a>(
                     unsafe { tf.texture.GetDevice() }.map_err(|e| e.to_string())?;
                 ecfg.width = w;
                 ecfg.height = h;
-                let converter = Converter::new(&tf.texture)?;
+                let converter = Converter::new(&tf.texture, output, hdr_source)?;
                 let encoder = Encoder::new(nvenc, device.as_raw(), &ecfg)?;
                 *spine = Some(Spine::D3d11 { converter, encoder });
             }
             let Some(Spine::D3d11 { converter, .. }) = spine.as_mut() else {
                 return Err("spine is not D3D11".into());
             };
-            let p010 = converter.convert(&tf.texture, w, h)?;
-            Ok((p010.as_raw(), first))
+            let surface = converter.convert(&tf.texture, w, h)?;
+            Ok((surface.as_raw(), first))
         }
         Frame::Cuda(cf) => {
             let (w, h) = (cf.meta.width, cf.meta.height);
@@ -432,7 +470,7 @@ fn build_and_convert<'a>(
             if first {
                 ecfg.width = w;
                 ecfg.height = h;
-                let converter = CudaConverter::new(ctx, w, h)?;
+                let converter = CudaConverter::new(ctx, w, h, output, hdr_source)?;
                 let pitch = converter.pitch();
                 let encoder = Encoder::new_cuda(nvenc, ctx, &ecfg, pitch)?;
                 *spine = Some(Spine::Cuda { converter, encoder });
@@ -440,8 +478,8 @@ fn build_and_convert<'a>(
             let Some(Spine::Cuda { converter, .. }) = spine.as_mut() else {
                 return Err("spine is not CUDA".into());
             };
-            let p010: CuDevicePtr = converter.convert(cf.device_ptr, cf.pitch as u32)?;
-            Ok((p010 as *mut c_void, first))
+            let surface: CuDevicePtr = converter.convert(cf.device_ptr, cf.pitch as u32)?;
+            Ok((surface as *mut c_void, first))
         }
     }
 }

@@ -32,7 +32,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, IDXGIDevice,
+    CreateDXGIFactory1, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, IDXGIAdapter1,
+    IDXGIDevice, IDXGIFactory1,
 };
 use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
@@ -61,8 +62,9 @@ pub struct WgcCapture {
 }
 
 impl WgcCapture {
-    /// Build a capture session on the primary monitor.
-    pub fn new() -> Result<WgcCapture, CaptureError> {
+    /// Build a capture session on the selected monitor (`Primary` = the primary
+    /// monitor; `Index(n)` = the n-th DXGI output, for a virtual display).
+    pub fn new(output: crate::OutputSelect) -> Result<WgcCapture, CaptureError> {
         // SAFETY: standard D3D11 + WinRT interop; every returned interface is
         // refcounted and released by `windows`.
         unsafe {
@@ -86,8 +88,19 @@ impl WgcCapture {
             let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi).map_err(backend)?;
             let d3d: IDirect3DDevice = inspectable.cast().map_err(backend)?;
 
-            // The primary monitor as a capture item, via the Win32 interop factory.
-            let hmon: HMONITOR = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+            // The monitor to capture, as an HMONITOR: the primary, or the n-th
+            // DXGI output's monitor for a selected (e.g. virtual) display.
+            let hmon: HMONITOR = match output {
+                crate::OutputSelect::Primary => {
+                    MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)
+                }
+                crate::OutputSelect::Index(n) => {
+                    let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
+                    let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).map_err(backend)?;
+                    let out = adapter.EnumOutputs(n).map_err(backend)?;
+                    out.GetDesc().map_err(backend)?.Monitor
+                }
+            };
             let interop: IGraphicsCaptureItemInterop =
                 windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                     .map_err(backend)?;

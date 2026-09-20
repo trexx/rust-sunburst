@@ -6,6 +6,9 @@ import android.content.Intent
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaCodecList
 import android.os.Build
 import android.os.Bundle
@@ -34,6 +37,23 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var view: SurfaceView
     private var hintSession: Session? = null
     private lateinit var cursorView: CursorView
+    private var audioFocus: AudioFocusRequest? = null
+    private var perfHintEnabled = true
+
+    /** The subset of prefs the native client is started with; changing any of
+     *  these means reconnecting, since the codec and bitrate are negotiated at
+     *  connect. Held so [restartIfSettingsChanged] can tell when to rebuild. */
+    private data class StreamParams(
+        val host: String,
+        val port: Int,
+        val secret: String,
+        val preferCodec: Int,
+        val maxBitrateKbps: Int,
+        val jitterMinMs: Int,
+        val audioRoute: Int,
+        val padVolume: Int,
+    )
+    private var startedWith: StreamParams? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,11 +70,76 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         frame.addView(cursorView) // drawn above the video
         setContentView(frame)
         view.requestFocus()
+        // Claim any Xbox pad / adapter and keep it for the activity's life, so
+        // opening Settings (a pause) does not drop a paired controller.
+        UsbBridge.start(this)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        UsbBridge.stop(this)
     }
 
     override fun onResume() {
         super.onResume()
+        requestAudioFocus()
+        restartIfSettingsChanged()
         maybeStart()
+    }
+
+    /** Coming back from [SettingsActivity]: apply the presentation prefs that do
+     *  not need a reconnect in place, and drop the client if a negotiated one
+     *  (codec / bitrate / jitter) changed so [maybeStart] rebuilds it. */
+    private fun restartIfSettingsChanged() {
+        if (handle == 0L) return
+        val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
+        cursorView.visibility =
+            if (prefs.getBoolean("show_cursor", true)) View.VISIBLE else View.GONE
+        perfHintEnabled = prefs.getBoolean("perf_hint", true)
+        if (perfHintEnabled) {
+            startPerformanceHint()
+        } else {
+            hintSession?.close()
+            hintSession = null
+        }
+        val started = startedWith ?: return
+        val reconnect = started.preferCodec != prefs.getInt("prefer_codec", -1) ||
+            started.maxBitrateKbps != prefs.getInt("max_bitrate_kbps", 0) ||
+            started.jitterMinMs != prefs.getInt("jitter_min_ms", 2) ||
+            started.audioRoute != prefs.getInt("audio_route", 2) ||
+            started.padVolume != prefs.getInt("pad_volume", 100)
+        if (reconnect) {
+            nativeStop(handle)
+            handle = 0
+            startedWith = null
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        abandonAudioFocus()
+    }
+
+    /** Take audio focus for the stream (usage GAME), so other apps' audio ducks
+     *  while we play. The Rust client owns the AAudio output itself. */
+    private fun requestAudioFocus() {
+        if (audioFocus != null) return
+        val am = getSystemService(AudioManager::class.java) ?: return
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(attrs)
+            .build()
+        am.requestAudioFocus(request)
+        audioFocus = request
+    }
+
+    private fun abandonAudioFocus() {
+        val request = audioFocus ?: return
+        getSystemService(AudioManager::class.java)?.abandonAudioFocusRequest(request)
+        audioFocus = null
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -78,7 +163,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     /** Ask the scheduler to favour the client thread for a ~16.6 ms frame budget.
      *  A real win on the Amlogic's small cores; API 31+. */
     private fun startPerformanceHint() {
-        if (hintSession != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        if (!perfHintEnabled || hintSession != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         val tid = nativeClientTid(handle)
         if (tid == 0) return
         val phm = getSystemService(PerformanceHintManager::class.java) ?: return
@@ -104,9 +189,25 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
             startActivity(Intent(this, PairActivity::class.java))
             return
         }
-        val host = prefs.getString("server_host", "192.168.1.10")!!
-        val port = prefs.getInt("server_port", 47811)
-        handle = nativeStart(s, host, port, secret, supportedCodecs())
+        val params = StreamParams(
+            host = prefs.getString("server_host", "192.168.1.10")!!,
+            port = prefs.getInt("server_port", 47811),
+            secret = secret,
+            preferCodec = prefs.getInt("prefer_codec", -1),
+            maxBitrateKbps = prefs.getInt("max_bitrate_kbps", 0),
+            jitterMinMs = prefs.getInt("jitter_min_ms", 2),
+            audioRoute = prefs.getInt("audio_route", 2),
+            padVolume = prefs.getInt("pad_volume", 100),
+        )
+        perfHintEnabled = prefs.getBoolean("perf_hint", true)
+        cursorView.visibility =
+            if (prefs.getBoolean("show_cursor", true)) View.VISIBLE else View.GONE
+        handle = nativeStart(
+            s, params.host, params.port, params.secret, supportedCodecs(),
+            params.preferCodec, params.maxBitrateKbps, params.jitterMinMs,
+            params.audioRoute, params.padVolume,
+        )
+        startedWith = params
     }
 
     // --- Input -------------------------------------------------------------
@@ -121,6 +222,14 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean = key(keyCode, event, false) || super.onKeyUp(keyCode, event)
 
     private fun key(keyCode: Int, event: KeyEvent, down: Boolean): Boolean {
+        // Menu opens settings and is never forwarded to the server — it is not a
+        // useful game key, and this is the one way in to the settings screen.
+        if (keyCode == KeyEvent.KEYCODE_MENU) {
+            if (down && event.repeatCount == 0) {
+                startActivity(Intent(this, SettingsActivity::class.java))
+            }
+            return true
+        }
         if (handle == 0L || event.repeatCount > 0) return false
         if (isGamepad(event)) {
             nativePadButton(handle, keyCode, down)
@@ -183,6 +292,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
                 when (type.lowercase()) {
                     "video/hevc" -> bits = bits or 0x1
                     "video/av01" -> bits = bits or 0x2
+                    "video/avc" -> bits = bits or 0x4
                 }
             }
         }
@@ -249,7 +359,18 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    private external fun nativeStart(surface: Surface, host: String, port: Int, secretHex: String, codecs: Int): Long
+    private external fun nativeStart(
+        surface: Surface,
+        host: String,
+        port: Int,
+        secretHex: String,
+        codecs: Int,
+        preferCodec: Int,
+        maxBitrateKbps: Int,
+        jitterMinMs: Int,
+        audioRoute: Int,
+        padVolume: Int,
+    ): Long
     private external fun nativeStop(handle: Long)
     private external fun nativeSurfaceChanged(handle: Long, surface: Surface)
     private external fun nativeClientTid(handle: Long): Int

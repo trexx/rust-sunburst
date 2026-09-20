@@ -25,8 +25,8 @@ use sunburst_capture::HdrMetadata;
 
 use crate::hdr::{ContentLightLevel, MasteringDisplayInfo};
 use crate::nvenc::{
-    Guid, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID, Nvenc, NvencStatus, Session,
-    struct_version,
+    Guid, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, Nvenc,
+    NvencStatus, Session, struct_version,
 };
 
 /// The codec an [`Encoder`] targets.
@@ -36,6 +36,9 @@ pub enum Codec {
     Hevc,
     /// AV1 10-bit — the Homatics' codec. Subdivided into tiles.
     Av1,
+    /// H.264 High, 8-bit SDR — an opt-in low-latency codec. NV12 input (not
+    /// P010); slices, like HEVC; no HDR (NVENC H.264 is 8-bit only).
+    H264,
 }
 
 impl Codec {
@@ -43,6 +46,16 @@ impl Codec {
         match self {
             Codec::Hevc => NV_ENC_CODEC_HEVC_GUID,
             Codec::Av1 => NV_ENC_CODEC_AV1_GUID,
+            Codec::H264 => NV_ENC_CODEC_H264_GUID,
+        }
+    }
+
+    /// The NVENC input buffer format this codec's convert stage produces —
+    /// 8-bit NV12 for H.264, 10-bit P010 for HEVC/AV1.
+    fn buffer_format(self) -> u32 {
+        match self {
+            Codec::H264 => NV_ENC_BUFFER_FORMAT_NV12,
+            Codec::Hevc | Codec::Av1 => NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
         }
     }
 }
@@ -61,18 +74,51 @@ const NV_ENC_MAP_INPUT_RESOURCE_VER: u32 = struct_version(4);
 const NV_ENC_CREATE_BITSTREAM_BUFFER_VER: u32 = struct_version(1);
 const NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER: u32 = struct_version(1);
 
-/// `NV_ENC_PRESET_P1_GUID`.
+/// `NV_ENC_PRESET_P1_GUID` .. `P4` (nvEncodeAPI.h). P1 is fastest/lowest-latency;
+/// the ULL *tuning* is fixed regardless — the preset trades quality for encode
+/// time inside it. P5–P7 are not exposed (they cost latency the project spends
+/// nowhere else).
 const NV_ENC_PRESET_P1_GUID: Guid = Guid {
     data1: 0xfc0a_8d3e,
     data2: 0x45f8,
     data3: 0x4cf8,
     data4: [0x80, 0xc7, 0x29, 0x88, 0x71, 0x59, 0x0e, 0xbf],
 };
+const NV_ENC_PRESET_P2_GUID: Guid = Guid {
+    data1: 0xf581_cfb8,
+    data2: 0x88d6,
+    data3: 0x4381,
+    data4: [0x93, 0xf0, 0xdf, 0x13, 0xf9, 0xc2, 0x7d, 0xab],
+};
+const NV_ENC_PRESET_P3_GUID: Guid = Guid {
+    data1: 0x3685_0110,
+    data2: 0x3a07,
+    data3: 0x441f,
+    data4: [0x94, 0xd5, 0x36, 0x70, 0x63, 0x1f, 0x91, 0xf6],
+};
+const NV_ENC_PRESET_P4_GUID: Guid = Guid {
+    data1: 0x90a7_b826,
+    data2: 0xdf06,
+    data3: 0x4862,
+    data4: [0xb9, 0xd2, 0xcd, 0x6d, 0x73, 0xa0, 0x86, 0x81],
+};
+
+/// The preset GUID for `preset` (1..=4, clamped).
+fn preset_guid(preset: u8) -> Guid {
+    match preset.clamp(1, 4) {
+        1 => NV_ENC_PRESET_P1_GUID,
+        2 => NV_ENC_PRESET_P2_GUID,
+        3 => NV_ENC_PRESET_P3_GUID,
+        _ => NV_ENC_PRESET_P4_GUID,
+    }
+}
 
 /// `NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY`.
 const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
 /// `NV_ENC_BUFFER_FORMAT_YUV420_10BIT` — P010, NVENC's 10-bit semi-planar input.
 const NV_ENC_BUFFER_FORMAT_YUV420_10BIT: u32 = 0x0001_0000;
+/// `NV_ENC_BUFFER_FORMAT_NV12` — 8-bit semi-planar input, for the H.264 SDR path.
+const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x0000_0001;
 /// `NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX`.
 const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0;
 /// `NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR`.
@@ -88,6 +134,8 @@ const NV_ENC_PIC_FLAG_FORCEIDR: u32 = 0x2;
 const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x4;
 /// `NV_ENC_PARAMS_RC_CBR` — constant bitrate, the low-latency choice.
 const NV_ENC_PARAMS_RC_CBR: u32 = 0x2;
+/// `NV_ENC_PARAMS_RC_VBR` — variable bitrate.
+const NV_ENC_PARAMS_RC_VBR: u32 = 0x1;
 /// `NVENC_INFINITE_GOPLENGTH` — never emit a periodic IDR; recovery is by
 /// reference invalidation and intra refresh instead (CLAUDE.md).
 const NVENC_INFINITE_GOPLENGTH: u32 = 0xffff_ffff;
@@ -126,6 +174,14 @@ pub struct EncoderConfig {
     /// fall back to an older good frame instead of forcing a keyframe
     /// (`NvEncInvalidateRefFrames` docs recommend it).
     pub dpb_depth: u32,
+    /// NVENC preset P1–P4 (1..=4, clamped). Stays within the ULL tuning; not a
+    /// UHQ escape.
+    pub preset: u8,
+    /// Variable-bitrate rate control (else constant bitrate).
+    pub vbr: bool,
+    /// Forced IDR period in frames; `0` = infinite GOP (recovery via
+    /// intra-refresh / reference invalidation).
+    pub idr_period: u32,
 }
 
 impl EncoderConfig {
@@ -133,7 +189,7 @@ impl EncoderConfig {
     /// counts, an 8-frame DPB, no intra refresh, SDR.
     pub fn new(codec: Codec, width: u32, height: u32) -> EncoderConfig {
         let slices = match codec {
-            Codec::Hevc => 4,
+            Codec::Hevc | Codec::H264 => 4,
             Codec::Av1 => 2,
         };
         EncoderConfig {
@@ -146,6 +202,9 @@ impl EncoderConfig {
             hdr: None,
             intra_refresh: None,
             dpb_depth: 8,
+            preset: 1,
+            vbr: false,
+            idr_period: 0,
         }
     }
 }
@@ -264,6 +323,36 @@ struct Av1ConfigHead {
     num_tile_columns: u32,
     num_tile_rows: u32,
 }
+
+/// The head of `NV_ENC_CONFIG_H264`, up to `sliceMode`/`sliceModeData`. Overlaid
+/// on the codec-config union (which is a `NV_ENC_CONFIG_H264` for an H.264
+/// encoder) to set slicing and intra-refresh, without transcribing all ~90
+/// fields. `enableIntraRefresh` is bit 10 of the first flag word (counting from
+/// `enableTemporalSVC`). The five enum fields between `idrPeriod` and
+/// `intraRefreshPeriod` (adaptive-transform, FMO, B-direct, entropy-coding,
+/// stereo) are left at the driver default (0).
+#[repr(C)]
+struct H264ConfigHead {
+    /// `enableTemporalSVC:1 … enableIntraRefresh:1 (bit 10) … reserved`.
+    flags: u32,
+    level: u32,
+    idr_period: u32,
+    /// `separateColourPlaneFlag:1, disableDeblockingFilterIDC:2, numTemporalLayers:4, spsId:8, ppsId:8, …`.
+    bitfields2: u32,
+    adaptive_transform_mode: u32,
+    fmo_mode: u32,
+    bdirect_mode: u32,
+    entropy_coding_mode: u32,
+    stereo_mode: u32,
+    intra_refresh_period: u32,
+    intra_refresh_cnt: u32,
+    max_num_ref_frames: u32,
+    slice_mode: u32,
+    slice_mode_data: u32,
+}
+
+/// `NV_ENC_CONFIG_H264`'s `enableIntraRefresh` — bit 10 of the first flag word.
+const H264_ENABLE_INTRA_REFRESH: u32 = 1 << 10;
 
 /// The head of `NV_ENC_PIC_PARAMS_HEVC`, up to the HDR metadata pointers. Overlaid
 /// on the pic-params codec union to point the per-frame `pMaxCll` /
@@ -703,6 +792,9 @@ impl<'a> Encoder<'a> {
                     head.p_max_cll = p_max_cll;
                     head.p_mastering_display = p_mastering;
                 }
+                // H.264 is SDR: `mastering`/`max_cll` are never set, so this is
+                // unreachable, but the match must be exhaustive.
+                Codec::H264 => {}
             }
         }
     }
@@ -780,7 +872,7 @@ impl<'a> Encoder<'a> {
         pic.input_height = self.cfg.height;
         pic.input_buffer = m.mapped_resource;
         pic.output_bitstream = self.bitstream;
-        pic.buffer_fmt = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+        pic.buffer_fmt = self.cfg.codec.buffer_format();
         pic.picture_struct = NV_ENC_PIC_STRUCT_FRAME;
         // The tag reference invalidation keys on, and the IDR request.
         pic.input_time_stamp = req.timestamp;
@@ -827,9 +919,9 @@ impl<'a> Encoder<'a> {
         reg.width = self.cfg.width;
         reg.height = self.cfg.height;
         reg.resource_to_register = input;
-        reg.buffer_format = NV_ENC_BUFFER_FORMAT_YUV420_10BIT;
+        reg.buffer_format = self.cfg.codec.buffer_format();
         reg.buffer_usage = NV_ENC_INPUT_IMAGE;
-        // SAFETY: live encoder; `input` is a live P010 surface of this size.
+        // SAFETY: live encoder; `input` is a live P010/NV12 surface of this size.
         let status = unsafe { register(self.session.encoder, &mut reg) };
         check(status, "nvEncRegisterResource")?;
         self.registered = Some((input, reg.registered_resource));
@@ -936,7 +1028,7 @@ fn preset_config(
         get_preset(
             encoder,
             cfg.codec.guid(),
-            NV_ENC_PRESET_P1_GUID,
+            preset_guid(cfg.preset),
             NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             &mut preset,
         )
@@ -944,16 +1036,25 @@ fn preset_config(
     check(status, "nvEncGetEncodePresetConfigEx")?;
     preset.preset_cfg.version = NV_ENC_CONFIG_VER;
 
-    // Constant bitrate, one-frame VBV, infinite GOP, one P per frame.
+    // Rate control (CBR default, VBR when asked), one-frame VBV, one P per frame,
+    // and the GOP — infinite unless a forced IDR period is configured.
     let bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
     let fps = cfg.fps.max(1);
     let rc = &mut preset.preset_cfg.rc_params;
-    rc.rate_control_mode = NV_ENC_PARAMS_RC_CBR;
+    rc.rate_control_mode = if cfg.vbr {
+        NV_ENC_PARAMS_RC_VBR
+    } else {
+        NV_ENC_PARAMS_RC_CBR
+    };
     rc.average_bit_rate = bitrate_bps;
     rc.max_bit_rate = bitrate_bps;
     rc.vbv_buffer_size = bitrate_bps / fps;
     rc.vbv_initial_delay = bitrate_bps / fps;
-    preset.preset_cfg.gop_length = NVENC_INFINITE_GOPLENGTH;
+    preset.preset_cfg.gop_length = if cfg.idr_period > 0 {
+        cfg.idr_period
+    } else {
+        NVENC_INFINITE_GOPLENGTH
+    };
     preset.preset_cfg.frame_interval_p = 1;
 
     let head = std::ptr::addr_of_mut!(preset.preset_cfg.encode_codec_config);
@@ -995,6 +1096,21 @@ fn preset_config(
                 av1.bitfields |= (1 << 14) | (1 << 15);
             }
         }
+        Codec::H264 => {
+            // SAFETY: the union is NV_ENC_CONFIG_H264 for an H.264 encoder.
+            let h264 = unsafe { &mut *(head as *mut H264ConfigHead) };
+            h264.max_num_ref_frames = cfg.dpb_depth;
+            if cfg.slices > 1 {
+                h264.slice_mode = 3; // a fixed number of uniform slices
+                h264.slice_mode_data = cfg.slices;
+            }
+            if let Some((period, count)) = cfg.intra_refresh {
+                h264.flags |= H264_ENABLE_INTRA_REFRESH;
+                h264.intra_refresh_period = period;
+                h264.intra_refresh_cnt = count;
+            }
+            // No HDR arm: NVENC H.264 is 8-bit SDR (cfg.hdr is None here).
+        }
     }
     Ok(preset)
 }
@@ -1006,7 +1122,7 @@ fn init_params(cfg: &EncoderConfig, encode_config: *mut NvEncConfig) -> NvEncIni
     let mut init: NvEncInitializeParams = unsafe { std::mem::zeroed() };
     init.version = NV_ENC_INITIALIZE_PARAMS_VER;
     init.encode_guid = cfg.codec.guid();
-    init.preset_guid = NV_ENC_PRESET_P1_GUID;
+    init.preset_guid = preset_guid(cfg.preset);
     init.encode_width = cfg.width;
     init.encode_height = cfg.height;
     init.dar_width = cfg.width;

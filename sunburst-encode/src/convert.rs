@@ -17,6 +17,7 @@
 //! on D3D11 plane-view support that varies by driver — it is verified on the 4070,
 //! not here (this host has no GPU).
 
+use windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS,
@@ -26,7 +27,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_P010, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
+    DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
+    DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
 };
 use windows::core::{PCSTR, s};
 
@@ -90,7 +92,94 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 "#;
 
-/// A P010 output texture and its two plane UAVs, sized to a resolution.
+/// The scRGB FP16 → NV12 (BT.709 SDR) compute shader — the H.264 path. Same 2×2
+/// structure as the P010 shader, but 8-bit and Rec.709. With `TONEMAP` defined
+/// (an HDR-range source) it rolls HDR off to SDR with an ACES curve; otherwise it
+/// clamps an already-SDR source.
+const SDR_SHADER_HLSL: &[u8] = br#"
+Texture2D<float4>   src   : register(t0);   // scRGB linear FP16 (1.0 == 80 nits)
+RWTexture2D<float>  dstY  : register(u0);   // NV12 luma plane (R8)
+RWTexture2D<float2> dstUV : register(u1);   // NV12 chroma plane (R8G8, half res)
+
+// ACES filmic (Narkowicz): roll HDR-range linear light off into [0, 1].
+float3 aces(float3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// Rec.709 opto-electronic transfer (gamma), the SDR video convention.
+float bt709_oetf(float c) {
+    c = saturate(c);
+    return c < 0.018 ? 4.5 * c : 1.099 * pow(c, 0.45) - 0.099;
+}
+
+float3 to_display(float3 rgb) {
+    float3 lin = max(rgb, 0.0);   // scRGB linear, 1.0 == 80 nits (SDR white)
+#ifdef TONEMAP
+    lin = aces(lin);              // HDR source: compress to SDR range
+#else
+    lin = saturate(lin);          // SDR source: clamp
+#endif
+    return float3(bt709_oetf(lin.r), bt709_oetf(lin.g), bt709_oetf(lin.b));
+}
+
+// Rec.709 non-constant luminance, limited (studio) range, 8-bit codes.
+float3 rgb_to_ycbcr(float3 c) {   // c is gamma-encoded [0, 1]
+    float y  = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    float cb = (c.b - y) / 1.8556;
+    float cr = (c.r - y) / 1.5748;
+    return float3(16.0 + y * 219.0, 128.0 + cb * 224.0, 128.0 + cr * 224.0);
+}
+
+// An 8-bit code into an R8_UNORM texel.
+float nv8(float code8) { return saturate(code8 / 255.0); }
+
+float3 sample_ycc(uint2 p) { return rgb_to_ycbcr(to_display(src[p].rgb)); }
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint2 p = tid.xy * 2;
+    float3 a = sample_ycc(p + uint2(0, 0));
+    float3 b = sample_ycc(p + uint2(1, 0));
+    float3 c = sample_ycc(p + uint2(0, 1));
+    float3 d = sample_ycc(p + uint2(1, 1));
+    dstY[p + uint2(0, 0)] = nv8(a.x);
+    dstY[p + uint2(1, 0)] = nv8(b.x);
+    dstY[p + uint2(0, 1)] = nv8(c.x);
+    dstY[p + uint2(1, 1)] = nv8(d.x);
+    float cb = (a.y + b.y + c.y + d.y) * 0.25;
+    float cr = (a.z + b.z + c.z + d.z) * 0.25;
+    dstUV[tid.xy] = float2(nv8(cb), nv8(cr));
+}
+"#;
+
+/// The output pixel format the converter produces: 10-bit P010 (BT.2020 PQ, for
+/// HEVC/AV1) or 8-bit NV12 (BT.709 SDR, for H.264).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConvertOutput {
+    P010,
+    Nv12,
+}
+
+impl ConvertOutput {
+    /// The output texture format and its (luma, chroma) plane view formats.
+    fn formats(self) -> (DXGI_FORMAT, DXGI_FORMAT, DXGI_FORMAT) {
+        match self {
+            ConvertOutput::P010 => (
+                DXGI_FORMAT_P010,
+                DXGI_FORMAT_R16_UNORM,
+                DXGI_FORMAT_R16G16_UNORM,
+            ),
+            ConvertOutput::Nv12 => (
+                DXGI_FORMAT_NV12,
+                DXGI_FORMAT_R8_UNORM,
+                DXGI_FORMAT_R8G8_UNORM,
+            ),
+        }
+    }
+}
+
+/// A P010/NV12 output texture and its two plane UAVs, sized to a resolution.
 struct Target {
     width: u32,
     height: u32,
@@ -104,13 +193,21 @@ pub struct Converter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     shader: ID3D11ComputeShader,
+    output: ConvertOutput,
     target: Option<Target>,
 }
 
 impl Converter {
-    /// Build a converter on the device that owns `like` (an input texture). The
-    /// converted P010 texture lives on the same device, as NVENC requires.
-    pub fn new(like: &ID3D11Texture2D) -> Result<Converter, String> {
+    /// Build a converter on the device that owns `like` (an input texture),
+    /// producing `output` (P010 for HEVC/AV1, NV12 for H.264). `hdr_source` says
+    /// whether the capture is HDR-range, which the NV12 (SDR) path tonemaps; it
+    /// is ignored by the P010 path. The output texture lives on the same device,
+    /// as NVENC requires.
+    pub fn new(
+        like: &ID3D11Texture2D,
+        output: ConvertOutput,
+        hdr_source: bool,
+    ) -> Result<Converter, String> {
         // SAFETY: `like` is a live texture; GetDevice/GetImmediateContext hand
         // back refcounted interfaces `windows` releases.
         let device: ID3D11Device = unsafe { like.GetDevice() }.map_err(err("GetDevice"))?;
@@ -118,7 +215,11 @@ impl Converter {
         let context =
             unsafe { device.GetImmediateContext() }.map_err(err("GetImmediateContext"))?;
 
-        let bytecode = compile()?;
+        let (src, tonemap) = match output {
+            ConvertOutput::P010 => (SHADER_HLSL, false),
+            ConvertOutput::Nv12 => (SDR_SHADER_HLSL, hdr_source),
+        };
+        let bytecode = compile(src, tonemap)?;
         let mut shader = None;
         // SAFETY: `bytecode` is valid DXBC from D3DCompile; out-param is written.
         unsafe { device.CreateComputeShader(&bytecode, None, Some(&mut shader)) }
@@ -129,6 +230,7 @@ impl Converter {
             device,
             context,
             shader,
+            output,
             target: None,
         })
     }
@@ -184,12 +286,13 @@ impl Converter {
             return Ok(());
         }
 
+        let (tex_format, y_format, uv_format) = self.output.formats();
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_P010,
+            Format: tex_format,
             SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -203,7 +306,7 @@ impl Converter {
             MiscFlags: D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
         };
         let mut texture: Option<ID3D11Texture2D> = None;
-        // SAFETY: `desc` is a valid P010 texture description; no initial data.
+        // SAFETY: `desc` is a valid P010/NV12 texture description; no initial data.
         unsafe {
             self.device.CreateTexture2D(
                 &desc,
@@ -211,13 +314,13 @@ impl Converter {
                 Some(&mut texture),
             )
         }
-        .map_err(err("CreateTexture2D(P010)"))?;
-        let texture = texture.ok_or_else(|| "no P010 texture".to_string())?;
+        .map_err(err("CreateTexture2D"))?;
+        let texture = texture.ok_or_else(|| "no output texture".to_string())?;
 
-        // Plane UAVs: R16 for luma (plane 0), R16G16 for chroma (plane 1). On
-        // D3D11 the plane is selected by the view format on a P010 resource.
-        let y_uav = self.plane_uav(&texture, DXGI_FORMAT_R16_UNORM)?;
-        let uv_uav = self.plane_uav(&texture, DXGI_FORMAT_R16G16_UNORM)?;
+        // Plane UAVs: luma is plane 0, chroma plane 1; the plane is selected by
+        // the view format (R16/R16G16 for P010, R8/R8G8 for NV12).
+        let y_uav = self.plane_uav(&texture, y_format)?;
+        let uv_uav = self.plane_uav(&texture, uv_format)?;
 
         self.target = Some(Target {
             width,
@@ -252,18 +355,31 @@ impl Converter {
     }
 }
 
-/// Runtime-compile [`SHADER_HLSL`] to DXBC.
-fn compile() -> Result<Vec<u8>, String> {
+/// Runtime-compile `src` to DXBC. `tonemap` defines `TONEMAP` for the SDR shader
+/// (HDR→SDR roll-off); it is inert in the P010 shader.
+fn compile(src: &[u8], tonemap: bool) -> Result<Vec<u8>, String> {
     let mut code = None;
     let mut errors = None;
+    // A `{name, definition}` list terminated by `{null, null}`, per D3DCompile.
+    let defines = [
+        D3D_SHADER_MACRO {
+            Name: s!("TONEMAP"),
+            Definition: s!("1"),
+        },
+        D3D_SHADER_MACRO {
+            Name: PCSTR::null(),
+            Definition: PCSTR::null(),
+        },
+    ];
+    let pdefines = tonemap.then_some(defines.as_ptr());
     // SAFETY: source is a valid byte slice; entry/target are NUL-terminated; the
-    // out-params are written on success/failure.
+    // macro list is NUL-terminated and outlives the call; out-params are written.
     let hr = unsafe {
         D3DCompile(
-            SHADER_HLSL.as_ptr().cast(),
-            SHADER_HLSL.len(),
+            src.as_ptr().cast(),
+            src.len(),
             PCSTR::null(),
-            None,
+            pdefines,
             None,
             s!("main"),
             s!("cs_5_0"),

@@ -19,8 +19,66 @@ use std::net::SocketAddr;
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{
     AppListing, DecoderQuirks, Feedback, Hello, InputEvent, PadOutput, PairRequest, Rumble, Seq16,
-    ServerControl, SessionConfig, SessionKey,
+    ServerControl, SessionConfig, SessionKey, StreamCodec,
 };
+
+/// Per-session stream settings the handler resolves before a session starts —
+/// the whole effective stream config (the global defaults with the running app's
+/// overrides merged in, `Config::effective`), so the manager reads every knob
+/// live per session rather than from a value frozen at startup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionSettings {
+    /// `None` = auto (the manager negotiates AV1 when offered, else HEVC).
+    pub codec: Option<StreamCodec>,
+    pub bitrate_kbps: u32,
+    /// Rate-controller floor/ceiling; `max = 0` means "use `bitrate_kbps`".
+    pub min_bitrate_kbps: u32,
+    pub max_bitrate_kbps: u32,
+    pub hdr: bool,
+    /// NVENC preset P1–P4 (1..=4, clamped by the encoder).
+    pub preset: u8,
+    /// Variable-bitrate rate control (else CBR).
+    pub vbr: bool,
+    /// Slice/tile override; `0` = the codec default.
+    pub slices: u8,
+    /// Forced IDR period in frames; `0` = infinite GOP.
+    pub idr_period: u32,
+    pub dpb_depth: u8,
+    pub capture_backend: CaptureBackend,
+    /// DXGI output index to capture; `None` = primary.
+    pub capture_output: Option<u32>,
+    /// Match the client's resolution on the physical display.
+    pub match_resolution: bool,
+    /// Capture the virtual display (MTT VDD) instead of the physical one.
+    pub virtual_display: bool,
+    /// Cap the encode frame rate; `0` = follow the client.
+    pub fps_cap: u32,
+    pub audio: bool,
+    pub audio_device: Option<String>,
+    /// Render endpoint the pads' headset mic is played into (a consumed virtual
+    /// microphone such as "Steam Streaming Microphone"), matched by name.
+    /// `None`/empty disables the pad-mic path — no render sink is opened.
+    pub mic_device: Option<String>,
+    pub audio_bitrate_kbps: u32,
+    pub audio_frame_us: u32,
+    pub audio_fec: bool,
+    pub audio_complexity: u8,
+    /// Turn Enhanced Pointer Precision off (server-side) for the session.
+    pub disable_epp: bool,
+}
+
+/// Which capture backend the session should use (mirrors the web config, kept
+/// here so this trait crate needs no dependency on `sunburst-web`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureBackend {
+    /// The OS default: WGC on Win11, DDA on Win10.
+    #[default]
+    Auto,
+    Wgc,
+    Dda,
+    /// Opt-in resilience only (CLAUDE.md); never automatic.
+    Nvfbc,
+}
 
 /// A server → client message queued by a producer for the endpoint to send.
 ///
@@ -52,8 +110,29 @@ pub enum Outbound {
 /// platform-bound: `sunburst-input` implements it against `SendInput` on
 /// Windows. It lives here rather than in `sunburst-web` so that the crate doing
 /// the injecting does not have to depend on `hyper` to reach the trait.
+/// Input tuning the injector applies live: mouse-delta scaling and an extra
+/// stick deadzone. Sent by the handler when a session starts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputSettings {
+    pub mouse_sensitivity: f32,
+    pub gamepad_deadzone: f32,
+}
+
+impl Default for InputSettings {
+    fn default() -> Self {
+        InputSettings {
+            mouse_sensitivity: 1.0,
+            gamepad_deadzone: 0.0,
+        }
+    }
+}
+
 pub trait InputSink: Send {
     fn inject(&mut self, client: u32, event: InputEvent);
+
+    /// Apply input tuning (mouse sensitivity, deadzone). Default no-op — tests
+    /// and `NoInput` ignore it.
+    fn configure(&mut self, _settings: InputSettings) {}
 
     /// A client announced a pad. The injector plugs a virtual controller of the
     /// declared type and readies its encoding session. Default no-op — most sinks
@@ -99,6 +178,7 @@ pub trait StreamControl: Send {
         from: SocketAddr,
         hello: &Hello,
         quirks: DecoderQuirks,
+        settings: SessionSettings,
     ) -> Option<SessionConfig>;
 
     /// The client's session ended (`Bye`, idle timeout, or a UI disconnect).
@@ -120,6 +200,11 @@ pub trait StreamControl: Send {
     /// A periodic client feedback report; drives rate control.
     fn on_feedback(&mut self, _client: u32, _feedback: Feedback) {}
 
+    /// A pad's headset-mic Opus frame (client → server). Default no-op — the
+    /// Windows `SessionManager` decodes it and renders it to the configured
+    /// virtual microphone for the active session.
+    fn on_audio_in(&mut self, _client: u32, _pad_index: u8, _seq: Seq16, _payload: &[u8]) {}
+
     /// Server→client video-control messages produced since the last call —
     /// `CodecPrivate`, cursor updates, `SecureDesktop`. Drained each tick.
     fn drain_outbound(&mut self) -> Vec<Outbound> {
@@ -138,6 +223,7 @@ impl StreamControl for NoStream {
         _from: SocketAddr,
         _hello: &Hello,
         _quirks: DecoderQuirks,
+        _settings: SessionSettings,
     ) -> Option<SessionConfig> {
         None
     }
@@ -215,6 +301,13 @@ pub trait ControlHandler: Send {
     }
     fn on_pad_disconnected(&mut self, _client: u32, _pad_index: u8) {}
 
+    /// A pad's headset-mic Opus frame (client → server), tagged with the pad it
+    /// came from. Default no-op — the Windows handler renders it to the virtual
+    /// microphone. Unauthenticated, like the outbound audio: media rides the LAN
+    /// without a MAC (see [`crate::endpoint`]), so `client` is attributed by
+    /// source address and may be any paired client the endpoint has seen.
+    fn on_audio_in(&mut self, _client: u32, _pad_index: u8, _seq: Seq16, _payload: &[u8]) {}
+
     fn on_bye(&mut self, client: u32);
 
     /// Server → client messages produced since the last call, for the endpoint
@@ -254,6 +347,8 @@ pub struct Recording {
     pub resizes: Vec<(u32, u32, u32, u32)>,
     pub pad_connects: Vec<(u32, u8, u8, u16)>,
     pub pad_disconnects: Vec<(u32, u8)>,
+    /// `(client, pad_index, seq, opus payload)` for each pad-mic frame received.
+    pub audio_ins: Vec<(u32, u8, Seq16, Vec<u8>)>,
     pub launches: Vec<u32>,
     pub app_list_calls: usize,
     pub byes: Vec<u32>,
@@ -400,6 +495,12 @@ impl<H: ControlHandler> ControlHandler for std::sync::Arc<std::sync::Mutex<H>> {
             .on_pad_disconnected(client, pad_index);
     }
 
+    fn on_audio_in(&mut self, client: u32, pad_index: u8, seq: Seq16, payload: &[u8]) {
+        self.lock()
+            .expect("not poisoned")
+            .on_audio_in(client, pad_index, seq, payload);
+    }
+
     fn on_bye(&mut self, client: u32) {
         self.lock().expect("not poisoned").on_bye(client);
     }
@@ -489,6 +590,11 @@ impl ControlHandler for Recording {
 
     fn on_pad_disconnected(&mut self, client: u32, pad_index: u8) {
         self.pad_disconnects.push((client, pad_index));
+    }
+
+    fn on_audio_in(&mut self, client: u32, pad_index: u8, seq: Seq16, payload: &[u8]) {
+        self.audio_ins
+            .push((client, pad_index, seq, payload.to_vec()));
     }
 
     fn on_bye(&mut self, client: u32) {

@@ -740,9 +740,9 @@ binding against — but it is worth knowing what else exists before committing.
 ### Investigation A — USB/IP
 
 The prize is Phase 8: forward `045e:02e6` and let Windows' own driver own the
-adapter, deleting ~6,500 lines of vendored MT7612U radio and ~450 of GIP, and
-lifting the X360 ceiling. The cost is TCP where an interrupt transfer becomes a
-round trip.
+adapter, deleting the vendored MT7612U radio (~3,460 lines) and the ~6,100 lines
+of GIP/controller/wired, and lifting the X360 ceiling. The cost is TCP where an
+interrupt transfer becomes a round trip.
 
 **The decisive unknown is Android, not Windows.** A USB/IP *server* normally needs
 the `usbip-host` kernel module and root; stock Android TV has neither, so an
@@ -1011,6 +1011,171 @@ server on the 4070, wired LAN.
       quirks per device once confirmed.
 - [ ] **PerformanceHintManager** keeps the client thread on a fast core on the
       Amlogic — check for a frame-time improvement with it on vs. off.
+
+---
+
+## 11. Phase 6 — audio, A/V sync (env S, A and B)
+
+Audio is built end to end but nothing here is measured. Server on the 4070 at a
+48 kHz output; the debug APK on both TVs; a game with clear, positional audio
+(and something with visible lip movement for the sync check).
+
+- [ ] **Sound reaches both TVs**, decoded from Opus and played through AAudio
+      `LowLatency`, on the Shield (HEVC video) and the Homatics (AV1 video).
+- [ ] **No A/V drift over 30 minutes.** Lip-sync holds start to finish; the
+      bounded-buffer corrections (drop-newest past the watermark, silence on
+      underrun) are inaudible. If a constant lip-sync *offset* is visible, tune
+      the ring watermark/capacity in `audio.rs` — that offset is the box-tuned
+      number the plan left open, not drift.
+- [ ] **Idle gap.** Go silent then loud (a menu, then gameplay): audio stops and
+      resumes cleanly, no desync on resume (the server's injected silence held
+      the cadence).
+- [ ] **Host-mute via device selection.** With `StreamConfig.audio_device` unset,
+      the server's own speakers play the game (default endpoint) and the client
+      still gets audio. Set it to "Steam Streaming Speakers" (with Steam's
+      Remote Play components installed): the server's physical output goes silent
+      and the client still gets audio. Confirm the device is present/enabled
+      first; a missing device logs a warning and falls back to the default.
+- [ ] **48 kHz requirement.** Set the server output to 44.1 kHz and confirm the
+      startup warning fires (resampling is deliberately not implemented); restore
+      48 kHz.
+- [ ] **Loss recovery.** Induce ~2% loss: audio recovers via Opus FEC/PLC with no
+      audible dropout, and **no** audio NACKs are sent (audio has none).
+- [ ] **Audio latency measured** from the new instrumentation chains
+      (au-capture/au-encode/au-send on the server, au-recv/au-decode/au-play on
+      the client), reported alongside the §4 video rows from the same runs.
+
+---
+
+## 12. Phase 7 — display integration + optional virtual display (env S)
+
+The display and VDD code is `cargo xwin`-verified but its behaviour is not.
+Server on the 4070; run these against a real HDR display and, for the VDD rows,
+with the MikeTheTech Virtual Display Driver installed.
+
+- [ ] **HDR around the session.** A client connects for an HDR stream: the
+      desktop enters HDR; on disconnect it returns to exactly the prior state
+      (on and off, both directions). Kill the server mid-session — HDR still
+      restores (the guard's `Drop`).
+- [ ] **Resolution matching** (opt-in `match_resolution`). The desktop switches
+      to the client's resolution/refresh for the session and restores after. An
+      unsupported mode is refused (CDS_TEST) rather than blanking the screen.
+- [ ] **Per-app profile.** Launch a game whose entry has a bitrate/codec
+      override; the live stream uses it, not the global default (codec only
+      applies when the game is launched before the client connects). The game
+      exits and its prep is undone (the `try_wait` reap).
+- [ ] **Virtual display** (opt-in `virtual_display`). With the VDD installed, the
+      session enables it and — with `capture_output` set to its DXGI index —
+      streams a client-native-resolution virtual display; the physical display is
+      untouched; the VDD is disabled on disconnect. Headless (no physical monitor)
+      still streams. Confirm the VDD's hardware id matches `VDD_HARDWARE_IDS` in
+      `display.rs`; add it there if a newer build differs.
+- [ ] **Fallback.** With `virtual_display` on but no VDD installed, the server
+      logs a warning and streams the physical display.
+
+---
+
+## 13. H.264 — a low-latency SDR codec (env S, A and B)
+
+H.264 is built end to end but its NVENC config, the NV12 convert (HLSL + the
+placeholder CUDA kernel) and the tonemap are `cargo xwin`-verified only. Set the
+server codec preference (or a per-app override) to H.264.
+
+- [ ] **Negotiate + decode.** A client offering `video/avc` negotiates H.264 and
+      decodes it; HEVC/AV1 still negotiate when preferred; auto never picks H.264
+      over an HDR codec.
+- [ ] **Correct 8-bit SDR** (BT.709 colours, no cast) on the DDA/WGC path. On the
+      NvFBC path once the real `argb_to_nv12` PTX is vendored (the checked-in one
+      is a no-op placeholder — a black frame, by design, like the P010 kernel).
+- [ ] **Tonemapping.** With the desktop in HDR, an H.264 stream still looks right
+      (highlights rolled off, no clip/oversaturation); in SDR it is unchanged. The
+      session does not alter the desktop's HDR state.
+- [ ] **Latency vs HEVC** on the same content, from the §4 instrumentation rows —
+      the reason H.264 exists. Report the delta.
+- [ ] 2% induced loss recovers (NACK + H.264 reference invalidation, which shares
+      HEVC's `Window`).
+- [ ] A per-app profile pins H.264 for one game while others stay HDR (HEVC/AV1).
+
+## 14. Configuration surface — everything takes effect (env S, A and B)
+
+The config is honoured live per session (no restart), and the round-trip, the
+device picker and the override merge are already host-tested through the `Fake`.
+What only real hardware can show is that each knob *moves the right number* and
+that the defaults reproduce today's behaviour. Read the effect off the §4
+instrumentation rows where latency is involved.
+
+- [ ] **NVENC preset.** P1 → P4 raises encode time and, at a fixed bitrate,
+      quality; P1 is unchanged from the old hardcoded value. All four stay within
+      the ULL envelope (no UHQ/B-frame regression in the numbers).
+- [ ] **Rate control.** VBR spends less on static frames than CBR; neither adds a
+      latency spike. CBR remains the default.
+- [ ] **Capture backend.** Forcing WGC, DDA and NvFBC each streams; `Auto`
+      reproduces the OS default (WGC on Win11, DDA on Win10). Backends measure
+      within the §7 half-millisecond of each other; NvFBC is the 1.2–1.5 ms-worse
+      resilience path, as documented — confirm it is not silently the default.
+- [ ] **Slices / IDR / DPB / fps cap.** A non-zero slice count changes the slice
+      layout on the wire; a forced IDR period shortens the GOP; an fps cap holds
+      the encode rate below the client's refresh. Defaults (0/0/8/0) are today's.
+- [ ] **Audio codec knobs.** Opus frame duration (2.5/5/10/20 ms), FEC and
+      complexity change the audio packet cadence/robustness; 5 ms/FEC-on/10 stays
+      the default, and A/V sync (§11) holds across the range.
+- [ ] **Audio device picker.** `GET /api/audio-devices` lists the server's
+      endpoints; selecting one captures it; "Steam Streaming Speakers" silences
+      the host while the client keeps audio; the default endpoint leaves the host
+      audible. A name no longer present falls back to the default, not silence.
+- [ ] **Input tuning.** Mouse sensitivity scales injected relative deltas (1.0 is
+      1:1); gamepad deadzone widens the neutral zone; the EPP toggle turns
+      Enhanced Pointer Precision off for the session (verify in the OS mouse
+      settings) and restores it on disconnect.
+- [ ] **Client requests, clamped.** From the TV settings screen a codec request
+      is honoured only if the device can decode it (else negotiation falls back);
+      a bitrate ceiling only lowers the rate, never raises it past the server cap.
+      Jitter depth, cursor overlay and the performance hint apply on the client;
+      changing codec/bitrate/jitter reconnects, the presentation prefs do not.
+- [ ] **Per-app overrides.** A per-app codec/bitrate/preset applies only while
+      that app is the running one; other apps inherit the global defaults.
+- [ ] **Autostart.** Toggling it from the UI creates/removes the scheduled task.
+
+---
+
+## 15. Phase 8 — Xbox pads (env S + the adapter, wired pads, a headset; both TVs)
+
+`sunburst-gip-bridge` builds for both ABIs and links the vendored C++ on the dev
+box, but the radio, real pads and the headset are hardware-only. Runs on the
+Android client (env A/B) against the server (env S). One clip is worth the whole
+list: a wired pad, then the adapter with a headset, through Big Picture.
+
+- [ ] **Wired pads enumerate and play.** A wired Xbox One and an Xbox Series pad
+      each attach (`UsbManager` permission prompt → fd), drive a game through Big
+      Picture, and disconnect cleanly. The server creates the emulated pad exactly
+      as for a TV-native controller.
+- [ ] **The adapter brings up the radio and pairs.** It loads the fetched
+      `FW_ACC_00U.bin`, brings up the MT7612U radio, and pairs a pad from the TV
+      remote's "Pair a controller" action (the physical button on the unit here is
+      dead). Up to **four pads** play at once.
+- [ ] **Rumble, including the trigger motors.** Rumble arrives and stops cleanly;
+      a lost final zero-level packet self-heals via the 200 ms client timeout /
+      100 ms server repeat. The Xbox **impulse-trigger** motors fire (a game that
+      uses them, e.g. a racing/shooter trigger effect).
+- [ ] **Battery.** Level, charging, and headset-present flags show per pad and
+      track a pad going flat / onto the charger.
+- [ ] **Headset, both directions (≤2 pads).** Server audio is audible in the pad's
+      headphones at the negotiated format, with working volume and the TV/pad/both
+      routing; the pad **mic** reaches the server's chosen "Steam Streaming
+      Microphone" endpoint and is heard by an app reading it. Confirm the mic is
+      the native 24 kHz mono capture upsampled cleanly by the server's decoder (no
+      pitch/speed artefact). No A/V drift over 30 min (§11 sync); survives an audio
+      reconfiguration (unplug/replug the headset mid-session).
+- [ ] **Input survives a UAC prompt and a lock/unlock.** The pad keeps driving the
+      re-attached desktop (the §6 desktop-reattach path), and Steam Input is
+      characterised (does it double-enumerate the emulated pad in any game?).
+- [ ] **Latency vs a directly-connected pad** is measured and the difference
+      reported (button-to-action, against a pad plugged into the server).
+- [ ] **Record a GIP frame corpus.** With the driver working, capture real GIP
+      frames (input, rumble, the audio handshake, capture/render audio) into a
+      fixture. This seeds the deferred **GIP-in-Rust** rewrite: the Rust layer is
+      validated by reproducing this verified corpus and diffed against the C++
+      on-device before it swaps in behind the bridge seam.
 
 ---
 

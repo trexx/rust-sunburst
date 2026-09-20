@@ -10,6 +10,7 @@ members = [
     "sunburst-server",
     "sunburst-web",
     "sunburst-android",
+    "sunburst-gip-bridge",
 
     # Phase 0 throwaway. A workspace member so it is type-checked in the same
     # pass as everything else, and deleted with the rest of spikes/ when Phase 0
@@ -35,8 +36,16 @@ sunburst-encode = { path = "sunburst-encode" }
 sunburst-net = { path = "sunburst-net" }
 sunburst-web = { path = "sunburst-web" }
 sunburst-input = { path = "sunburst-input" }
+sunburst-audio = { path = "sunburst-audio" }
+sunburst-gip-bridge = { path = "sunburst-gip-bridge" }
 
 blake3 = { version = "1.8", default-features = false, features = ["std"] }
+
+# libopus transpiled to pure Rust (c2rust). Pure Rust so the Opus encoder (server)
+# and decoder (client) cross-compile to Windows and both Android ABIs with no C
+# toolchain — the reason it beat the audiopus/CMake route. Wrapped thin in
+# `sunburst-audio::codec`.
+unsafe-libopus = "0.2"
 
 # Control plane only. CLAUDE.md permits tokio in sunburst-server; sunburst-web is
 # the same plane and never sits between the frame path and anything.

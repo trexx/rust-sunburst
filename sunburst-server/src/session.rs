@@ -19,28 +19,24 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sunburst_capture::OutputSelect;
 use sunburst_core::proto::{
-    DecoderQuirks, Feedback, Hello, Nack, Seq16, ServerControl, SessionConfig, StreamCodec,
-    negotiate_codec,
+    AudioParams, DecoderQuirks, Feedback, Hello, Nack, Seq16, ServerControl, SessionConfig,
+    StreamCodec, negotiate_codec,
 };
 use sunburst_encode::encoder::Codec;
-use sunburst_net::{Bounds, Outbound, RateController, StreamControl};
+use sunburst_net::{
+    Bounds, CaptureBackend as SessionBackend, Outbound, RateController, SessionSettings,
+    StreamControl,
+};
 use sunburst_web::host::SessionSummary;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 
+use crate::audio_pipeline::{self, AudioPipeline};
 use crate::cursor::CursorPoller;
+use crate::mic_pipeline::MicPipeline;
+use crate::display::{self, DisplayGuard, EppGuard, VirtualDisplay};
 use crate::pipeline::{CodecHeaders, Pipeline, PipelineParams, StreamShared, retransmit_ring};
-
-/// The configured stream defaults the manager applies to every session.
-#[derive(Clone, Debug)]
-pub struct StreamSettings {
-    /// `None` = auto (AV1 when the client offers it, else HEVC).
-    pub codec: Option<StreamCodec>,
-    pub bitrate_kbps: u32,
-    pub hdr: bool,
-    /// Opt into the NvFBC CUDA-native backend (resilience, never the default).
-    pub nvfbc: bool,
-}
 
 /// The live-session view the web UI reads and the disconnect it can request.
 /// Shared between the manager (on the endpoint thread) and the `Host` (on the
@@ -97,6 +93,22 @@ struct Active {
     session_id: u32,
     codec: StreamCodec,
     pipeline: Pipeline,
+    /// The audio pipeline, when the session streams sound. Stopped with the
+    /// video pipeline in `stop_active`.
+    audio: Option<AudioPipeline>,
+    /// The pad-mic receive pipeline, when a virtual-mic endpoint is configured.
+    /// Renders the pads' headset mic into a consumed virtual microphone; dropped
+    /// (which joins its thread) when the session ends.
+    mic: Option<MicPipeline>,
+    /// Restores the display (HDR, and resolution if matched) when dropped, so a
+    /// disconnect — or an abnormal teardown — puts the desktop back as found.
+    _display: DisplayGuard,
+    /// Holds the virtual display enabled for this session, disabling it on drop.
+    /// `None` when not opted in or the VDD is absent (physical-display fallback).
+    _vdd: Option<VirtualDisplay>,
+    /// Holds the EPP override for the session, restoring it on drop; `None`
+    /// unless `disable_epp` is set.
+    _epp: Option<EppGuard>,
     shared: Arc<StreamShared>,
     rate: RateController,
     headers_rx: mpsc::Receiver<CodecHeaders>,
@@ -110,23 +122,19 @@ struct Active {
 pub struct SessionManager {
     socket: UdpSocket,
     sessions: Arc<Sessions>,
-    settings: StreamSettings,
     active: Option<Active>,
     next_session_id: u32,
 }
 
 impl SessionManager {
     /// `socket` is a clone of the endpoint's UDP socket, so video leaves the one
-    /// shared port. `sessions` is shared with the `Host` for the UI.
-    pub fn new(
-        socket: UdpSocket,
-        sessions: Arc<Sessions>,
-        settings: StreamSettings,
-    ) -> SessionManager {
+    /// shared port. `sessions` is shared with the `Host` for the UI. All stream
+    /// config now arrives per session via `session_start`'s [`SessionSettings`]
+    /// (the handler resolves it live from the effective config).
+    pub fn new(socket: UdpSocket, sessions: Arc<Sessions>) -> SessionManager {
         SessionManager {
             socket,
             sessions,
-            settings,
             active: None,
             next_session_id: 1,
         }
@@ -135,6 +143,9 @@ impl SessionManager {
     fn stop_active(&mut self) {
         if let Some(active) = self.active.take() {
             active.pipeline.stop();
+            if let Some(audio) = active.audio {
+                audio.stop();
+            }
             self.sessions.set_active(None);
         }
     }
@@ -145,6 +156,9 @@ fn codec_ceiling_kbps(codec: StreamCodec) -> u32 {
     match codec {
         StreamCodec::Hevc => 150_000,
         StreamCodec::Av1 => 100_000,
+        // H.264 is less efficient than HEVC; give it the same practical ceiling
+        // (the Shield's decoder caps around here regardless).
+        StreamCodec::H264 => 150_000,
     }
 }
 
@@ -179,28 +193,49 @@ impl StreamControl for SessionManager {
         from: SocketAddr,
         hello: &Hello,
         quirks: DecoderQuirks,
+        settings: SessionSettings,
     ) -> Option<SessionConfig> {
         // One stream at a time.
         if self.active.is_some() {
             return None;
         }
-        let codec = negotiate_codec(self.settings.codec, hello.codecs)?;
+        // Codec: the client's request (from the TV settings) wins over the
+        // server/per-app preference, but only among codecs it can decode.
+        let prefer = hello.prefer_codec.or(settings.codec);
+        let codec = negotiate_codec(prefer, hello.codecs)?;
         let enc_codec = match codec {
             StreamCodec::Hevc => Codec::Hevc,
             StreamCodec::Av1 => Codec::Av1,
+            StreamCodec::H264 => Codec::H264,
         };
 
         // Bitrate: the configured target, bounded by the codec ceiling and the
-        // decoder's own hint.
+        // decoder's own hint, then by any client-requested ceiling (the client
+        // can only lower it), with a 10 Mbps floor.
         let ceiling = codec_ceiling_kbps(codec).min(quirks.max_bitrate_hint / 1000);
-        let bitrate_kbps = self.settings.bitrate_kbps.min(ceiling).max(10_000);
+        let mut bitrate_kbps = settings.bitrate_kbps.min(ceiling);
+        if hello.max_bitrate_kbps > 0 {
+            bitrate_kbps = bitrate_kbps.min(hello.max_bitrate_kbps);
+        }
+        let bitrate_kbps = bitrate_kbps.max(10_000);
         let ref_invalidation = quirks.ref_invalidation;
         let intra_refresh = quirks.intra_refresh.then_some((240, 30));
-        let slices = match enc_codec {
-            Codec::Hevc => 4,
-            Codec::Av1 => 2,
+        // Slices: the config override, else the codec default.
+        let slices = if settings.slices > 0 {
+            settings.slices as u32
+        } else {
+            match enc_codec {
+                Codec::Hevc | Codec::H264 => 4,
+                Codec::Av1 => 2,
+            }
         };
-        let fps = (hello.refresh_mhz / 1000).max(1);
+        // Frame rate: the client's refresh, capped if the config asks.
+        let mut fps = (hello.refresh_mhz / 1000).max(1);
+        if settings.fps_cap > 0 {
+            fps = fps.min(settings.fps_cap);
+        }
+        // H.264 is SDR (tonemapped): never enable HDR on the desktop for it.
+        let want_hdr = settings.hdr && codec != StreamCodec::H264;
 
         let socket = self.socket.try_clone().ok()?;
         let shared = StreamShared::new(bitrate_kbps);
@@ -214,11 +249,23 @@ impl StreamControl for SessionManager {
             fps,
             bitrate_kbps,
             slices,
-            hdr: self.settings.hdr,
+            hdr: want_hdr,
             intra_refresh,
-            dpb_depth: 8,
+            dpb_depth: settings.dpb_depth as u32,
             ref_invalidation,
-            nvfbc: self.settings.nvfbc,
+            nvfbc: matches!(settings.capture_backend, SessionBackend::Nvfbc),
+            force_backend: match settings.capture_backend {
+                SessionBackend::Wgc => Some(sunburst_capture::Backend::Wgc),
+                SessionBackend::Dda => Some(sunburst_capture::Backend::Dda),
+                SessionBackend::Auto | SessionBackend::Nvfbc => None,
+            },
+            output: match settings.capture_output {
+                Some(i) => OutputSelect::Index(i),
+                None => OutputSelect::Primary,
+            },
+            preset: settings.preset,
+            vbr: settings.vbr,
+            idr_period: settings.idr_period,
         };
         let pipeline = Pipeline::spawn(
             socket,
@@ -239,9 +286,83 @@ impl StreamControl for SessionManager {
             return None;
         }
 
+        // Audio rides the same shared socket to the same client. Spawn failure
+        // (only the socket clone can fail here) leaves the session video-only.
+        let audio = if settings.audio {
+            match self.socket.try_clone() {
+                Ok(audio_socket) => Some(AudioPipeline::spawn(
+                    audio_socket,
+                    from,
+                    audio_pipeline::AudioParams {
+                        device: settings.audio_device.clone(),
+                        bitrate_kbps: settings.audio_bitrate_kbps,
+                        frame_us: settings.audio_frame_us,
+                        fec: settings.audio_fec,
+                        complexity: settings.audio_complexity,
+                    },
+                )),
+                Err(e) => {
+                    eprintln!(
+                        "audio: could not clone the stream socket, streaming without sound: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let audio_on = audio.is_some();
+
+        // The pad-mic path: open a render sink to the configured virtual mic when
+        // one is named. Independent of the game-audio direction above — a headset
+        // can carry the mic even when TV audio is routed elsewhere. The endpoint
+        // routes `AudioIn` frames here through `on_audio_in`.
+        let mic = settings
+            .mic_device
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(|d| MicPipeline::spawn(d.to_string()));
+
+        // Bring up the virtual display first (if opted in and installed), so it is
+        // an active output before HDR is toggled; absent, fall back to physical.
+        let vdd = if settings.virtual_display {
+            let enabled = VirtualDisplay::enable();
+            if enabled.is_none() {
+                eprintln!(
+                    "display: virtual_display requested but no VDD is installed; \
+                     streaming the physical display"
+                );
+            }
+            enabled
+        } else {
+            None
+        };
+
+        // Set the display up for the session and hold the guard that restores it.
+        // Resolution matching only touches the physical display; when the virtual
+        // display is active it provides the resolution instead (Phase 7 commit 4).
+        let resolution = (settings.match_resolution && !settings.virtual_display).then(|| {
+            (
+                hello.width,
+                hello.height,
+                display::refresh_hz(hello.refresh_mhz),
+            )
+        });
+        let display_guard = DisplayGuard::apply(want_hdr, resolution);
+        let epp_guard = settings.disable_epp.then(EppGuard::disable);
+
+        // Rate-controller bounds from config: the floor (never above the target),
+        // and a ceiling the controller may climb to (the explicit max when set,
+        // else the session target — today's behaviour).
+        let min_kbps = settings.min_bitrate_kbps.clamp(1, bitrate_kbps);
+        let max_kbps = if settings.max_bitrate_kbps > 0 {
+            settings.max_bitrate_kbps.max(bitrate_kbps)
+        } else {
+            bitrate_kbps
+        };
         let bounds = Bounds {
-            min_kbps: 10_000,
-            max_kbps: bitrate_kbps,
+            min_kbps,
+            max_kbps,
             initial_kbps: bitrate_kbps,
         };
 
@@ -263,6 +384,11 @@ impl StreamControl for SessionManager {
             session_id,
             codec,
             pipeline,
+            audio,
+            mic,
+            _display: display_guard,
+            _vdd: vdd,
+            _epp: epp_guard,
             shared,
             rate: RateController::new(bounds),
             headers_rx,
@@ -284,6 +410,11 @@ impl StreamControl for SessionManager {
             fps_mhz: hello.refresh_mhz,
             bitrate_kbps,
             hdr: None,
+            audio: audio_on.then_some(AudioParams {
+                sample_rate: audio_pipeline::SAMPLE_RATE,
+                channels: audio_pipeline::CHANNELS,
+                frame_samples: audio_pipeline::frame_samples(settings.audio_frame_us),
+            }),
             intra_refresh: intra_refresh.is_some(),
             ref_invalidation,
             slices: slices as u8,
@@ -333,6 +464,18 @@ impl StreamControl for SessionManager {
             && let Some(new_kbps) = a.rate.on_feedback(&feedback, now_ms())
         {
             a.shared.target_kbps.store(new_kbps, Ordering::Relaxed);
+        }
+    }
+
+    fn on_audio_in(&mut self, client: u32, pad_index: u8, _seq: Seq16, payload: &[u8]) {
+        // Only the active session's client feeds the virtual mic; a frame from
+        // anyone else (media is unauthenticated) is ignored. `None` mic means no
+        // endpoint was configured, so the frame is dropped.
+        if let Some(a) = &self.active
+            && a.client == client
+            && let Some(mic) = &a.mic
+        {
+            mic.push(pad_index, payload);
         }
     }
 

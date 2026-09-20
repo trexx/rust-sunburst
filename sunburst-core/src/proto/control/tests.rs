@@ -33,6 +33,8 @@ fn hello() -> ClientControl {
         client_nonce: [9; NONCE_LEN],
         clock_offset_ns: -1_234_567,
         codecs: codecs::HEVC_MAIN10,
+        prefer_codec: None,
+        max_bitrate_kbps: 0,
     })
 }
 
@@ -51,6 +53,11 @@ fn session_config(hdr: bool) -> SessionConfig {
             min_luminance: 50,
             max_cll: 1_000,
             max_fall: 400,
+        }),
+        audio: Some(AudioParams {
+            sample_rate: 48_000,
+            channels: 2,
+            frame_samples: 240,
         }),
         intra_refresh: true,
         ref_invalidation: false,
@@ -130,6 +137,10 @@ fn every_implemented_server_message_round_trips() {
     round_trip_server(ServerControl::AppList(Vec::new()));
     round_trip_server(ServerControl::SessionConfig(session_config(true)));
     round_trip_server(ServerControl::SessionConfig(session_config(false)));
+    // Audio absent must round-trip too, not just the present case the helper sets.
+    let mut no_audio = session_config(true);
+    no_audio.audio = None;
+    round_trip_server(ServerControl::SessionConfig(no_audio));
     round_trip_server(ServerControl::CodecPrivate {
         codec: StreamCodec::Hevc,
         data: vec![0, 0, 0, 1, 0x40, 0x01, 0x0C],
@@ -171,12 +182,17 @@ fn every_implemented_server_message_round_trips() {
 
 #[test]
 fn session_config_flags_are_independent() {
-    // Three bits in one byte; a shift slip would silently enable the wrong
-    // recovery mode on one codec.
-    for bits in 0..8u8 {
+    // Four bits in one byte (hdr, intra-refresh, ref-invalidation, audio); a
+    // shift slip would silently enable the wrong mode or misparse the tail.
+    for bits in 0..16u8 {
         let mut c = session_config(bits & 1 != 0);
         c.intra_refresh = bits & 2 != 0;
         c.ref_invalidation = bits & 4 != 0;
+        c.audio = (bits & 8 != 0).then_some(AudioParams {
+            sample_rate: 48_000,
+            channels: 2,
+            frame_samples: 240,
+        });
         round_trip_server(ServerControl::SessionConfig(c));
     }
 }
@@ -217,15 +233,59 @@ fn hello_advertises_codecs_and_the_bits_map_to_stream_codecs() {
     let ClientControl::Hello(mut h) = hello() else {
         unreachable!()
     };
-    h.codecs = codecs::HEVC_MAIN10 | codecs::AV1_MAIN10;
+    h.codecs = codecs::HEVC_MAIN10 | codecs::AV1_MAIN10 | codecs::H264;
     round_trip_client(ClientControl::Hello(h.clone()));
     assert_eq!(StreamCodec::Hevc.hello_bit(), codecs::HEVC_MAIN10);
     assert_eq!(StreamCodec::Av1.hello_bit(), codecs::AV1_MAIN10);
+    assert_eq!(StreamCodec::H264.hello_bit(), codecs::H264);
     assert_eq!(
-        StreamCodec::from_u8(StreamCodec::Av1 as u8),
+        StreamCodec::from_u8(StreamCodec::H264 as u8),
+        Some(StreamCodec::H264)
+    );
+    assert_eq!(StreamCodec::from_u8(3), None);
+}
+
+#[test]
+fn hello_carries_a_codec_and_bitrate_request() {
+    let ClientControl::Hello(mut h) = hello() else {
+        unreachable!()
+    };
+    h.prefer_codec = Some(StreamCodec::H264);
+    h.max_bitrate_kbps = 45_000;
+    round_trip_client(ClientControl::Hello(h.clone()));
+    // The absent case (0xFF sentinel / 0) must round-trip too.
+    h.prefer_codec = None;
+    h.max_bitrate_kbps = 0;
+    round_trip_client(ClientControl::Hello(h));
+}
+
+#[test]
+fn negotiate_never_auto_selects_h264_over_an_hdr_codec() {
+    use super::negotiate_codec;
+    // Auto keeps HDR: AV1 first, then HEVC, and H.264 only as a sole offer.
+    assert_eq!(
+        negotiate_codec(None, codecs::AV1_MAIN10 | codecs::H264),
         Some(StreamCodec::Av1)
     );
-    assert_eq!(StreamCodec::from_u8(2), None);
+    assert_eq!(
+        negotiate_codec(None, codecs::HEVC_MAIN10 | codecs::H264),
+        Some(StreamCodec::Hevc)
+    );
+    assert_eq!(
+        negotiate_codec(None, codecs::H264),
+        Some(StreamCodec::H264),
+        "H.264 is taken only when it is all the client offers"
+    );
+    // Explicit preference picks H.264 when the client can decode it.
+    assert_eq!(
+        negotiate_codec(Some(StreamCodec::H264), codecs::H264 | codecs::HEVC_MAIN10),
+        Some(StreamCodec::H264)
+    );
+    // A pinned codec the client cannot decode is declined.
+    assert_eq!(
+        negotiate_codec(Some(StreamCodec::H264), codecs::AV1_MAIN10),
+        None
+    );
 }
 
 #[test]

@@ -17,7 +17,7 @@ use windows::Win32::UI::HiDpi::{
 use crate::dda::DdaCapture;
 use crate::tocuda::NvFbcCapture;
 use crate::wgc::WgcCapture;
-use crate::{Backend, Capture, CaptureError, default_backend};
+use crate::{Backend, Capture, CaptureError, OutputSelect, default_backend};
 
 /// The first Windows 11 build number.
 const WIN11_BUILD: u32 = 22000;
@@ -52,10 +52,17 @@ pub fn set_dpi_awareness() {
 /// `nvfbc_opt_in` selects NvFBC (falling through to the OS default if it is
 /// unavailable). `hdr` is a hint the NvFBC path uses to pick ARGB10 vs ARGB8;
 /// DDA and WGC detect HDR from the output themselves.
-pub fn build(nvfbc_opt_in: bool, hdr: bool) -> Result<Box<dyn Capture>, CaptureError> {
+pub fn build(
+    nvfbc_opt_in: bool,
+    force: Option<Backend>,
+    hdr: bool,
+    output: OutputSelect,
+) -> Result<Box<dyn Capture>, CaptureError> {
     set_dpi_awareness();
 
     if nvfbc_opt_in {
+        // NvFBC captures the primary desktop; it does not take an output
+        // selector, so a non-primary virtual display is a DDA/WGC path.
         match NvFbcCapture::new(hdr) {
             Ok(c) => return Ok(Box::new(c)),
             Err(e) => {
@@ -64,14 +71,21 @@ pub fn build(nvfbc_opt_in: bool, hdr: bool) -> Result<Box<dyn Capture>, CaptureE
         }
     }
 
-    let first = default_backend(is_win11(), false);
+    // A forced D3D11 backend (WGC/DDA) overrides the OS default; the other
+    // remains the fallback. NvFBC as a `force` is treated as the OS default here
+    // (the opt-in path above is how NvFBC is selected).
+    let first = match force {
+        Some(Backend::Wgc) => Backend::Wgc,
+        Some(Backend::Dda) => Backend::Dda,
+        _ => default_backend(is_win11(), false),
+    };
     let second = match first {
         Backend::Wgc => Backend::Dda,
         _ => Backend::Wgc,
     };
-    match build_one(first) {
+    match build_one(first, output) {
         Ok(c) => Ok(c),
-        Err(e1) => build_one(second).map_err(|e2| {
+        Err(e1) => build_one(second, output).map_err(|e2| {
             CaptureError::Backend(format!(
                 "both backends failed: {first:?}: {e1}; {second:?}: {e2}"
             ))
@@ -81,10 +95,10 @@ pub fn build(nvfbc_opt_in: bool, hdr: bool) -> Result<Box<dyn Capture>, CaptureE
 
 /// Construct one specific D3D11 backend. NvFBC is not a default and is not built
 /// here.
-fn build_one(backend: Backend) -> Result<Box<dyn Capture>, CaptureError> {
+fn build_one(backend: Backend, output: OutputSelect) -> Result<Box<dyn Capture>, CaptureError> {
     match backend {
-        Backend::Wgc => Ok(Box::new(WgcCapture::new()?)),
-        Backend::Dda => Ok(Box::new(DdaCapture::new()?)),
+        Backend::Wgc => Ok(Box::new(WgcCapture::new(output)?)),
+        Backend::Dda => Ok(Box::new(DdaCapture::new(output)?)),
         Backend::NvFbc => Err(CaptureError::Backend(
             "NvFBC is not a default backend".into(),
         )),

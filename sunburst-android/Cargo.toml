@@ -18,6 +18,10 @@ sunburst-net.workspace = true
 # For the modifier-bit contract (keymap::modifiers); cross-platform, its Windows
 # injector is gated off and not pulled in on Android.
 sunburst-input.workspace = true
+# The Opus decoder wrapper (codec module). Cross-platform: its WASAPI modules are
+# `#[cfg(windows)]` and pull nothing in on Android; only the pure codec + the
+# transpiled libopus come across.
+sunburst-audio.workspace = true
 # Used by the host-testable PIN module and the Android pairing path.
 getrandom = "0.4"
 
@@ -25,8 +29,12 @@ getrandom = "0.4"
 # crate compiles to an (empty) cdylib, so `cargo test`/clippy stay green while
 # the real client is built and cross-compiled for the two ABIs.
 [target.'cfg(target_os = "android")'.dependencies]
+# The Xbox pad driver. Android-only and `vendored`, so its C++/libusb are built
+# and linked into this cdylib (the first real link of the vendored driver); the
+# host build never sees it, and its own build.rs also gates on target_os=android.
+sunburst-gip-bridge = { workspace = true, features = ["vendored"] }
 jni = "0.21"
-ndk = { version = "0.9", features = ["media", "api-level-30"] }
+ndk = { version = "0.9", features = ["media", "audio", "api-level-30"] }
 ndk-sys = "0.6"
 ndk-context = "0.1"
 libc = "0.2"

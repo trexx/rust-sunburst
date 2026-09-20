@@ -17,6 +17,7 @@ const BLANK: AppEntry = {
     width: null,
     height: null,
     fps: null,
+    preset: null,
   },
 };
 
@@ -196,6 +197,46 @@ function Editor({
         />
       </label>
 
+      <p className="hint">
+        Overrides apply only while this app is the running one; blank inherits
+        the stream defaults.
+      </p>
+      <label>
+        Codec override
+        <select
+          value={draft.overrides.codec ?? ""}
+          onChange={(e) =>
+            set("overrides", {
+              ...draft.overrides,
+              codec: e.target.value === "" ? null : e.target.value,
+            })
+          }
+        >
+          <option value="">Inherit default</option>
+          <option value="auto">Auto</option>
+          <option value="hevc">HEVC (Main10)</option>
+          <option value="av1">AV1 (Main10)</option>
+          <option value="h264">H.264 (8-bit SDR)</option>
+        </select>
+      </label>
+      <label>
+        NVENC preset override
+        <select
+          value={draft.overrides.preset ?? ""}
+          onChange={(e) =>
+            set("overrides", {
+              ...draft.overrides,
+              preset: e.target.value === "" ? null : Number(e.target.value),
+            })
+          }
+        >
+          <option value="">Inherit default</option>
+          <option value={1}>P1 — fastest</option>
+          <option value={2}>P2</option>
+          <option value={3}>P3</option>
+          <option value={4}>P4 — highest quality</option>
+        </select>
+      </label>
       <label>
         Bitrate override (kbps)
         <input

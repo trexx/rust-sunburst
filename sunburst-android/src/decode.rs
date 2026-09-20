@@ -42,6 +42,7 @@ impl Decoder {
         let mime = match codec {
             StreamCodec::Hevc => "video/hevc",
             StreamCodec::Av1 => "video/av01",
+            StreamCodec::H264 => "video/avc",
         };
         let mut fmt = MediaFormat::new();
         fmt.set_str("mime", mime);

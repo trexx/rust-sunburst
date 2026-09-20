@@ -260,10 +260,37 @@ a 30-minute session.
 
 ## Phase 6 — Audio (1 week)
 
-- WASAPI loopback via `IAudioClient3` at minimum engine period.
-- Virtual sink so the host stays muted.
-- Opus encode; libopus via NDK on the client, Oboe/AAudio in low-latency mode.
-- A/V sync against the existing Phase 1 timestamps.
+**Status: landed, box-validation pending.** End to end: WASAPI loopback capture
++ Opus encode on the server, one Opus frame per unauthenticated packet on the
+wire, Opus decode + low-latency AAudio playback on the client. Host-tested where
+pure (the Opus codec wrapper round-trips, the PCM conversion/accumulator, the
+SPSC playback ring, the audio packet), `cargo xwin`-verified on Windows and
+built + clippy-linted on both Android ABIs. What remains is the box run —
+HARDWARE_TESTING §11.
+
+- **WASAPI loopback** via `IAudioClient3` on a **selectable** render endpoint:
+  the default endpoint (host audible) by default, or a named one — set
+  `StreamConfig.audio_device` to "Steam Streaming Speakers" to reuse Valve's
+  signed virtual sink and silence the host without a driver of our own. The
+  server injects silence during the endpoint's idle gaps so the cadence holds.
+- **Opus** at 48 kHz stereo, 5 ms frames, `RESTRICTED_LOWDELAY`, in-band FEC on.
+  The codec is `unsafe-libopus` (libopus transpiled to pure Rust) — chosen over
+  audiopus/CMake so it cross-compiles to Windows and both Android ABIs as plain
+  Rust. **No audio NACK:** FEC + PLC recover a lost packet more cheaply than a
+  retransmit.
+- **AAudio** `LowLatency`, fed from a lock-free PCM ring; underruns play silence.
+- **A/V sync** rides the existing Phase 1 timestamps: audio and video share the
+  server's performance-counter domain, and audio buffering is kept bounded (drop
+  the newest frame past a watermark, silence on underrun) so the offset cannot
+  drift without limit. The exact buffer target is a box-tuned number.
+- **Audio instrumentation:** two new `Stage` chains — capture/encode/send on the
+  server, recv/decode/play on the client — so audio latency is measurable
+  alongside video.
+
+**Deferred (defended):** a custom virtual-sink driver (the selectable Steam
+device covers host-mute), arbitrary sample-rate resampling (the endpoint is
+required at 48 kHz, warned otherwise), surround (stereo downmix), and
+microphone/return audio (server → client only).
 
 **Acceptance:** no drift over 30 minutes. Audio latency measured and reported
 alongside video.
@@ -274,13 +301,34 @@ alongside video.
 
 Ordered by value, not difficulty.
 
-- **Big Picture launch** — `steam://open/bigpicture` from the existing interactive
-  session helper. Win10 HDR global toggle around the session with restore on
-  disconnect. Game launch/exit detection for per-game bitrate profiles.
-- **IDD** — virtual display for client-native resolution and headless operation.
-  Solves resolution matching and HDR mode control cleanly. Requires an EV-signed
-  WDDM driver; strongly consider consuming an existing VDD (Parsec VDD, Virtual
-  Display Driver) rather than authoring one.
+**Status: landed, box-validation pending.** App launching already existed
+(`CreateProcess`/`ShellExecute` for `steam://`, `schtasks` autostart, prep/undo).
+This phase added the display integration that was missing and the optional
+virtual display:
+
+- **Native HDR + resolution control** (`sunburst-server/src/display.rs`),
+  replacing the fake `set-hdr` shell placeholder. A `DisplayGuard` created in
+  `session_start` toggles advanced color (HDR) via `DisplayConfigSetDeviceInfo` on
+  every active output, and — opt-in (`match_resolution`) — switches the primary
+  mode to the client's resolution via `ChangeDisplaySettingsExW`; its `Drop`
+  restores the exact prior state, so a disconnect **or an abnormal teardown**
+  puts the desktop back.
+- **Per-app profiles applied live.** `WebHandler::on_hello` resolves
+  `Config::effective(running_app)` and passes the bitrate/codec through
+  `StreamControl::session_start`, so a launched game's profile reaches the stream;
+  `WinHost::running_app` reaps an exited game (via `try_wait`) and undoes its prep.
+- **Optional virtual display**, consuming the MikeTheTech VDD (`virtual_display`,
+  off by default — the NvFBC posture). `display::VirtualDisplay` enables the
+  installed driver's device node via SetupAPI for the session and disables it on
+  drop; capture targets a chosen output (`capture_output`, DXGI output index)
+  through the new `OutputSelect` on both DDA and WGC. Absent driver ⇒ warn and
+  fall back to the physical display. We **consume** the VDD (device state +
+  capture only), never author or vendor a driver — no EV-signed WDDM work, no GPL
+  linkage, the ViGEmBus/HIDMaestro posture.
+
+What remains is the box run — HARDWARE_TESTING §12. The display and VDD code is
+`cargo xwin`-verified; behaviour (which output is the virtual one, the VDD's exact
+hardware id, HDR/mode restore) is confirmed on the 4070.
 - ~~**NvFBC**~~ — **moved to Phase 3** as an opt-in backend. Phase 0.1 unlocked
   it, made it GPU-resident via ToCuda and measured 0.86–0.94x DDA, which settles
   throughput and nothing else. It belongs beside the other backends rather than
@@ -303,61 +351,101 @@ Ordered by value, not difficulty.
 
 ---
 
-## Phase 8 — Xbox Wireless Adapter
+## Codecs — HEVC / AV1 / H.264
 
-Depends on Phase 5 and nothing else — not audio, not the optional capture
-backends — so it can be pulled ahead of Phases 6 and 7 at any point.
+**Status: H.264 landed, box-validation pending.** Alongside HEVC Main10 and AV1
+Main10 (the HDR codecs), the encoder gained **H.264 High, 8-bit SDR** — an
+opt-in, low-latency codec. NVENC has no 10-bit H.264, so it never carries HDR;
+`negotiate_codec` picks it only by explicit preference or as a client's sole
+offer, never over an HDR codec. It reuses the HEVC packetizer, sequence-header
+path and reference-invalidation `Window`; its one new piece is an 8-bit SDR
+convert (scRGB→NV12 BT.709, with an ACES HDR→SDR tonemap) on both the D3D11 and
+NvFBC paths, feeding NVENC NV12. See HARDWARE_TESTING §13. The NvFBC NV12 CUDA
+kernel ships as a no-op placeholder PTX until vendored, like the P010 kernel.
 
-The adapter (`045e:02e6`) is not a HID device. It is an MT7612U wireless chip
-that must be given firmware and have a radio brought up before it will speak to a
-pad at all. That half is ~6,500 lines in the xow/xone lineage; GIP itself is
-about 450.
+---
 
-- **Radio: vendored C++** behind a narrow FFI seam, per the same reasoning
-  CLAUDE.md applies to D3D11/NVENC. Proven against this exact adapter, and
-  unforgiving enough that a re-transcription reads as "the dongle does nothing".
-- **GIP: Rust, written from [MS-GIPUSB] v20240916** — not transcribed from
-  `gip.cpp`. The xow-derived code has four known defects against that spec
-  (rumble as a raw byte rather than a percentage, a sign-extension discontinuity
-  on the wired path, a dropped extended status message, and capabilities never
-  advertised). Transcribing reimports all four.
+## Phase 8 — Xbox Wireless Adapter — **landed** (dev-box-verified; hardware validation pending)
+
+Depended on Phase 5 and nothing else — not audio, not the optional capture
+backends. Shipped at its **maximal scope**: both transports — the Xbox **Wireless
+Adapter** (`045e:02e6`, MT7612U radio) and **wired** Xbox One/Series pads — up to
+**four pads**, buttons/sticks/triggers, **trigger rumble** (the impulse-trigger
+motors), **battery**, and **full-duplex headset audio** (server audio → the pad's
+headphones, and the pad mic → a Windows microphone, capped at two concurrent
+headsets). In-app pairing from the TV remote.
+
+**How it shipped — vendor, not rewrite.** The adapter is not a HID device: an
+MT7612U chip that must be given firmware and have a radio brought up before it
+speaks to a pad. A *hardware-validated* Android port of xow/xone already existed
+(`/home/turk/Git/moonlight-trexx`), and reading it corrected the original premise
+of this section. The GIP layer is **not ~450 lines** — it is **~6,100 lines** of
+GIP/controller/wired logic plus a byte-exact **RSA-PKCS#1v1.5 + ECDH-P256**
+security handshake (the exact thing `AUDIO.md` records costing four hardware
+iterations), on top of ~3,460 lines of radio C++ vendored either way. Rewriting
+that blind from the spec, with the pad-audio handshake unverifiable off-hardware,
+was the wrong first move. So the decision was **"vendor now, Rustify later"**:
+
+- **Vendored xow/xone C++** (MT7612U radio + GIP + wired + libusb) behind the new
+  **`sunburst-gip-bridge`** crate — a **C FFI seam Rust calls** (not the upstream
+  JNI), with a safe `Bridge` API and a pure-Rust **host stub** so everything but
+  the device is dev-box-verifiable. GPL-2-or-later; provenance in
+  `sunburst-gip-bridge/vendor/UPSTREAM.md`.
+- **GIP handshake crypto reimplemented in Rust** (`crypto.rs`, RustCrypto),
+  host-tested byte-exact to the reference — the first real step of the eventual
+  Rustification, and it removed the vendored driver's Java/mbedtls dependency.
 - **USB**: Kotlin holds `UsbManager` permission and passes
-  `UsbDeviceConnection.getFileDescriptor()` down; Rust wraps the fd. No JNI on
-  the input path.
+  `UsbDeviceConnection.getFileDescriptor()` down; Rust wraps the fd. No JNI on the
+  input path — Kotlin owns only the Activity, per CLAUDE.md.
 - **Firmware**: `FW_ACC_00U.bin`, fetched by `scripts/fetch-firmware.sh` at build
-  time and never committed. Needs `bsdtar` or `cabextract`.
-- **In-app pairing is required, not a nicety.** The physical pairing button on
-  the unit here is dead, and it must be reachable from the TV remote — needing a
-  working pad to pair a pad defeats the point.
+  time and never committed (needs `bsdtar`/`cabextract`); the embedded blob is not
+  vendored.
+- **The virtual mic is consumed, not authored**: the server renders the pad mic to
+  a signed "Steam Streaming Microphone" endpoint selected by name — the inbound
+  twin of the "Steam Streaming Speakers" reuse, no driver of ours.
 
-**Scope is set by what survives the pad boundary:** four pads, buttons, sticks,
-triggers, rumble. Motion, trigger rumble and battery-to-host are out where the
-emulated pad cannot express them. *(This section predates the Phase 2 driver
-reversal: the server now emulates via HIDMaestro device nodes rather than a
-ViGEm X360 pad, so the "X360 boundary" below is the conservative floor, not a
-hard ceiling — a native family can carry more. The MT7612U radio and the
-GIP-from-spec work stand unchanged.)*
+**The GIP-in-Rust goal is kept, re-scoped.** Rather than a blind-from-spec rewrite,
+it becomes a **captured-corpus follow-up**: once the vendored driver runs on
+hardware, record real GIP frames, rewrite the interpretation layer in Rust to
+reproduce that verified corpus plus `[MS-GIPUSB]`, and diff it against the C++
+on-device before swapping it in behind the same bridge seam. The four
+`[MS-GIPUSB]` defects the original plan meant to fix in-place (rumble-as-raw-byte,
+a wired sign-extension discontinuity, a dropped extended status message,
+unadvertised host capabilities) have been **audited and resolved** — the vendored
+moonlight-trexx port already fixed three, and the fourth is not a spec requirement
+(§1.7 capability negotiation is "None"); status per defect is in
+`sunburst-gip-bridge/vendor/UPSTREAM.md`. The pad mic now works on **every** audio
+route, including 'TV only': playback and mic capture share one headset-enablement
+gate (the ≤2-headset cap is on enabled headsets, not per direction), and the mic
+path enables a present headset itself rather than relying on playback. **The one
+remaining Phase 8 follow-up** is the GIP-in-Rust rewrite above (gated on a
+hardware-captured corpus).
 
-**Two routes past that boundary were measured and both closed**
-(`HARDWARE_TESTING.md` §8). **USB/IP** would have forwarded the adapter to
-Windows and let its own driver own it, deleting the radio and GIP work below —
-but `usbip-win2` 0.9.8.0 cannot carry the Xbox GIP protocol: a wired Xbox One
-pad fails the same way in both receive modes, with the Windows driver resetting
-the interrupt pipe until it gives up and resets the device. The adapter is a
-strictly harder case. Revisit only if upstream fixes GIP; it is not a plan.
-**HIDMaestro** reaches WGI/GameInput with byte-exact identity. Its internals are
-not a contract, but its .NET SDK *is*, and that can be hosted from Rust — a
-NativeAOT shim with `[UnmanagedCallersOnly]` exports, or `netcorehost`. That is
-now the credible route past the ceiling with the pad still presenting as an Xbox
-pad; the DS4 target is the other, at the cost of games seeing a DualShock. The
-gate on the hosted route is measuring per-frame managed allocation
-(`HMGamepadState` carries an axes dictionary) before any shim is written. The
-6,950 lines below stand either way. Battery can still be shown client-side. Pad
-headphone audio depends on Phase 6 and is a separate decision.
+*(The old "X360 boundary" caveat is moot: the Phase 2 driver reversal emulates via
+HIDMaestro device nodes, not a ViGEm X360 pad, and trigger rumble + battery in fact
+landed.)*
 
-**Acceptance:** four pads pair and play simultaneously through Big Picture.
-Rumble arrives and stops cleanly, including when the stop packet is lost. Input
-latency is measured against a directly-connected pad and the difference reported.
+**Two alternatives to vendoring the adapter were measured and both closed**
+(`HARDWARE_TESTING.md` §8). **USB/IP** would have forwarded the adapter to Windows
+and let its own driver own it, deleting the vendored radio and GIP entirely — but
+`usbip-win2` 0.9.8.0 cannot carry the Xbox GIP protocol: a wired Xbox One pad
+fails the same way in both receive modes, with the Windows driver resetting the
+interrupt pipe until it gives up and resets the device. The adapter is a strictly
+harder case. Revisit only if upstream fixes GIP; it is not a plan. **HIDMaestro**
+reaches WGI/GameInput with byte-exact identity; its .NET SDK can be hosted from
+Rust (a NativeAOT shim with `[UnmanagedCallersOnly]` exports, or `netcorehost`).
+That is orthogonal to this phase — it is the route past the *server-side emulated-
+pad* ceiling should a native family ever need to express more than what shipped;
+the DS4 target is the other, at the cost of games seeing a DualShock. Gated on
+measuring per-frame managed allocation (`HMGamepadState` carries an axes
+dictionary) first. Neither bears on the vendored bridge, which stands either way.
+
+**Acceptance (hardware, pending the box — `HARDWARE_TESTING.md` §15):** four pads
+pair and play simultaneously through Big Picture, wired and via the adapter;
+rumble incl. the trigger motors arrives and stops cleanly, including when the stop
+packet is lost; battery shows per pad; a headset plays server audio and its mic
+reaches the server's virtual microphone; input latency is measured against a
+directly-connected pad and the difference reported.
 
 ---
 

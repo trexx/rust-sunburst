@@ -29,6 +29,11 @@ pub enum PacketType {
     /// Server→client rich pad output — motors, adaptive triggers, LED (see
     /// [`super::padoutput`]). Unreliable, latest-wins, like [`PacketType::Rumble`].
     PadOutput = 7,
+    /// Client→server audio — a paired pad's headset microphone, the mirror of
+    /// [`PacketType::Audio`]. Unauthenticated for the same reason as `Audio`:
+    /// it is media, LAN-only, and the threat model does not justify per-packet
+    /// key management (unlike input/control, which make the server *act*).
+    AudioIn = 8,
 }
 
 impl PacketType {
@@ -42,6 +47,7 @@ impl PacketType {
             5 => PacketType::Feedback,
             6 => PacketType::Rumble,
             7 => PacketType::PadOutput,
+            8 => PacketType::AudioIn,
             _ => return None,
         })
     }
@@ -193,7 +199,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_packet_type() {
         let mut buf = [0u8; HEADER_LEN];
-        buf[0] = 8; // one past PadOutput
+        buf[0] = 9; // one past AudioIn
         assert_eq!(Header::decode(&buf), None);
         assert_eq!(PacketType::from_u8(255), None);
     }
@@ -226,6 +232,7 @@ mod tests {
         assert!(PacketType::PadOutput.is_authenticated());
         assert!(!PacketType::Video.is_authenticated());
         assert!(!PacketType::Audio.is_authenticated());
+        assert!(!PacketType::AudioIn.is_authenticated());
     }
 
     #[test]

@@ -8,7 +8,9 @@
 //! [`GamepadState`], mouse deltas and wheel to their events. Keyboard/gamepad
 //! routing is Kotlin's job (it knows the event source); this maps each stream.
 
-use sunburst_core::proto::input::{GamepadState, InputEvent, MouseButton, MouseMotion, buttons};
+use sunburst_core::proto::input::{
+    GamepadState, InputEvent, MAX_PADS, MouseButton, MouseMotion, buttons,
+};
 use sunburst_input::keymap::modifiers;
 
 /// A raw Android event, before mapping. Floats are Android's normalised axis
@@ -45,6 +47,15 @@ pub enum ClientInput {
         rt: f32,
         hat_x: f32,
         hat_y: f32,
+    },
+    /// A fully-decoded pad from the GIP bridge (an Xbox pad on the adapter or
+    /// wired USB). Unlike `PadButton`/`PadAxis`, which arrive as incremental
+    /// Android View events for the single TV-native pad, this carries the whole
+    /// `GamepadState` for a specific `index`, so the accumulator just stamps the
+    /// index and forwards it.
+    Pad {
+        index: u8,
+        state: GamepadState,
     },
 }
 
@@ -172,9 +183,24 @@ pub fn trigger_to_u8(v: f32) -> u8 {
 
 /// Accumulates gamepad state across button/axis events so each change emits a
 /// full [`GamepadState`]; other events map one-to-one.
-#[derive(Default)]
+///
+/// One slot per pad index. The Android-View pad (`PadButton`/`PadAxis`, a
+/// controller paired directly to the TV) accumulates into slot 0; the GIP bridge
+/// delivers whole states via [`ClientInput::Pad`] into their own slots, so up to
+/// [`MAX_PADS`] controllers stay independent.
+#[derive(Debug)]
 pub struct InputAccumulator {
-    pad: GamepadState,
+    pads: [GamepadState; MAX_PADS as usize],
+}
+
+impl Default for InputAccumulator {
+    fn default() -> InputAccumulator {
+        let mut pads = [GamepadState::default(); MAX_PADS as usize];
+        for (i, p) in pads.iter_mut().enumerate() {
+            p.pad_index = i as u8;
+        }
+        InputAccumulator { pads }
+    }
 }
 
 impl InputAccumulator {
@@ -211,12 +237,13 @@ impl InputAccumulator {
             }),
             ClientInput::PadButton { code, down } => {
                 let bit = android_button_to_xinput(code)?;
+                let pad = &mut self.pads[0];
                 if down {
-                    self.pad.buttons |= bit;
+                    pad.buttons |= bit;
                 } else {
-                    self.pad.buttons &= !bit;
+                    pad.buttons &= !bit;
                 }
-                Some(InputEvent::Gamepad(self.pad))
+                Some(InputEvent::Gamepad(*pad))
             }
             ClientInput::PadAxis {
                 lx,
@@ -228,30 +255,39 @@ impl InputAccumulator {
                 hat_x,
                 hat_y,
             } => {
-                self.pad.lx = stick_to_i16(lx);
+                let pad = &mut self.pads[0];
+                pad.lx = stick_to_i16(lx);
                 // Android Y is down-positive; XInput up-positive.
-                self.pad.ly = stick_to_i16(-ly);
-                self.pad.rx = stick_to_i16(rx);
-                self.pad.ry = stick_to_i16(-ry);
-                self.pad.lt = trigger_to_u8(lt);
-                self.pad.rt = trigger_to_u8(rt);
+                pad.ly = stick_to_i16(-ly);
+                pad.rx = stick_to_i16(rx);
+                pad.ry = stick_to_i16(-ry);
+                pad.lt = trigger_to_u8(lt);
+                pad.rt = trigger_to_u8(rt);
                 // The hat axes carry the d-pad on many pads; fold into the bits.
                 let dpad = buttons::DPAD_UP
                     | buttons::DPAD_DOWN
                     | buttons::DPAD_LEFT
                     | buttons::DPAD_RIGHT;
-                self.pad.buttons &= !dpad;
+                pad.buttons &= !dpad;
                 if hat_y < -0.5 {
-                    self.pad.buttons |= buttons::DPAD_UP;
+                    pad.buttons |= buttons::DPAD_UP;
                 } else if hat_y > 0.5 {
-                    self.pad.buttons |= buttons::DPAD_DOWN;
+                    pad.buttons |= buttons::DPAD_DOWN;
                 }
                 if hat_x < -0.5 {
-                    self.pad.buttons |= buttons::DPAD_LEFT;
+                    pad.buttons |= buttons::DPAD_LEFT;
                 } else if hat_x > 0.5 {
-                    self.pad.buttons |= buttons::DPAD_RIGHT;
+                    pad.buttons |= buttons::DPAD_RIGHT;
                 }
-                Some(InputEvent::Gamepad(self.pad))
+                Some(InputEvent::Gamepad(*pad))
+            }
+            ClientInput::Pad { index, state } => {
+                // The bridge already decoded a whole state; a slot out of range
+                // is dropped rather than clamped, so a bug cannot cross pads.
+                let slot = self.pads.get_mut(index as usize)?;
+                *slot = state;
+                slot.pad_index = index;
+                Some(InputEvent::Gamepad(*slot))
             }
         }
     }
@@ -369,6 +405,63 @@ mod tests {
         assert!((s.lt as i32 - 127).abs() <= 1);
         assert_eq!(s.buttons & buttons::DPAD_LEFT, buttons::DPAD_LEFT);
         assert_eq!(s.buttons & buttons::DPAD_UP, buttons::DPAD_UP);
+    }
+
+    #[test]
+    fn bridge_pads_are_independent_and_keep_their_index() {
+        let mut acc = InputAccumulator::new();
+
+        // Two GIP-decoded pads at different indices.
+        let mut p1 = GamepadState {
+            buttons: buttons::A,
+            lt: 200,
+            ..Default::default()
+        };
+        p1.pad_index = 99; // deliberately wrong; the accumulator must restamp it
+        let e1 = acc.apply(ClientInput::Pad {
+            index: 1,
+            state: p1,
+        });
+        let Some(InputEvent::Gamepad(s1)) = e1 else {
+            panic!("expected a gamepad event")
+        };
+        assert_eq!(s1.pad_index, 1, "the slot index wins over the payload's");
+        assert_eq!(s1.buttons & buttons::A, buttons::A);
+
+        let p3 = GamepadState {
+            buttons: buttons::B,
+            ..Default::default()
+        };
+        let e3 = acc.apply(ClientInput::Pad {
+            index: 3,
+            state: p3,
+        });
+        let Some(InputEvent::Gamepad(s3)) = e3 else {
+            panic!("expected a gamepad event")
+        };
+        assert_eq!(s3.pad_index, 3);
+        assert_eq!(s3.buttons, buttons::B, "pad 3 is not polluted by pad 1");
+
+        // The TV-native path is pad 0, distinct from the bridge pads.
+        let e0 = acc
+            .apply(ClientInput::PadButton {
+                code: 96,
+                down: true,
+            })
+            .unwrap();
+        let InputEvent::Gamepad(s0) = e0 else {
+            panic!()
+        };
+        assert_eq!(s0.pad_index, 0);
+
+        // An index past MAX_PADS is dropped, never clamped onto another pad.
+        assert_eq!(
+            acc.apply(ClientInput::Pad {
+                index: MAX_PADS,
+                state: GamepadState::default(),
+            }),
+            None
+        );
     }
 
     #[test]

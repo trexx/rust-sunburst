@@ -237,12 +237,23 @@ pub struct Hello {
     /// server chooses among these; a client never receives a codec it did not
     /// offer.
     pub codecs: u8,
+    /// The codec the client *requests*, if the user picked one on the device.
+    /// `None` = no preference (the server decides). The server honours it when
+    /// the client can also decode it, taking precedence over the server's
+    /// global default; it can never yield a codec absent from `codecs`.
+    pub prefer_codec: Option<StreamCodec>,
+    /// A client-requested bitrate ceiling in kbps, or `0` for no client limit.
+    /// The server only ever lowers its target by this, never raises it.
+    pub max_bitrate_kbps: u32,
 }
 
 /// Bits of [`Hello::codecs`].
 pub mod codecs {
     pub const HEVC_MAIN10: u8 = 1 << 0;
     pub const AV1_MAIN10: u8 = 1 << 1;
+    /// H.264 High profile, 8-bit. SDR only (NVENC H.264 has no 10-bit), so it is
+    /// a low-latency fallback, never an HDR path.
+    pub const H264: u8 = 1 << 2;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,6 +271,9 @@ pub enum StreamCodec {
     Hevc = 0,
     /// AV1 Main10, subdivided into tiles. The Homatics' codec.
     Av1 = 1,
+    /// H.264 High profile, 8-bit SDR. A low-latency, opt-in fallback — HDR stays
+    /// on HEVC/AV1. Subdivided into slices, like HEVC.
+    H264 = 2,
 }
 
 impl StreamCodec {
@@ -267,6 +281,7 @@ impl StreamCodec {
         match v {
             0 => Some(StreamCodec::Hevc),
             1 => Some(StreamCodec::Av1),
+            2 => Some(StreamCodec::H264),
             _ => None,
         }
     }
@@ -276,6 +291,7 @@ impl StreamCodec {
         match self {
             StreamCodec::Hevc => codecs::HEVC_MAIN10,
             StreamCodec::Av1 => codecs::AV1_MAIN10,
+            StreamCodec::H264 => codecs::H264,
         }
     }
 }
@@ -285,13 +301,16 @@ impl StreamCodec {
 ///
 /// A pinned preference the client cannot decode yields `None` — the server
 /// declines rather than sending a stream that will not play. Auto takes AV1 when
-/// offered (it is the more efficient of the two), else HEVC.
+/// offered (it is the more efficient of the two), else HEVC, and only falls to
+/// H.264 when the client offers nothing else — auto never chooses H.264 over an
+/// HDR-capable codec, because H.264 here is 8-bit SDR.
 pub fn negotiate_codec(prefer: Option<StreamCodec>, client_codecs: u8) -> Option<StreamCodec> {
     let has = |c: StreamCodec| client_codecs & c.hello_bit() != 0;
     match prefer {
         Some(c) => has(c).then_some(c),
         None if has(StreamCodec::Av1) => Some(StreamCodec::Av1),
         None if has(StreamCodec::Hevc) => Some(StreamCodec::Hevc),
+        None if has(StreamCodec::H264) => Some(StreamCodec::H264),
         None => None,
     }
 }
@@ -310,6 +329,24 @@ pub struct HdrMastering {
     pub max_fall: u16,
 }
 
+/// Opus audio parameters for the session, present when the server streams sound.
+///
+/// Opus needs no per-stream codec-private blob — the decoder is configured from
+/// the sample rate and channel count alone — so there is no audio equivalent of
+/// [`ServerControl::CodecPrivate`]. `frame_samples` is the samples per channel
+/// in one packet (240 = 5 ms at 48 kHz), which fixes the packet cadence both
+/// ends pace against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AudioParams {
+    /// Sample rate in Hz. 48 000 in practice; see the 48 kHz endpoint note in
+    /// CLAUDE.md.
+    pub sample_rate: u32,
+    /// Channels: 2 (stereo) today.
+    pub channels: u8,
+    /// Samples per channel in one Opus packet.
+    pub frame_samples: u16,
+}
+
 /// Everything the client needs before the first frame arrives. Sent reliably,
 /// once per session, signed with the pairing key because it carries the nonce
 /// the session key is derived from.
@@ -325,6 +362,8 @@ pub struct SessionConfig {
     pub bitrate_kbps: u32,
     /// Present when the stream is HDR (scRGB capture → BT.2020 PQ).
     pub hdr: Option<HdrMastering>,
+    /// Present when the server streams audio; `None` disables it for the session.
+    pub audio: Option<AudioParams>,
     /// What the server will actually do, given the quirks the client reported
     /// and what the encoder supports.
     pub intra_refresh: bool,
@@ -512,6 +551,9 @@ impl ClientControl {
                 b.extend_from_slice(&h.client_nonce);
                 b.extend_from_slice(&h.clock_offset_ns.to_le_bytes());
                 b.push(h.codecs);
+                // 0xFF = no codec preference; else the StreamCodec wire value.
+                b.push(h.prefer_codec.map_or(0xFF, |c| c as u8));
+                b.extend_from_slice(&h.max_bitrate_kbps.to_le_bytes());
             }
             ClientControl::Quirks(q) => {
                 b.push(q.flags());
@@ -577,6 +619,11 @@ impl ClientControl {
                 client_nonce: r.array::<NONCE_LEN>()?,
                 clock_offset_ns: r.u64()? as i64,
                 codecs: r.u8()?,
+                prefer_codec: match r.u8()? {
+                    0xFF => None,
+                    v => StreamCodec::from_u8(v),
+                },
+                max_bitrate_kbps: r.u32()?,
             }),
             ClientMessage::DecoderQuirks => {
                 ClientControl::Quirks(DecoderQuirks::from_flags(r.u8()?, r.u32()?))
@@ -650,7 +697,8 @@ impl ServerControl {
                 b.extend_from_slice(&c.bitrate_kbps.to_le_bytes());
                 let flags = u8::from(c.hdr.is_some())
                     | u8::from(c.intra_refresh) << 1
-                    | u8::from(c.ref_invalidation) << 2;
+                    | u8::from(c.ref_invalidation) << 2
+                    | u8::from(c.audio.is_some()) << 3;
                 b.push(flags);
                 b.push(c.slices);
                 b.extend_from_slice(&c.server_nonce);
@@ -666,6 +714,11 @@ impl ServerControl {
                     b.extend_from_slice(&h.min_luminance.to_le_bytes());
                     b.extend_from_slice(&h.max_cll.to_le_bytes());
                     b.extend_from_slice(&h.max_fall.to_le_bytes());
+                }
+                if let Some(a) = &c.audio {
+                    b.extend_from_slice(&a.sample_rate.to_le_bytes());
+                    b.push(a.channels);
+                    b.extend_from_slice(&a.frame_samples.to_le_bytes());
                 }
             }
             ServerControl::CodecPrivate { codec, data } => {
@@ -762,6 +815,15 @@ impl ServerControl {
                 } else {
                     None
                 };
+                let audio = if flags & 8 != 0 {
+                    Some(AudioParams {
+                        sample_rate: r.u32()?,
+                        channels: r.u8()?,
+                        frame_samples: r.u16()?,
+                    })
+                } else {
+                    None
+                };
                 ServerControl::SessionConfig(SessionConfig {
                     session_id,
                     codec,
@@ -770,6 +832,7 @@ impl ServerControl {
                     fps_mhz,
                     bitrate_kbps,
                     hdr,
+                    audio,
                     intra_refresh: flags & 2 != 0,
                     ref_invalidation: flags & 4 != 0,
                     slices,

@@ -25,6 +25,10 @@ use crate::ivf::IvfWriter;
 
 pub struct StreamOpts {
     pub codecs: u8,
+    /// A codec the client *requests* (tests the server honouring it); `None` = none.
+    pub prefer_codec: Option<sunburst_core::proto::StreamCodec>,
+    /// A client bitrate ceiling in kbps; `0` = none.
+    pub max_bitrate_kbps: u32,
     pub out: Option<String>,
     pub drop_pct: u8,
     pub retransmit: bool,
@@ -64,6 +68,8 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
             client_nonce,
             clock_offset_ns: 0,
             codecs: opts.codecs,
+            prefer_codec: opts.prefer_codec,
+            max_bitrate_kbps: opts.max_bitrate_kbps,
         })
         .map_err(|e| e.to_string())?;
 
@@ -139,6 +145,9 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
     // Counters for the summary.
     let (mut delivered, mut keyframes, mut stepped, mut nacks, mut abandons, mut received) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    // Audio is server→client like video; fakeclient does not decode Opus, but it
+    // counts audio packets so the server's audio send path is provable off-box.
+    let mut audio_pkts = 0u64;
 
     while Instant::now() < end {
         match client.recv().map_err(|e| e.to_string())? {
@@ -194,6 +203,10 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
                     Accept::Ignored => {}
                 }
             }
+            Some(Inbound::Audio(_)) => audio_pkts += 1,
+            // The stub receiver has no pad to drive; count rumble/pad-output with
+            // the rest of the ignored control traffic.
+            Some(Inbound::Rumble(_)) | Some(Inbound::PadOutput(_)) => {}
             Some(Inbound::Control(_)) | Some(Inbound::Other) => {}
             None => client.tick().map_err(|e| e.to_string())?,
         }
@@ -266,7 +279,7 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
     collector.rotate();
     println!(
         "received {received}, delivered {delivered} ({keyframes} keyframes), \
-         stepped {stepped}, abandons {abandons}, nacks {nacks}"
+         stepped {stepped}, abandons {abandons}, nacks {nacks}, audio {audio_pkts}"
     );
     if let Some(f) = frames {
         println!("wrote {f} IVF frames");
