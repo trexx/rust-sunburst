@@ -365,7 +365,7 @@ kernel ships as a no-op placeholder PTX until vendored, like the P010 kernel.
 
 ---
 
-## Phase 8 — Xbox Wireless Adapter — **landed** (dev-box-verified; hardware validation pending)
+## Phase 8 — Xbox Wireless Adapter — **merged** (PR #2, `af2d876`; CI green) — hardware validation pending
 
 Depended on Phase 5 and nothing else — not audio, not the optional capture
 backends. Shipped at its **maximal scope**: both transports — the Xbox **Wireless
@@ -446,6 +446,38 @@ rumble incl. the trigger motors arrives and stops cleanly, including when the st
 packet is lost; battery shows per pad; a headset plays server audio and its mic
 reaches the server's virtual microphone; input latency is measured against a
 directly-connected pad and the difference reported.
+
+**Continuing on the 4070 box + real pads.** The dev-box work is merged; what is
+left needs the hardware. Sequence (the detailed checklist is `HARDWARE_TESTING.md`
+§15 — this is the setup path to it):
+
+1. **Server** — download the `sunburst-windows` artifact from the green `main` CI
+   run (its `package` job builds release `sunburst-server` + `fakeclient` + the web
+   UI), so nothing is compiled on the box; or `cargo build --release -p
+   sunburst-server -p fakeclient`. Start it (it autostarts via the scheduled task
+   once configured) and open the web UI.
+2. **Firmware** — on a build host run `scripts/fetch-firmware.sh` (needs `bsdtar`
+   or `cabextract`); it extracts `FW_ACC_00U.bin` into the gitignored assets path
+   so it ships inside the APK. Never committed.
+3. **Client APK** — `cd android && ./gradlew assembleDebug` (both ABIs), sideload
+   to the Shield (arm64-v8a) and the Homatics (armeabi-v7a), and pair each from the
+   TV. Attach the adapter or a wired pad; grant the `UsbManager` permission.
+4. **Consumed audio devices** — install Steam so its Remote Play virtual devices
+   exist, then set `audio_device` = "Steam Streaming Speakers" and (for the mic)
+   `mic_device` = "Steam Streaming Microphone" by name in the web UI. Big Picture is
+   the workload.
+5. **Run `HARDWARE_TESTING.md` §15** — the pad matrix end to end: wired One/Series
+   enumerate and play; the adapter loads firmware, brings up the radio, and pairs
+   from the remote; four pads at once; rumble incl. the trigger motors with
+   lost-stop self-heal; battery; headset both directions (≤2) at the negotiated
+   format (incl. the 24 kHz-mono mic → the Steam mic endpoint); input through a UAC
+   prompt and a lock/unlock; Steam Input characterised; latency vs a wired pad.
+6. **Record a GIP frame corpus** (the §15 step) — this is the gate for the **one
+   remaining follow-up, the GIP-in-Rust rewrite**: capture real input / rumble /
+   handshake / capture-render audio frames from the working driver, reimplement the
+   interpretation layer in Rust to reproduce that verified corpus plus
+   `[MS-GIPUSB]`, and diff it against the C++ on-device before swapping it in behind
+   the same `sunburst-gip-bridge` seam.
 
 ---
 
