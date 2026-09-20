@@ -47,7 +47,7 @@
 //! armed, only for those two kinds, and dropped silently otherwise. Those peers
 //! are tracked by address, because they have no identity yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -56,8 +56,9 @@ use sunburst_core::proto::padoutput::PAD_OUTPUT_MAX_BODY;
 use sunburst_core::proto::pairing::NONCE_LEN;
 use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
 use sunburst_core::proto::{
-    ClientControl, ClientMessage, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN, MAX_PAYLOAD,
-    PacketType, PadOutput, ReplayWindow, Rumble, Seq16, ServerControl, SessionKey,
+    ClientControl, ClientMessage, Feedback, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN,
+    MAX_PAYLOAD, Nack, PacketType, PadOutput, ReplayWindow, Rumble, Seq16, ServerControl,
+    SessionConfig, SessionKey,
 };
 
 use crate::handler::{ControlHandler, Outbound};
@@ -73,13 +74,50 @@ const IDLE_SECS: u64 = 120;
 /// Read timeout, which is also how often `tick` runs.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Which channel a packet arrived on, and therefore which key must verify it.
+///
+/// The reliable **control** channel stays on the long-lived pairing key: the
+/// message that establishes the session key (`SessionConfig`) travels it, so it
+/// cannot itself require that key, and the control messages are not the input
+/// path the session key exists to protect. **Data** — input, NACK, feedback —
+/// switches to the per-session key the moment one is installed, which is what
+/// makes a packet captured in one session fail in the next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Control,
+    Data,
+}
+
 /// An authenticated client. Survives a change of source address.
 struct Session {
-    key: SessionKey,
+    /// The long-lived key derived straight from the pairing secret. Verifies the
+    /// control channel and identifies the client on its first packet.
+    pairing_key: SessionKey,
+    /// The per-session key derived once `Hello` supplied the client nonce and
+    /// `SessionConfig` the server nonce. Once set, the data channel verifies
+    /// against this and the pairing key is no longer accepted for input.
+    session_key: Option<SessionKey>,
+    /// The client's handshake nonce, stashed from `Hello` so the session key can
+    /// be derived when `SessionConfig` is sent.
+    client_nonce: Option<[u8; NONCE_LEN]>,
     addr: SocketAddr,
     reliable: Reliable,
     replay: ReplayWindow,
     last_seen_ms: u64,
+    /// Control messages that did not fit the reliable window when produced;
+    /// drained in order as the window frees. A cursor bitmap is several chunks,
+    /// so a burst can exceed the window, and dropping a chunk would corrupt the
+    /// shape — the queue is what makes reliable delivery hold under a burst.
+    pending_out: VecDeque<ServerControl>,
+}
+
+impl Session {
+    /// The key the data channel (input, NACK, feedback, rumble, pad output)
+    /// signs and verifies with: the session key once installed, else the
+    /// pairing key for the window before `Hello` has completed.
+    fn data_key(&self) -> &SessionKey {
+        self.session_key.as_ref().unwrap_or(&self.pairing_key)
+    }
 }
 
 /// A peer that has not authenticated. Pairing only.
@@ -100,7 +138,13 @@ pub struct Endpoint<H: ControlHandler> {
 
 impl<H: ControlHandler> Endpoint<H> {
     pub fn bind(addr: SocketAddr, handler: H) -> io::Result<Endpoint<H>> {
-        let socket = UdpSocket::bind(addr)?;
+        Endpoint::from_socket(UdpSocket::bind(addr)?, handler)
+    }
+
+    /// Build on an already-bound socket, so the video send path can hold a clone
+    /// of the very same socket (one shared port). The caller clones before
+    /// handing the socket over.
+    pub fn from_socket(socket: UdpSocket, handler: H) -> io::Result<Endpoint<H>> {
         socket.set_read_timeout(Some(POLL_INTERVAL))?;
         Ok(Endpoint {
             socket,
@@ -179,63 +223,107 @@ impl<H: ControlHandler> Endpoint<H> {
         match header.packet_type {
             PacketType::Control => self.on_control(datagram, body, from),
             PacketType::Input => self.on_input(datagram, body, from),
-            // Video, audio, NACK, feedback and rumble have no handler until the
-            // phases that produce them. Dropping is the honest response; a
-            // placeholder would be a lie about what works.
+            PacketType::Nack => self.on_nack(datagram, header.frame_id, body, from),
+            PacketType::Feedback => self.on_feedback(datagram, body, from),
+            PacketType::AudioIn => self.on_audio_in(datagram, from),
+            // Video and audio flow the other way; rumble and pad output are
+            // server-originated. Nothing else is expected inbound.
             _ => {}
         }
     }
 
-    /// Identify the sender, scanning the paired keys if the address is new.
+    /// A pad's headset-mic Opus frame. Audio is unauthenticated (LAN, like the
+    /// outbound audio and video), so there is no MAC to verify; the sender is
+    /// attributed by source address to a client the endpoint already knows, and
+    /// dropped if the address is unrecognised — so a stray host cannot inject
+    /// microphone audio into a session it never joined.
+    fn on_audio_in(&mut self, datagram: &[u8], from: SocketAddr) {
+        let Some((pad_index, header, payload)) = crate::audio::parse_audio_in_packet(datagram)
+        else {
+            return;
+        };
+        let Some(&client) = self.by_addr.get(&from) else {
+            return;
+        };
+        self.handler
+            .on_audio_in(client, pad_index, header.frame_id, payload);
+    }
+
+    /// Identify the sender on `channel`, scanning the paired keys if the address
+    /// is new. On success the session's return address is updated, so a client
+    /// that reconnects from a new port keeps its replay window and its channel.
     ///
-    /// On success the session's return address is updated, so a client that
-    /// reconnects from a new port keeps its replay window and its channel.
-    fn authenticate(
-        &mut self,
-        datagram: &[u8],
-        from: SocketAddr,
-        hint: Option<u32>,
-    ) -> Option<u32> {
+    /// The channel decides which key may verify. Control always uses the pairing
+    /// key. Data uses the session key once one is installed and refuses the
+    /// pairing key thereafter — so a captured session-key packet fails in any
+    /// later session (the key differs) and a pairing-key packet cannot stand in
+    /// for input once the switch has happened.
+    fn authenticate(&mut self, datagram: &[u8], from: SocketAddr, channel: Channel) -> Option<u32> {
         let now_ms = self.now_ms();
 
+        // Fast path: an address already attributed to a client.
         if let Some(&client) = self.by_addr.get(&from)
             && let Some(session) = self.sessions.get_mut(&client)
-            && session.key.verify_packet(datagram).is_some()
         {
-            session.last_seen_ms = now_ms;
-            return Some(client);
+            match (channel, &session.session_key) {
+                (Channel::Data, Some(sk)) => {
+                    if sk.verify_packet(datagram).is_some() {
+                        session.last_seen_ms = now_ms;
+                        return Some(client);
+                    }
+                    // The session key is installed, so a data packet that does
+                    // not carry it is refused rather than falling back.
+                    return None;
+                }
+                _ => {
+                    if session.pairing_key.verify_packet(datagram).is_some() {
+                        session.last_seen_ms = now_ms;
+                        return Some(client);
+                    }
+                }
+            }
         }
 
-        let mut keys = self.handler.client_keys();
-        if let Some(want) = hint {
-            // Only reorders the scan. A wrong id costs one extra verification.
-            keys.sort_by_key(|(id, _)| *id != want);
-        }
-
-        for (client, key) in keys {
+        // Scan the pairing keys for a new or reconnecting address.
+        for (client, key) in self.handler.client_keys() {
             if key.verify_packet(datagram).is_none() {
                 continue;
+            }
+            // A pairing-key data packet for a client that has already switched is
+            // exactly the stand-in the switch forbids.
+            if channel == Channel::Data
+                && self
+                    .sessions
+                    .get(&client)
+                    .is_some_and(|sess| sess.session_key.is_some())
+            {
+                return None;
             }
 
             match self.sessions.get_mut(&client) {
                 Some(session) => {
                     // The same client from a different port. The replay window
-                    // and the reliable channel come with it — that is the whole
-                    // point of keying on the client.
+                    // comes with it — that is the point of keying on the client.
+                    // The old session key is dropped: a reconnect re-`Hello`s and
+                    // gets a fresh one, and a stale key must not linger.
                     self.by_addr.remove(&session.addr);
                     session.addr = from;
                     session.last_seen_ms = now_ms;
-                    session.key = key;
+                    session.pairing_key = key;
+                    session.session_key = None;
                 }
                 None => {
                     self.sessions.insert(
                         client,
                         Session {
-                            key,
+                            pairing_key: key,
+                            session_key: None,
+                            client_nonce: None,
                             addr: from,
                             reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
                             replay: ReplayWindow::new(),
                             last_seen_ms: now_ms,
+                            pending_out: VecDeque::new(),
                         },
                     );
                 }
@@ -254,14 +342,14 @@ impl<H: ControlHandler> Endpoint<H> {
 
         // Authenticated first. The unauthenticated pairing path is only reached
         // when no key verifies, and then only while armed.
-        if let Some(client) = self.authenticate(datagram, from, None) {
+        if let Some(client) = self.authenticate(datagram, from, Channel::Control) {
             let frame = &body[..body.len().saturating_sub(MAC_LEN)];
             let messages = {
                 let session = self.sessions.get_mut(&client).expect("just authenticated");
                 session.reliable.on_frame(frame)
             };
             for message in messages {
-                self.on_authenticated(&message, client, now);
+                self.on_authenticated(&message, client, from, now);
             }
             return;
         }
@@ -314,13 +402,29 @@ impl<H: ControlHandler> Endpoint<H> {
         }
     }
 
-    fn on_authenticated(&mut self, message: &[u8], client: u32, _now: u64) {
+    fn on_authenticated(&mut self, message: &[u8], client: u32, from: SocketAddr, _now: u64) {
         let Ok((decoded, _)) = ClientControl::decode(message) else {
             return;
         };
 
         match decoded {
-            ClientControl::Hello(hello) => self.handler.on_hello(client, hello),
+            ClientControl::Hello(hello) => {
+                // Stash the client nonce so the session key can be derived when
+                // the config is sent, then offer the session the handler returns.
+                if let Some(session) = self.sessions.get_mut(&client) {
+                    session.client_nonce = Some(hello.client_nonce);
+                }
+                if let Some(config) = self.handler.on_hello(client, from, hello) {
+                    self.offer_session(client, config);
+                }
+            }
+            ClientControl::Quirks(quirks) => self.handler.on_quirks(client, quirks),
+            ClientControl::RequestIdr => self.handler.on_request_idr(client),
+            ClientControl::Resize {
+                width,
+                height,
+                refresh_mhz,
+            } => self.handler.on_resize(client, width, height, refresh_mhz),
             ClientControl::ListApps => {
                 let apps = self.handler.on_app_list();
                 self.send_to_client(client, &ServerControl::AppList(apps));
@@ -352,7 +456,7 @@ impl<H: ControlHandler> Endpoint<H> {
     }
 
     fn on_input(&mut self, datagram: &[u8], body: &[u8], from: SocketAddr) {
-        let Some(client) = self.authenticate(datagram, from, None) else {
+        let Some(client) = self.authenticate(datagram, from, Channel::Data) else {
             return;
         };
 
@@ -373,29 +477,109 @@ impl<H: ControlHandler> Endpoint<H> {
         }
     }
 
+    /// A NACK: authenticate on the data channel, then hand the body (MAC
+    /// stripped) to the handler, which retransmits or invalidates.
+    fn on_nack(&mut self, datagram: &[u8], frame_id: Seq16, body: &[u8], from: SocketAddr) {
+        let Some(client) = self.authenticate(datagram, from, Channel::Data) else {
+            return;
+        };
+        let payload = &body[..body.len().saturating_sub(MAC_LEN)];
+        // Reject a malformed body rather than passing garbage on.
+        if Nack::decode(payload).is_none() {
+            return;
+        }
+        self.handler.on_nack(client, frame_id, payload);
+    }
+
+    /// A feedback report: authenticate on the data channel, decode, hand up.
+    fn on_feedback(&mut self, datagram: &[u8], body: &[u8], from: SocketAddr) {
+        let Some(client) = self.authenticate(datagram, from, Channel::Data) else {
+            return;
+        };
+        let payload = &body[..body.len().saturating_sub(MAC_LEN)];
+        if let Some(feedback) = Feedback::decode(payload) {
+            self.handler.on_feedback(client, feedback);
+        }
+    }
+
+    /// Sign, frame reliably, and send a `SessionConfig`, then install the derived
+    /// session key. The config is signed with the pairing key — the client has
+    /// not derived the session key yet, this is the message it derives it from —
+    /// and once it is out, input switches to the session key on both ends.
+    fn offer_session(&mut self, client: u32, config: SessionConfig) {
+        let _ = self.try_offer_session(client, config);
+    }
+
+    fn try_offer_session(&mut self, client: u32, config: SessionConfig) -> Option<()> {
+        let secret = self.handler.client_secret(client)?;
+        let encoded = ServerControl::SessionConfig(config.clone()).encode().ok()?;
+        let now_ms = self.now_ms();
+
+        let (addr, frame, pairing_key, client_nonce) = {
+            let session = self.sessions.get_mut(&client)?;
+            let cn = session.client_nonce?;
+            // The window is empty at session start, so this does not block; if it
+            // somehow did, dropping is correct — the client re-`Hello`s.
+            let frame = session.reliable.send(&encoded, now_ms).ok()?;
+            (session.addr, frame, session.pairing_key.clone(), cn)
+        };
+
+        self.transmit(addr, &frame, Some(&pairing_key), PacketType::Control);
+
+        let session = self.sessions.get_mut(&client)?;
+        session.session_key = Some(SessionKey::derive(
+            &secret,
+            &client_nonce,
+            &config.server_nonce,
+        ));
+        Some(())
+    }
+
     fn forget(&mut self, client: u32) {
+        self.handler.session_stop(client);
         if let Some(session) = self.sessions.remove(&client) {
             self.by_addr.remove(&session.addr);
         }
     }
 
     fn send_to_client(&mut self, client: u32, message: &ServerControl) {
-        let Ok(encoded) = message.encode() else {
-            return;
-        };
-        let now_ms = self.now_ms();
+        if let Some(session) = self.sessions.get_mut(&client) {
+            session.pending_out.push_back(message.clone());
+        }
+        self.flush_control(client);
+    }
 
+    /// Send as many queued control messages as the reliable window allows, in
+    /// order. Stops at the first `WouldBlock`; `tick` retries as the window
+    /// frees. Control is signed with the pairing key throughout (see `Channel`).
+    fn flush_control(&mut self, client: u32) {
+        let now_ms = self.now_ms();
         let Some(session) = self.sessions.get_mut(&client) else {
             return;
         };
         let addr = session.addr;
-        let key = session.key.clone();
-        // A full window or an oversized message is a bug on this side, not
-        // something the peer can fix by waiting.
-        let Ok(frame) = session.reliable.send(&encoded, now_ms) else {
-            return;
-        };
-        self.transmit(addr, &frame, Some(&key), PacketType::Control);
+        let key = session.pairing_key.clone();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        while let Some(message) = session.pending_out.front() {
+            let Ok(encoded) = message.encode() else {
+                // Unencodable is our bug, not the peer's; drop it and move on.
+                session.pending_out.pop_front();
+                continue;
+            };
+            match session.reliable.send(&encoded, now_ms) {
+                Ok(frame) => {
+                    frames.push(frame);
+                    session.pending_out.pop_front();
+                }
+                Err(ReliableError::WouldBlock) => break,
+                Err(_) => {
+                    session.pending_out.pop_front();
+                }
+            }
+        }
+        for frame in frames {
+            self.transmit(addr, &frame, Some(&key), PacketType::Control);
+        }
     }
 
     fn send_pending(&mut self, to: SocketAddr, message: &ServerControl) {
@@ -446,7 +630,12 @@ impl<H: ControlHandler> Endpoint<H> {
         if rumble.encode(&mut body).is_none() {
             return;
         }
-        self.transmit(session.addr, &body, Some(&session.key), PacketType::Rumble);
+        self.transmit(
+            session.addr,
+            &body,
+            Some(session.data_key()),
+            PacketType::Rumble,
+        );
     }
 
     /// Send one rich pad-output packet, unreliably (`type=7`, authenticated).
@@ -462,7 +651,7 @@ impl<H: ControlHandler> Endpoint<H> {
         self.transmit(
             session.addr,
             &body[..n],
-            Some(&session.key),
+            Some(session.data_key()),
             PacketType::PadOutput,
         );
     }
@@ -498,7 +687,7 @@ impl<H: ControlHandler> Endpoint<H> {
             match session.reliable.tick(now_ms) {
                 Ok(frames) => {
                     for frame in frames {
-                        send.push((session.addr, frame, Some(session.key.clone())));
+                        send.push((session.addr, frame, Some(session.pairing_key.clone())));
                     }
                 }
                 Err(ReliableError::PeerGone) => drop_clients.push(*client),
@@ -525,6 +714,11 @@ impl<H: ControlHandler> Endpoint<H> {
         for (addr, frame, key) in send {
             self.transmit(addr, &frame, key.as_ref(), PacketType::Control);
         }
+        // Push out anything that was waiting on window space.
+        let clients: Vec<u32> = self.sessions.keys().copied().collect();
+        for client in clients {
+            self.flush_control(client);
+        }
         for client in drop_clients {
             self.forget(client);
         }
@@ -541,8 +735,44 @@ pub struct ClientEndpoint {
     pub socket: UdpSocket,
     pub server: SocketAddr,
     pub reliable: Reliable,
+    /// Verifies incoming control and signs outgoing control. For a test with a
+    /// fixed key and no handshake, this is that key; for a real client it is the
+    /// pairing key.
     pub key: Option<SessionKey>,
+    /// The raw pairing secret, kept so the session key can be derived when
+    /// `SessionConfig` arrives. Set by [`connect_paired`](Self::connect_paired).
+    secret: Option<[u8; 32]>,
+    /// The nonce sent in the last `Hello`, half of the session-key input.
+    client_nonce: Option<[u8; NONCE_LEN]>,
+    /// Signs outgoing input/NACK/feedback once `SessionConfig` has arrived. Until
+    /// then those use [`key`](Self::key), matching the server's data channel.
+    session_key: Option<SessionKey>,
+    /// Control messages decoded from a single datagram but not yet returned:
+    /// one reliable frame can carry several, and [`recv`](Self::recv) hands them
+    /// out one at a time.
+    pending_control: VecDeque<ServerControl>,
     origin: Instant,
+}
+
+/// One thing that arrived on the client's socket, demultiplexed by packet type.
+#[derive(Debug)]
+pub enum Inbound {
+    /// A decoded, authenticated control message.
+    Control(ServerControl),
+    /// A raw video packet (header included), for the reassembler to decode.
+    Video(Vec<u8>),
+    /// A raw audio packet (header included), for [`parse_audio_packet`](crate::parse_audio_packet)
+    /// and the Opus decoder. Unauthenticated, like video.
+    Audio(Vec<u8>),
+    /// A decoded, authenticated rumble frame — motor levels (incl. the Xbox
+    /// trigger motors) for a pad the client drives.
+    Rumble(Rumble),
+    /// A decoded, authenticated rich pad-output frame — motors, adaptive
+    /// triggers, and LED for a pad the client drives.
+    PadOutput(PadOutput),
+    /// Anything the receiver ignores (an unknown type, or a frame that failed to
+    /// authenticate or decode).
+    Other,
 }
 
 impl ClientEndpoint {
@@ -559,8 +789,52 @@ impl ClientEndpoint {
             server,
             reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
             key,
+            secret: None,
+            client_nonce: None,
+            session_key: None,
+            pending_control: VecDeque::new(),
             origin: Instant::now(),
         })
+    }
+
+    /// Connect with the raw pairing secret, so the client can complete the
+    /// session-key handshake: control is signed with the pairing key, and once
+    /// `SessionConfig` arrives (see [`recv_control`](Self::recv_control)) input
+    /// switches to the derived session key.
+    pub fn connect_paired(server: SocketAddr, secret: [u8; 32]) -> io::Result<ClientEndpoint> {
+        let mut client = ClientEndpoint::connect(server, Some(SessionKey::from_bytes(secret)))?;
+        client.secret = Some(secret);
+        Ok(client)
+    }
+
+    /// Send `Hello`, remembering its nonce so the session key can be derived
+    /// from the `SessionConfig` that answers it.
+    pub fn send_hello(&mut self, hello: sunburst_core::proto::Hello) -> io::Result<()> {
+        self.client_nonce = Some(hello.client_nonce);
+        self.send_control(&ClientControl::Hello(hello))
+    }
+
+    /// The key outgoing input/NACK/feedback are signed with: the session key
+    /// once installed, else the control key.
+    fn data_key(&self) -> Option<&SessionKey> {
+        self.session_key.as_ref().or(self.key.as_ref())
+    }
+
+    /// Send a NACK for `frame_id`. Empty `missing` abandons the frame.
+    pub fn send_nack(&self, frame_id: Seq16, missing: &[u16]) -> io::Result<()> {
+        let mut body = [0u8; MAX_PAYLOAD];
+        let n = sunburst_core::proto::Nack::encode(missing, &mut body)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many NACK indices"))?;
+        self.transmit_data(PacketType::Nack, frame_id, &body[..n])
+    }
+
+    /// Send a feedback report.
+    pub fn send_feedback(&self, feedback: &Feedback) -> io::Result<()> {
+        let mut body = [0u8; sunburst_core::proto::FEEDBACK_BODY_LEN];
+        let n = feedback
+            .encode(&mut body)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "feedback body"))?;
+        self.transmit_data(PacketType::Feedback, Seq16(0), &body[..n])
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -588,14 +862,56 @@ impl ClientEndpoint {
         let n = packet
             .encode(&mut body)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input body too large"))?;
-        self.transmit(PacketType::Input, &body[..n])
+        self.transmit_data(PacketType::Input, Seq16(0), &body[..n])
     }
 
+    /// Send one pad-mic Opus frame (`AudioIn`, tagged with `pad_index`). Like
+    /// the video/audio the server sends this way, it is **unauthenticated** —
+    /// media rides the LAN without a MAC — so it carries no key; the server
+    /// attributes it by source address, which is why it goes out this socket.
+    /// `qpc` is the frame's capture-time tick counter, low 32 bits.
+    pub fn send_audio_in(
+        &self,
+        pad_index: u8,
+        seq: Seq16,
+        qpc: u32,
+        opus: &[u8],
+    ) -> io::Result<()> {
+        let mut buf = [0u8; crate::audio::MAX_AUDIO_PACKET];
+        let n = crate::audio::encode_audio_in_packet(pad_index, seq, qpc, opus, &mut buf)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "audio-in body too large")
+            })?;
+        self.socket.send_to(&buf[..n], self.server)?;
+        Ok(())
+    }
+
+    /// Send a control packet, signed with the control key.
     fn transmit(&self, packet_type: PacketType, body: &[u8]) -> io::Result<()> {
+        self.emit(packet_type, Seq16(0), body, self.key.as_ref())
+    }
+
+    /// Send a data packet (input/NACK/feedback), signed with the data key.
+    fn transmit_data(
+        &self,
+        packet_type: PacketType,
+        frame_id: Seq16,
+        body: &[u8],
+    ) -> io::Result<()> {
+        self.emit(packet_type, frame_id, body, self.data_key())
+    }
+
+    fn emit(
+        &self,
+        packet_type: PacketType,
+        frame_id: Seq16,
+        body: &[u8],
+        key: Option<&SessionKey>,
+    ) -> io::Result<()> {
         let header = Header {
             packet_type,
             flags: Flags::EMPTY,
-            frame_id: Seq16(0),
+            frame_id,
             qpc_timestamp: 0,
             pkt_idx: 0,
             pkt_count: 1,
@@ -603,7 +919,7 @@ impl ClientEndpoint {
         let mut datagram = vec![0u8; HEADER_LEN];
         header.encode((&mut datagram[..]).try_into().expect("HEADER_LEN bytes"));
         datagram.extend_from_slice(body);
-        if let Some(key) = &self.key {
+        if let Some(key) = key {
             key.sign_packet(&mut datagram);
         }
         self.socket.send_to(&datagram, self.server)?;
@@ -644,10 +960,96 @@ impl ClientEndpoint {
 
         for message in self.reliable.on_frame(body) {
             if let Ok((decoded, _)) = ServerControl::decode(&message) {
+                // The handshake's other half: derive the same session key the
+                // server installed, so input switches to it from here on.
+                if let ServerControl::SessionConfig(config) = &decoded
+                    && let (Some(secret), Some(cn)) = (self.secret, self.client_nonce)
+                {
+                    self.session_key = Some(SessionKey::derive(&secret, &cn, &config.server_nonce));
+                }
                 return Ok(Some(decoded));
             }
         }
         Ok(None)
+    }
+
+    /// Receive one datagram and demultiplex it: a control message (verified and
+    /// framed like [`recv_control`](Self::recv_control), switching the session
+    /// key on `SessionConfig`), a raw video packet for the reassembler, or
+    /// something the stub receiver ignores. `None` on the read timeout.
+    ///
+    /// Control frames can carry several messages; the extras are queued and
+    /// returned by later calls before the socket is read again.
+    pub fn recv(&mut self) -> io::Result<Option<Inbound>> {
+        if let Some(msg) = self.pending_control.pop_front() {
+            return Ok(Some(Inbound::Control(msg)));
+        }
+        let mut buf = [0u8; HEADER_LEN + MAX_PAYLOAD];
+        let len = match self.socket.recv(&mut buf) {
+            Ok(len) => len,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let datagram = &buf[..len];
+        let Some(header) = Header::decode(datagram) else {
+            return Ok(Some(Inbound::Other));
+        };
+
+        match header.packet_type {
+            PacketType::Video => Ok(Some(Inbound::Video(datagram.to_vec()))),
+            // Audio is unauthenticated, like video: hand the raw datagram up for
+            // the Opus decoder with no MAC to verify.
+            PacketType::Audio => Ok(Some(Inbound::Audio(datagram.to_vec()))),
+            PacketType::Control => {
+                let mut body = &datagram[HEADER_LEN..];
+                if let Some(key) = &self.key {
+                    match key.verify_packet(datagram) {
+                        Some(_) => body = &body[..body.len().saturating_sub(MAC_LEN)],
+                        None => return Ok(Some(Inbound::Other)),
+                    }
+                }
+                for message in self.reliable.on_frame(body) {
+                    if let Ok((decoded, _)) = ServerControl::decode(&message) {
+                        if let ServerControl::SessionConfig(config) = &decoded
+                            && let (Some(secret), Some(cn)) = (self.secret, self.client_nonce)
+                        {
+                            self.session_key =
+                                Some(SessionKey::derive(&secret, &cn, &config.server_nonce));
+                        }
+                        self.pending_control.push_back(decoded);
+                    }
+                }
+                Ok(self.pending_control.pop_front().map(Inbound::Control))
+            }
+            // Rumble and pad output are authenticated (they drive hardware), so
+            // verify the MAC before decoding — an unauthenticated one is dropped
+            // as `Other`, never applied to a controller.
+            PacketType::Rumble | PacketType::PadOutput => {
+                // Signed with the data key (the session key once derived, like
+                // the server's `session.data_key()`), not the control key.
+                let Some(key) = self.data_key() else {
+                    return Ok(Some(Inbound::Other));
+                };
+                let Some(verified) = key.verify_packet(datagram) else {
+                    return Ok(Some(Inbound::Other));
+                };
+                let body = &verified[HEADER_LEN..];
+                let inbound = match header.packet_type {
+                    PacketType::Rumble => Rumble::decode(body).map(Inbound::Rumble),
+                    _ => PadOutput::decode(body).map(Inbound::PadOutput),
+                };
+                Ok(Some(inbound.unwrap_or(Inbound::Other)))
+            }
+            _ => Ok(Some(Inbound::Other)),
+        }
     }
 
     /// Emit retransmits and owed acks.

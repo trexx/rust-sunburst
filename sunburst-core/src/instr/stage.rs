@@ -11,7 +11,7 @@
 
 /// Number of stages. Sized off the enum so adding a variant cannot leave an
 /// array behind.
-pub const STAGE_COUNT: usize = Stage::Present as usize + 1;
+pub const STAGE_COUNT: usize = Stage::AudioPlay as usize + 1;
 
 /// A point in the frame pipeline. Recording one marks that stage *completing*
 /// for a given frame.
@@ -34,6 +34,19 @@ pub enum Stage {
     DecodeSubmit = 8,
     DecodeOut = 9,
     Present = 10,
+
+    // Audio server chain. Independent of the video chain and clocked on its own
+    // 5 ms cadence, so `AudioCapture` opens a fresh timing chain rather than
+    // being measured against `Present`.
+    AudioCapture = 11,
+    AudioEncode = 12,
+    AudioSend = 13,
+
+    // Audio client chain. Like `Recv`, `AudioRecv` spans the wire from
+    // `AudioSend` and opens a new chain: two machines, no shared epoch.
+    AudioRecv = 14,
+    AudioDecode = 15,
+    AudioPlay = 16,
 }
 
 impl Stage {
@@ -51,16 +64,25 @@ impl Stage {
             Stage::DecodeSubmit => "dec-submit",
             Stage::DecodeOut => "dec-out",
             Stage::Present => "present",
+            Stage::AudioCapture => "au-capture",
+            Stage::AudioEncode => "au-encode",
+            Stage::AudioSend => "au-send",
+            Stage::AudioRecv => "au-recv",
+            Stage::AudioDecode => "au-decode",
+            Stage::AudioPlay => "au-play",
         }
     }
 
     /// Whether this stage begins a new timing chain, so no duration is derived
     /// from its predecessor.
     ///
-    /// True for the first stage on each machine. Everything else measures
-    /// against the stage before it.
+    /// True for the first stage on each machine, on each of the video and audio
+    /// pipelines. Everything else measures against the stage before it.
     pub const fn starts_chain(self) -> bool {
-        matches!(self, Stage::CaptureAcquire | Stage::Recv)
+        matches!(
+            self,
+            Stage::CaptureAcquire | Stage::Recv | Stage::AudioCapture | Stage::AudioRecv
+        )
     }
 
     /// Recover a stage from its wire/ring representation.
@@ -77,6 +99,12 @@ impl Stage {
             8 => Stage::DecodeSubmit,
             9 => Stage::DecodeOut,
             10 => Stage::Present,
+            11 => Stage::AudioCapture,
+            12 => Stage::AudioEncode,
+            13 => Stage::AudioSend,
+            14 => Stage::AudioRecv,
+            15 => Stage::AudioDecode,
+            16 => Stage::AudioPlay,
             _ => return None,
         })
     }
@@ -94,6 +122,12 @@ impl Stage {
         Stage::DecodeSubmit,
         Stage::DecodeOut,
         Stage::Present,
+        Stage::AudioCapture,
+        Stage::AudioEncode,
+        Stage::AudioSend,
+        Stage::AudioRecv,
+        Stage::AudioDecode,
+        Stage::AudioPlay,
     ];
 }
 
@@ -119,14 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn exactly_two_chains_start() {
-        // One per machine. A third would mean a stage stopped being measured
-        // without anyone noticing.
+    fn exactly_four_chains_start() {
+        // One per machine per pipeline: video server/client and audio
+        // server/client. A stray one would mean a stage stopped being measured
+        // against its predecessor without anyone noticing.
         let starts: Vec<_> = Stage::ALL.iter().filter(|s| s.starts_chain()).collect();
         assert_eq!(
             starts.len(),
-            2,
-            "expected one chain per machine: {starts:?}"
+            4,
+            "expected one chain per machine per pipeline: {starts:?}"
         );
     }
 

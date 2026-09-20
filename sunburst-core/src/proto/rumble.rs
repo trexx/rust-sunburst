@@ -14,8 +14,10 @@
 
 use super::input::MAX_PADS;
 
-/// Encoded rumble body length: pad, two motors, sequence.
-pub const RUMBLE_BODY_LEN: usize = 6;
+/// Encoded rumble body length: pad, four motors (low, high, two triggers),
+/// sequence. The two trigger motors are the Xbox impulse triggers; a pad without
+/// them simply leaves them zero, so the wire size is fixed regardless of family.
+pub const RUMBLE_BODY_LEN: usize = 10;
 
 /// Stop a motor that has gone unheard this long.
 pub const RUMBLE_TIMEOUT_MS: u32 = 200;
@@ -31,6 +33,10 @@ pub struct Rumble {
     pub motor_low: u16,
     /// Small, high-frequency motor.
     pub motor_high: u16,
+    /// Left impulse-trigger motor (Xbox One/Series). Zero on pads without it.
+    pub trigger_left: u16,
+    /// Right impulse-trigger motor (Xbox One/Series). Zero on pads without it.
+    pub trigger_right: u16,
     /// Wraps. Compared modularly so reordering cannot strand a motor at a stale
     /// level — the failure you feel in your hands rather than see in a log.
     pub seq: u8,
@@ -38,7 +44,10 @@ pub struct Rumble {
 
 impl Rumble {
     pub const fn is_silent(&self) -> bool {
-        self.motor_low == 0 && self.motor_high == 0
+        self.motor_low == 0
+            && self.motor_high == 0
+            && self.trigger_left == 0
+            && self.trigger_right == 0
     }
 
     pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
@@ -48,7 +57,9 @@ impl Rumble {
         out[0] = self.pad_index;
         out[1..3].copy_from_slice(&self.motor_low.to_le_bytes());
         out[3..5].copy_from_slice(&self.motor_high.to_le_bytes());
-        out[5] = self.seq;
+        out[5..7].copy_from_slice(&self.trigger_left.to_le_bytes());
+        out[7..9].copy_from_slice(&self.trigger_right.to_le_bytes());
+        out[9] = self.seq;
         Some(RUMBLE_BODY_LEN)
     }
 
@@ -64,7 +75,9 @@ impl Rumble {
             pad_index,
             motor_low: u16::from_le_bytes([buf[1], buf[2]]),
             motor_high: u16::from_le_bytes([buf[3], buf[4]]),
-            seq: buf[5],
+            trigger_left: u16::from_le_bytes([buf[5], buf[6]]),
+            trigger_right: u16::from_le_bytes([buf[7], buf[8]]),
+            seq: buf[9],
         })
     }
 }
@@ -156,6 +169,9 @@ mod tests {
             pad_index,
             motor_low: level,
             motor_high: level / 2,
+            // Distinct trigger levels so the round trip and is_silent cover them.
+            trigger_left: level / 4,
+            trigger_right: level / 8,
             seq,
         }
     }
@@ -166,6 +182,24 @@ mod tests {
         let mut buf = [0u8; RUMBLE_BODY_LEN];
         let n = r.encode(&mut buf).unwrap();
         assert_eq!(n, RUMBLE_BODY_LEN);
+        assert_eq!(Rumble::decode(&buf[..n]), Some(r));
+    }
+
+    #[test]
+    fn trigger_motors_round_trip_and_count_as_active() {
+        // A pad rumbling only its impulse triggers must survive the wire and not
+        // read as silent, or the tracker's timeout would cut trigger rumble off.
+        let r = Rumble {
+            pad_index: 1,
+            motor_low: 0,
+            motor_high: 0,
+            trigger_left: 0xABCD,
+            trigger_right: 0x1234,
+            seq: 9,
+        };
+        assert!(!r.is_silent());
+        let mut buf = [0u8; RUMBLE_BODY_LEN];
+        let n = r.encode(&mut buf).unwrap();
         assert_eq!(Rumble::decode(&buf[..n]), Some(r));
     }
 

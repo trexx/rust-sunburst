@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "sunburst-gip-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sunburst-core.workspace = true
+log = "0.4"
+
+# The GIP security-handshake crypto, reimplemented in Rust (xow delegates it to a
+# Java `GipCrypto` + mbedtls, which Sunburst has not got). Pure Rust, so it
+# cross-compiles to both Android ABIs and is host-tested against known vectors.
+sha2 = "0.10"
+hmac = "0.12"
+rsa = "0.9"
+p256 = { version = "0.13", features = ["ecdh"] }
+# `OsRng`, an OS CSPRNG implementing the `rand_core` traits `rsa`/`p256` want.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[features]
+# Turned on once the xow-derived C++ driver + libusb are vendored under `vendor/`
+# (Stage B1's second half). Until then the crate is a pure-Rust stub, so it
+# compiles and is host-tested on every target with no C toolchain, exactly like
+# `sunburst-android` compiles to an empty cdylib off-device. The real FFI path is
+# additionally gated on `target_os = "android"`, the only place the bridge runs.
+vendored = []
+
+# `cc` builds the vendored C/C++ only when `vendored` is on and the target is
+# Android (see build.rs); on every other build it does nothing, so the dep is
+# cheap and the host toolchain is never invoked.
+[build-dependencies]
+cc = "1"

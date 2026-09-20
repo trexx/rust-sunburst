@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::client::QuirksRecord;
-use crate::config::{CodecPreference, ConfigError};
+use crate::config::{CaptureBackend, CodecPreference, ConfigError, RateControl};
 use crate::host::Fake;
 use crate::pairing::PairRequest;
 use sunburst_core::proto::pairing::{confirm_tag, derive_secret};
@@ -183,6 +183,20 @@ fn settings_round_trip() {
         .expect("settings");
     settings.stream.bitrate_kbps = 90_000;
     settings.stream.codec = CodecPreference::Av1;
+    // The advanced knobs and the input group must survive the round trip too,
+    // not just the two headline fields.
+    settings.stream.hdr = false;
+    settings.stream.preset = 4;
+    settings.stream.rate_control = RateControl::Vbr;
+    settings.stream.capture_backend = CaptureBackend::Nvfbc;
+    settings.stream.slices = 4;
+    settings.stream.max_bitrate_kbps = 130_000;
+    settings.stream.audio_frame_us = 2_500;
+    settings.stream.audio_fec = false;
+    settings.stream.mic_device = Some("Steam Streaming Microphone".into());
+    settings.input.mouse_sensitivity = 1.5;
+    settings.input.gamepad_deadzone = 0.1;
+    settings.input.disable_epp = true;
 
     let r = h.send(ApiRequest::put("/api/config", &settings));
     assert_eq!(r.status, 200, "{}", body_text(&r));
@@ -193,6 +207,40 @@ fn settings_round_trip() {
         .expect("settings");
     assert_eq!(reloaded.stream.bitrate_kbps, 90_000);
     assert_eq!(reloaded.stream.codec, CodecPreference::Av1);
+    assert!(!reloaded.stream.hdr);
+    assert_eq!(reloaded.stream.preset, 4);
+    assert_eq!(reloaded.stream.rate_control, RateControl::Vbr);
+    assert_eq!(reloaded.stream.capture_backend, CaptureBackend::Nvfbc);
+    assert_eq!(reloaded.stream.slices, 4);
+    assert_eq!(reloaded.stream.max_bitrate_kbps, 130_000);
+    assert_eq!(reloaded.stream.audio_frame_us, 2_500);
+    assert!(!reloaded.stream.audio_fec);
+    assert_eq!(
+        reloaded.stream.mic_device.as_deref(),
+        Some("Steam Streaming Microphone")
+    );
+    assert_eq!(reloaded.input.mouse_sensitivity, 1.5);
+    assert_eq!(reloaded.input.gamepad_deadzone, 0.1);
+    assert!(reloaded.input.disable_epp);
+}
+
+#[test]
+fn audio_devices_lists_the_hosts_endpoints() {
+    // The settings device picker reads this; the Fake stands in for WASAPI
+    // enumeration. Assert the wiring reaches the host and the names round-trip,
+    // including Valve's sink, which is the host-silencing choice.
+    let h = Harness::new("audio-devices");
+    let r = h.send(ApiRequest::get("/api/audio-devices"));
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    let body: serde_json::Value = r.parse().expect("audio devices");
+    let devices: Vec<String> = body["devices"]
+        .as_array()
+        .expect("devices array")
+        .iter()
+        .map(|v| v.as_str().expect("string").to_string())
+        .collect();
+    assert_eq!(devices, h.host.audio_devices());
+    assert!(devices.iter().any(|d| d.contains("Steam Streaming")));
 }
 
 #[test]
@@ -392,6 +440,40 @@ fn launching_reports_the_running_app() {
     let running: RunningApp = r.parse().expect("running app");
     assert_eq!(running.app_id, app.id);
     assert_eq!(h.host.running_app().map(|r| r.app_id), Some(app.id));
+}
+
+#[test]
+fn effective_stream_config_applies_the_running_apps_overrides() {
+    use crate::config::{CodecPreference, SessionOverrides};
+
+    let h = Harness::new("effective");
+    // No app running: the global defaults.
+    let global = h.state.stream_config();
+    assert_eq!(h.state.effective_stream_config(), global);
+
+    // An app with a bitrate + codec profile, launched.
+    let body = crate::config::AppEntry {
+        name: "Profiled".into(),
+        exe: "game.exe".into(),
+        overrides: SessionOverrides {
+            bitrate_kbps: Some(55_000),
+            codec: Some(CodecPreference::Av1),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let app: crate::config::AppEntry = h
+        .send(ApiRequest::post("/api/apps", &body))
+        .parse()
+        .expect("app entry");
+    h.send(ApiRequest::post(
+        &format!("/api/apps/{}/launch", app.id),
+        (),
+    ));
+
+    let effective = h.state.effective_stream_config();
+    assert_eq!(effective.bitrate_kbps, 55_000);
+    assert_eq!(effective.codec, CodecPreference::Av1);
 }
 
 #[test]

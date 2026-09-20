@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later
+     Devices Sunburst claims, so Android offers the "use by default for this USB
+     device" checkbox (permanent permission) — without a matching intent-filter
+     it re-asks on every replug. Values are decimal.
+
+     Cabled Xbox pads are matched on the GIP signature (vendor 0x045e, the
+     vendor-specific interface class 0xff / subclass 0x47 / protocol 0xd0 that
+     [MS-GIPUSB] 2.2.12 defines) rather than product ids, so the list does not
+     drift as pads are added. The wireless adapter is matched by product id. -->
+<resources>
+    <!-- Cabled Xbox pads: the GIP data interface (0xff / 0x47 / 0xd0). -->
+    <usb-device vendor-id="1118" class="255" subclass="71" protocol="208" />
+
+    <!-- Xbox Wireless Adapter: older 0x02e6 (742) and newer 0x02fe (766). -->
+    <usb-device vendor-id="1118" product-id="742" />
+    <usb-device vendor-id="1118" product-id="766" />
+</resources>

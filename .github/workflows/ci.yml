@@ -115,6 +115,12 @@ jobs:
       - name: arm64-v8a (Shield)
         run: cargo build -p sunburst-android --target aarch64-linux-android
 
+      # Host clippy only sees the crate's empty (non-Android) shell, so lint the
+      # real Android target here — the same reasoning as `cargo xwin clippy` for
+      # the Windows-only crates. RUSTFLAGS=-D warnings makes it enforcing.
+      - name: Clippy the Android client
+        run: cargo clippy -p sunburst-android --all-targets --target aarch64-linux-android
+
       # armeabi-v7a is not optional: the Homatics ships a 32-bit userspace on a
       # 64-bit SoC, so dropping it drops half the supported hardware.
       - name: armeabi-v7a (Homatics)
@@ -123,5 +129,21 @@ jobs:
       - name: Gradle build and unit tests
         # The Gradle wrapper fetches its own JDK via the toolchain resolver, and
         # `ndkVersion` in app/build.gradle installs the pinned NDK if the
-        # runner's differs.
-        run: ./gradlew -p android testDebugUnitTest assembleDebug --console=plain
+        # runner's differs. The app's `cargoBuildJni` task cross-compiles the
+        # client cdylib for both ABIs and stages it in jniLibs, so assembleDebug
+        # produces an APK that actually contains the native library.
+        # The wrapper lives in android/, so run from there (there is no root gradlew).
+        working-directory: android
+        run: ./gradlew testDebugUnitTest assembleDebug --console=plain
+
+      - name: Assert the client library is packaged in the APK
+        # The whole point of the build wiring: a debug APK with no `lib/*.so`
+        # would install and then do nothing on the boxes.
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          for abi in arm64-v8a armeabi-v7a; do
+            unzip -l "$apk" | grep -q "lib/$abi/libsunburst_android.so" \
+              || { echo "missing lib/$abi/libsunburst_android.so in the APK"; exit 1; }
+          done
+          echo "both ABIs packaged"

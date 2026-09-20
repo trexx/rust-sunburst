@@ -39,6 +39,6 @@ pub mod store;
 
 pub use api::{ApiRequest, ApiResponse, AppState, dispatch};
 pub use config::{AppEntry, Config};
-pub use control::{InputSink, NoInput, WebHandler};
+pub use control::{InputSink, NoInput, NoStream, StreamControl, WebHandler};
 pub use host::{Host, HostError};
 pub use store::{Store, StoreError};

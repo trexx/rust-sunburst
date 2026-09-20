@@ -347,9 +347,20 @@ mod tests {
         );
     }
 
-    /// One tick is one nanosecond on Linux, where the tests run.
+    /// A timestamp fed to the collector, in ticks. One tick is one nanosecond
+    /// only on Linux; the ingest path converts ticks to ns with the platform
+    /// clock (QPC on Windows), so value assertions compare against [`dur_ns`]
+    /// rather than the raw tick count — otherwise they fail on Windows CI.
     fn ns(n: u64) -> u64 {
         n
+    }
+
+    /// The nanoseconds the collector records for a duration of `n` ticks —
+    /// identity on Linux, QPC-scaled on Windows — mirroring the
+    /// `clock::ticks_to_ns` the ingest path applies. Value assertions below run
+    /// their expected value and tolerance through this so they hold on both.
+    fn dur_ns(n: u64) -> u64 {
+        clock::ticks_to_ns(n)
     }
 
     #[test]
@@ -362,7 +373,7 @@ mod tests {
         let convert = r.stage(Stage::ColorConvert).expect("convert missing");
         assert_eq!(convert.count, 1);
         assert!(
-            convert.p50_ns.abs_diff(1_000_000) < 20_000,
+            convert.p50_ns.abs_diff(dur_ns(1_000_000)) < dur_ns(20_000),
             "expected ~1ms, got {}ns",
             convert.p50_ns
         );
@@ -389,7 +400,7 @@ mod tests {
             convert.count, 1,
             "out-of-order pair should still be counted"
         );
-        assert!(convert.p50_ns.abs_diff(1_000_000) < 20_000);
+        assert!(convert.p50_ns.abs_diff(dur_ns(1_000_000)) < dur_ns(20_000));
     }
 
     #[test]
@@ -455,7 +466,7 @@ mod tests {
             .expect("missing");
         assert_eq!(convert.count, 1);
         assert!(
-            convert.p50_ns.abs_diff(1_000_000) < 20_000,
+            convert.p50_ns.abs_diff(dur_ns(1_000_000)) < dur_ns(20_000),
             "slot recycling mixed two frames: got {}ns",
             convert.p50_ns
         );
@@ -480,7 +491,7 @@ mod tests {
             .expect("missing");
         assert_eq!(units.count, 4, "every emitted unit should be measured");
         assert!(
-            units.max_ns.abs_diff(8_000_000) < 200_000,
+            units.max_ns.abs_diff(dur_ns(8_000_000)) < dur_ns(200_000),
             "the last unit should read ~8ms, got {}ns",
             units.max_ns
         );
@@ -508,7 +519,7 @@ mod tests {
             .expect("missing");
         assert_eq!(convert.count, 2);
         assert!(
-            convert.max_ns < 2_000_000,
+            convert.max_ns < dur_ns(2_000_000),
             "the wrap paired two different frames: max {}ns",
             convert.max_ns
         );

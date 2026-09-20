@@ -97,6 +97,15 @@ pub trait Host: Send + Sync {
     fn metrics(&self) -> Option<sunburst_core::instr::Report> {
         None
     }
+
+    /// The friendly names of the server's active audio render endpoints, for the
+    /// settings device picker. Defaults to empty — enumeration is Windows-only
+    /// and the picker degrades to free text, so this never needs to fail. The
+    /// name is matched as a substring against `StreamConfig.audio_device`, so an
+    /// exact name from this list always resolves back to the same endpoint.
+    fn audio_devices(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// An in-memory `Host` for tests.
@@ -219,6 +228,18 @@ impl Host for Fake {
 
     fn metrics(&self) -> Option<sunburst_core::instr::Report> {
         self.state.lock().expect("not poisoned").metrics.clone()
+    }
+
+    fn audio_devices(&self) -> Vec<String> {
+        // A canned list standing in for WASAPI enumeration: the default
+        // endpoint, Valve's signed sink (the host-silencing choice), and a
+        // representative HDMI endpoint. Enough for the picker's tests to assert
+        // the wiring without a 4070 box.
+        vec![
+            "Speakers (Realtek High Definition Audio)".into(),
+            "Steam Streaming Speakers".into(),
+            "LG TV (NVIDIA High Definition Audio)".into(),
+        ]
     }
 
     fn disconnect(&self, session_id: u32) -> Result<(), HostError> {

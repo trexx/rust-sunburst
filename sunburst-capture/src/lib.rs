@@ -65,6 +65,19 @@ pub enum Backend {
     NvFbc,
 }
 
+/// Which monitor a backend captures.
+///
+/// `Primary` is the default and the historical behaviour (DXGI output 0 /
+/// `MONITOR_DEFAULTTOPRIMARY`). `Index(n)` selects the n-th DXGI output on the
+/// first adapter — used to capture a virtual display (the opt-in MTT VDD) when
+/// it is not the primary monitor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OutputSelect {
+    #[default]
+    Primary,
+    Index(u32),
+}
+
 /// Per-frame metadata carried alongside whichever surface a backend produced.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameMeta {
@@ -218,6 +231,14 @@ pub trait Capture {
 
     /// This backend's static capabilities.
     fn caps(&self) -> Caps;
+
+    /// The CUDA context this backend produces [`Frame::Cuda`] surfaces in, as a
+    /// raw `CUcontext`, or `None` for a D3D11 backend. The NvFBC-native encode
+    /// spine adopts it so the convert kernel and the NVENC-CUDA session run in
+    /// the same context the grab does — the frame never leaves the GPU.
+    fn cuda_context(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Choose the default backend for the host.

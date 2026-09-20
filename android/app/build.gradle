@@ -35,11 +35,65 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    // The Rust cdylib the cargo task stages, kept out of the source tree.
+    sourceSets {
+        main {
+            jniLibs.srcDirs += "${projectDir}/build/generated/jniLibs"
+        }
+    }
+
     lint {
         // A lint failure must not be the reason a Phase 0 measurement does not
         // happen. Tighten this when the app becomes the actual client.
         abortOnError false
     }
+}
+
+// Build the Rust client cdylib for both ABIs and drop it into the APK. The
+// plugin sets the NDK linker/AR env itself (apiLevel 30), so it does not rely on
+// `.cargo/config.toml` or the NDK being on PATH.
+// Build the Rust client cdylib for both ABIs and copy it into jniLibs. A small
+// task rather than a plugin: it runs the exact `cargo build` CI uses (so the
+// toolchain cannot drift) and works on the latest AGP, which rust-android-gradle
+// does not yet support.
+def rustAbis = ['arm64-v8a': 'aarch64-linux-android', 'armeabi-v7a': 'armv7-linux-androideabi']
+// The NDK's per-API-30 clang wrappers must be on PATH for the cargo cross-link
+// (see `.cargo/config.toml`). Prefer the CI-provided NDK envs, else the pinned
+// SDK NDK. linux-x86_64 covers CI (ubuntu) and the dev host.
+def pinnedNdk = '29.0.14206865'
+def androidHome = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+def ndkRoot = System.getenv('ANDROID_NDK_HOME') ?: System.getenv('ANDROID_NDK_LATEST_HOME') ?: "${androidHome}/ndk/${pinnedNdk}"
+def ndkBin = "${ndkRoot}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+def cargoTarget = "${rootProject.projectDir}/../target"
+// Staged out of the source tree so nothing generated is ever committed.
+def genJniLibs = "${projectDir}/build/generated/jniLibs"
+
+// Gradle 9 removed Project.exec/copy from task context; inject the services.
+interface CargoServices {
+    @javax.inject.Inject ExecOperations getExec()
+    @javax.inject.Inject org.gradle.api.file.FileSystemOperations getFs()
+}
+def repoRoot = "${rootProject.projectDir}/.."
+def cargoBuildJni = tasks.register('cargoBuildJni') {
+    description = 'Cross-compile sunburst-android for each ABI and stage it in jniLibs'
+    def svc = project.objects.newInstance(CargoServices)
+    doLast {
+        rustAbis.each { abi, triple ->
+            svc.exec.exec {
+                workingDir repoRoot
+                environment 'PATH', "${ndkBin}:${System.getenv('PATH')}"
+                commandLine 'cargo', 'build', '-p', 'sunburst-android', '--target', triple
+            }
+            svc.fs.copy {
+                from "${cargoTarget}/${triple}/debug/libsunburst_android.so"
+                into "${genJniLibs}/${abi}"
+            }
+        }
+    }
+}
+
+tasks.matching { it.name.matches(/merge.*JniLibFolders/) }.configureEach {
+    dependsOn cargoBuildJni
 }
 
 dependencies {

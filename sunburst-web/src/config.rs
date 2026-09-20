@@ -28,10 +28,36 @@ pub const DEFAULT_STREAM_PORT: u16 = 47811;
 pub struct Config {
     pub web: WebConfig,
     pub stream: StreamConfig,
+    pub input: InputConfig,
     pub apps: Vec<AppEntry>,
     /// Next id to hand out. Monotonic, never reused, so a revoked app id in a
     /// client's cache cannot come back pointing at a different program.
     pub next_app_id: u32,
+}
+
+/// Server-side input tuning. All default to today's behaviour (no scaling, no
+/// extra deadzone, EPP left as the OS has it).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct InputConfig {
+    /// Multiplier applied to injected relative mouse deltas. 1.0 = 1:1.
+    pub mouse_sensitivity: f32,
+    /// Extra stick deadzone (0..1) applied on top of what the client reports.
+    pub gamepad_deadzone: f32,
+    /// Have the server turn Enhanced Pointer Precision off (`SystemParametersInfo`)
+    /// while streaming, and restore it after. CLAUDE.md otherwise leaves this a
+    /// manual OS checkbox; this makes the server own it, opt-in.
+    pub disable_epp: bool,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        InputConfig {
+            mouse_sensitivity: 1.0,
+            gamepad_deadzone: 0.0,
+            disable_epp: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -73,6 +99,64 @@ pub struct StreamConfig {
     pub port: u16,
     pub bitrate_kbps: u32,
     pub codec: CodecPreference,
+    /// Stream game audio (WASAPI loopback + Opus). On by default.
+    pub audio: bool,
+    /// Render endpoint to capture, matched by name substring. `None` (or empty)
+    /// captures the system default endpoint; "Steam Streaming Speakers" silences
+    /// the host while the client still gets audio.
+    pub audio_device: Option<String>,
+    /// Render endpoint the pads' headset mic is played into, matched by name
+    /// substring. `None` (or empty) disables the pad-mic path; "Steam Streaming
+    /// Microphone" is the intended target — a signed virtual mic Steam installs,
+    /// consumed the same way "Steam Streaming Speakers" is on the capture side,
+    /// so no driver of ours is required. Games read it as a microphone input.
+    pub mic_device: Option<String>,
+    /// Opus target bitrate in kbps.
+    pub audio_bitrate_kbps: u32,
+    /// Switch the server's display to the client's resolution for the session
+    /// and restore it after. Off by default: changing the physical mode is
+    /// disruptive, and the virtual display (below) supersedes it. Ignored while
+    /// `virtual_display` is active.
+    pub match_resolution: bool,
+    /// Capture a virtual display (the installed MikeTheTech VDD) at the client's
+    /// resolution instead of the physical one — headless, host untouched. Opt-in
+    /// like NvFBC; falls back to the physical display when the driver is absent.
+    pub virtual_display: bool,
+    /// Which monitor to capture, as a DXGI output index. `None` = the primary
+    /// (the default). Set it to the virtual display's index when the VDD is not
+    /// the primary monitor.
+    pub capture_output: Option<u32>,
+
+    // ── Advanced video (defaults reproduce today's fixed behaviour) ──────────
+    /// Stream HDR. On by default (the 4K60 HDR10 workload); off streams SDR on
+    /// an HDR-capable codec. Ignored for H.264, which is always SDR.
+    pub hdr: bool,
+    /// NVENC preset P1–P4 (1 = P1, fastest/lowest-latency). Clamped to 1..=4.
+    /// Stays inside `TUNING_INFO_ULTRA_LOW_LATENCY` — this is not a UHQ escape.
+    pub preset: u8,
+    pub rate_control: RateControl,
+    /// HEVC slices / AV1 tiles-per-axis; `0` = the codec default (HEVC 4, AV1 2).
+    pub slices: u8,
+    /// Forced IDR period in frames; `0` = infinite GOP (recovery via intra-refresh).
+    pub idr_period: u32,
+    /// Reconstructed-frame DPB depth (`maxNumRefFramesInDPB`).
+    pub dpb_depth: u8,
+    pub capture_backend: CaptureBackend,
+    /// Rate-control floor in kbps.
+    pub min_bitrate_kbps: u32,
+    /// Rate-control ceiling in kbps; `0` = use `bitrate_kbps` as the ceiling.
+    pub max_bitrate_kbps: u32,
+    /// Cap the encode frame rate; `0` = follow the client's refresh.
+    pub fps_cap: u32,
+
+    // ── Advanced audio ───────────────────────────────────────────────────────
+    /// Opus frame duration in microseconds (2500/5000/10000/20000). Lower = lower
+    /// latency, more overhead. 5 ms default.
+    pub audio_frame_us: u32,
+    /// Opus in-band FEC.
+    pub audio_fec: bool,
+    /// Opus complexity 0..=10.
+    pub audio_complexity: u8,
 }
 
 impl Default for StreamConfig {
@@ -83,8 +167,51 @@ impl Default for StreamConfig {
             // notes the Shield's decoder caps out before 1GbE does.
             bitrate_kbps: 120_000,
             codec: CodecPreference::Auto,
+            audio: true,
+            audio_device: None,
+            mic_device: None,
+            audio_bitrate_kbps: 128,
+            match_resolution: false,
+            virtual_display: false,
+            capture_output: None,
+            hdr: true,
+            preset: 1,
+            rate_control: RateControl::Cbr,
+            slices: 0,
+            idr_period: 0,
+            dpb_depth: 8,
+            capture_backend: CaptureBackend::Auto,
+            min_bitrate_kbps: 10_000,
+            max_bitrate_kbps: 0,
+            fps_cap: 0,
+            audio_frame_us: 5_000,
+            audio_fec: true,
+            audio_complexity: 10,
         }
     }
+}
+
+/// NVENC rate-control mode, within the ULL envelope.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RateControl {
+    /// Constant bitrate — steady wire load, the streaming default.
+    #[default]
+    Cbr,
+    /// Variable bitrate — spends less on static frames.
+    Vbr,
+}
+
+/// Which capture backend to use. `Auto` is the OS default (WGC on Win11, DDA on
+/// Win10); `NvFbc` is opt-in resilience (see CLAUDE.md), never automatic.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureBackend {
+    #[default]
+    Auto,
+    Wgc,
+    Dda,
+    Nvfbc,
 }
 
 /// Which codec to negotiate.
@@ -99,6 +226,8 @@ pub enum CodecPreference {
     Auto,
     Hevc,
     Av1,
+    /// H.264 High, 8-bit SDR — a low-latency, opt-in choice; HDR needs HEVC/AV1.
+    H264,
 }
 
 /// One launchable entry. Typed in by hand; nothing is scanned.
@@ -133,6 +262,8 @@ pub struct SessionOverrides {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<u32>,
+    /// NVENC preset P1–P4 for this app; `None` inherits [`StreamConfig::preset`].
+    pub preset: Option<u8>,
 }
 
 /// Why a config was refused.
@@ -214,6 +345,9 @@ impl Config {
             }
             if let Some(c) = app.overrides.codec {
                 effective.codec = c;
+            }
+            if let Some(p) = app.overrides.preset {
+                effective.preset = p;
             }
         }
         effective
@@ -349,6 +483,21 @@ mod tests {
         let mut c = Config::default();
         c.web.token = "tok".into();
         c.next_app_id = 1;
+        // Non-default values across the new advanced/video/audio and input fields,
+        // so a round trip proves every one survives serde.
+        c.stream.hdr = false;
+        c.stream.codec = CodecPreference::H264;
+        c.stream.preset = 3;
+        c.stream.rate_control = RateControl::Vbr;
+        c.stream.slices = 2;
+        c.stream.idr_period = 120;
+        c.stream.capture_backend = CaptureBackend::Nvfbc;
+        c.stream.max_bitrate_kbps = 90_000;
+        c.stream.fps_cap = 60;
+        c.stream.audio_frame_us = 10_000;
+        c.stream.audio_fec = false;
+        c.input.mouse_sensitivity = 1.5;
+        c.input.disable_epp = true;
         c.apps = vec![AppEntry {
             id: 0,
             name: "Game".into(),
@@ -394,16 +543,20 @@ mod tests {
     fn overrides_apply_over_the_global_settings() {
         let mut c = Config::default();
         c.stream.bitrate_kbps = 120_000;
+        c.stream.preset = 1;
         let mut a = app(0);
         a.overrides.bitrate_kbps = Some(70_000);
         a.overrides.codec = Some(CodecPreference::Av1);
+        a.overrides.preset = Some(4);
 
         let effective = c.effective(Some(&a));
         assert_eq!(effective.bitrate_kbps, 70_000);
         assert_eq!(effective.codec, CodecPreference::Av1);
+        assert_eq!(effective.preset, 4);
 
         // And an app with no overrides inherits everything.
         assert_eq!(c.effective(Some(&app(1))).bitrate_kbps, 120_000);
+        assert_eq!(c.effective(Some(&app(1))).preset, 1);
         assert_eq!(c.effective(None).bitrate_kbps, 120_000);
     }
 }

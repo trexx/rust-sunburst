@@ -149,6 +149,7 @@ export interface Overrides {
   width: number | null;
   height: number | null;
   fps: number | null;
+  preset: number | null;
 }
 
 export interface AppEntry {
@@ -161,6 +162,44 @@ export interface AppEntry {
   overrides: Overrides;
 }
 
+export type Codec = "auto" | "hevc" | "av1" | "h264";
+export type RateControl = "cbr" | "vbr";
+export type CaptureBackend = "auto" | "wgc" | "dda" | "nvfbc";
+
+export interface StreamSettings {
+  port: number;
+  bitrate_kbps: number;
+  codec: Codec;
+  audio: boolean;
+  audio_device: string | null;
+  mic_device: string | null;
+  audio_bitrate_kbps: number;
+  match_resolution: boolean;
+  virtual_display: boolean;
+  capture_output: number | null;
+  // Advanced video
+  hdr: boolean;
+  preset: number;
+  rate_control: RateControl;
+  slices: number;
+  idr_period: number;
+  dpb_depth: number;
+  capture_backend: CaptureBackend;
+  min_bitrate_kbps: number;
+  max_bitrate_kbps: number;
+  fps_cap: number;
+  // Advanced audio
+  audio_frame_us: number;
+  audio_fec: boolean;
+  audio_complexity: number;
+}
+
+export interface InputSettings {
+  mouse_sensitivity: number;
+  gamepad_deadzone: number;
+  disable_epp: boolean;
+}
+
 export interface Settings {
   web: {
     bind: string;
@@ -168,11 +207,12 @@ export interface Settings {
     token: string;
     assets_dir: string;
   };
-  stream: {
-    port: number;
-    bitrate_kbps: number;
-    codec: string;
-  };
+  stream: StreamSettings;
+  input: InputSettings;
+}
+
+export interface AudioDevices {
+  devices: string[];
 }
 
 export interface StageMetrics {

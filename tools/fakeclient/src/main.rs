@@ -15,17 +15,21 @@
 //! Pairing prints the PIN it generated. Type that into the web UI — it is never
 //! transmitted, and both ends derive the same secret from it independently.
 
+mod ivf;
+mod stream;
+
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use sunburst_core::proto::codecs;
 use sunburst_core::proto::input::buttons;
 use sunburst_core::proto::pairing::{NONCE_LEN, PIN_DIGITS, confirm_tag, derive_secret};
 use sunburst_core::proto::{
     Battery, ClientControl, Finger, GamepadState, Hello, Imu, InputEvent, InputPacket, MouseButton,
-    MouseMotion, PairRequest, ServerControl, SessionKey, Touchpad,
+    MouseMotion, PairRequest, ServerControl, SessionKey, StreamCodec, Touchpad,
 };
 use sunburst_net::ClientEndpoint;
 
@@ -53,6 +57,7 @@ fn main() -> ExitCode {
         Some("pair") => pair(server, &secrets),
         Some("apps") => apps(server, &secrets),
         Some("input") => input(server, &secrets, option(&refs, "--script")),
+        Some("stream") => stream_cmd(server, &secrets, &refs),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -70,9 +75,12 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  fakeclient pair  [--server host:port] [--state path]
-  fakeclient apps  [--server host:port] [--state path]
-  fakeclient input [--server host:port] [--state path] [--script name]
+  fakeclient pair   [--server host:port] [--state path]
+  fakeclient apps   [--server host:port] [--state path]
+  fakeclient input  [--server host:port] [--state path] [--script name]
+  fakeclient stream [--server host:port] [--state path] [--codecs hevc,av1]
+                    [--out file.265|file.ivf] [--drop PCT] [--no-retransmit]
+                    [--secs N] [--stats]
 
 scripts: gamepad-sweep (default), gamepad-rich, keyboard, mouse
 
@@ -249,6 +257,10 @@ fn hello(client_nonce: [u8; NONCE_LEN]) -> ClientControl {
         refresh_mhz: 60_000,
         client_nonce,
         clock_offset_ns: 0,
+        // A stub decoder: it can "decode" either, so the server picks by preference.
+        codecs: codecs::HEVC_MAIN10 | codecs::AV1_MAIN10,
+        prefer_codec: None,
+        max_bitrate_kbps: 0,
     })
 }
 
@@ -316,6 +328,51 @@ fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<()
         stored.next_input_seq
     );
     Ok(())
+}
+
+fn stream_cmd(server: SocketAddr, state: &PathBuf, refs: &[&str]) -> Result<(), String> {
+    use sunburst_core::proto::codecs;
+    let stored = load_state(state)?;
+
+    let codecs = match option(refs, "--codecs") {
+        None => codecs::HEVC_MAIN10 | codecs::AV1_MAIN10,
+        Some(list) => {
+            let mut bits = 0u8;
+            for c in list.split(',') {
+                match c.trim() {
+                    "hevc" => bits |= codecs::HEVC_MAIN10,
+                    "av1" => bits |= codecs::AV1_MAIN10,
+                    "h264" => bits |= codecs::H264,
+                    other => return Err(format!("unknown codec {other}")),
+                }
+            }
+            bits
+        }
+    };
+    let prefer_codec = match option(refs, "--prefer") {
+        None => None,
+        Some("hevc") => Some(StreamCodec::Hevc),
+        Some("av1") => Some(StreamCodec::Av1),
+        Some("h264") => Some(StreamCodec::H264),
+        Some(other) => return Err(format!("unknown --prefer codec {other}")),
+    };
+    let opts = stream::StreamOpts {
+        codecs,
+        prefer_codec,
+        max_bitrate_kbps: option(refs, "--max-bitrate")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        out: option(refs, "--out").map(str::to_owned),
+        drop_pct: option(refs, "--drop")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        retransmit: !refs.contains(&"--no-retransmit"),
+        secs: option(refs, "--secs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+        stats: refs.contains(&"--stats"),
+    };
+    stream::stream(server, stored.secret, opts)
 }
 
 fn gamepad_sweep() -> Vec<InputEvent> {

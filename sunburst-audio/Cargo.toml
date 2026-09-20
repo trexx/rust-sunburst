@@ -11,3 +11,27 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
+# libopus, transpiled to pure Rust by c2rust. Chosen over the audiopus/CMake
+# route so the encoder and decoder cross-compile to the Windows and both Android
+# targets as plain Rust — no C toolchain, no CMake toolchain files. See the
+# codec module for the thin safe wrapper. This crate is *not* `#![cfg(windows)]`
+# at the root (unlike -capture/-encode): the codec and PCM logic are pure and
+# host-tested, and only the WASAPI modules are gated, the same split
+# `sunburst-input` uses for its keymap.
+unsafe-libopus.workspace = true
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# WASAPI loopback capture: IAudioClient3 + IAudioCaptureClient off the default
+# render endpoint, selected through IMMDeviceEnumerator.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Performance",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }

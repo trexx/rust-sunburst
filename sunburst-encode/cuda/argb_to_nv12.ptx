@@ -1,0 +1,38 @@
+//
+// PLACEHOLDER — regenerate with .github/workflows/cuda-kernel.yml
+// (`nvcc -ptx argb_to_nv12.cu`). This checked-in copy is a valid but **no-op**
+// stub: it lets the crate compile and the module load, but converts nothing, so a
+// build without the CI-generated PTX produces a black frame rather than a crash.
+// The real kernel is a vendored artifact, like the driver DLLs.
+//
+// Two entry points, one per HDR/SDR source (same 6-param signature as the P010
+// kernel): `argb_to_nv12` for an already-SDR capture, `argb_to_nv12_tonemap` for
+// an HDR-range capture that must be rolled off to SDR.
+//
+.version 7.0
+.target sm_52
+.address_size 64
+
+.visible .entry argb_to_nv12(
+    .param .u64 _p0,
+    .param .u32 _p1,
+    .param .u64 _p2,
+    .param .u32 _p3,
+    .param .u32 _p4,
+    .param .u32 _p5
+)
+{
+    ret;
+}
+
+.visible .entry argb_to_nv12_tonemap(
+    .param .u64 _p0,
+    .param .u32 _p1,
+    .param .u64 _p2,
+    .param .u32 _p3,
+    .param .u32 _p4,
+    .param .u32 _p5
+)
+{
+    ret;
+}

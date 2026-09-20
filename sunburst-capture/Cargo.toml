@@ -23,7 +23,10 @@ windows = { version = "0.62", features = [
     # DXGI_OUTPUT_DESC{,1} carry an HMONITOR, a GDI type.
     "Win32_Graphics_Gdi",
     # NvFBC / nvcuda.dll are loaded at runtime (no build dep).
+    "Win32_Security",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Foundation",
     # WGC (Windows.Graphics.Capture) + its Win32 interop.
     "Graphics",
     "Graphics_Capture",

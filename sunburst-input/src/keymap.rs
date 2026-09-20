@@ -293,6 +293,38 @@ pub fn relative_action(dx: i16, dy: i16) -> MouseAction {
     }
 }
 
+/// Scale a relative mouse delta by a sensitivity multiplier, rounding and
+/// saturating to `i32` so a fast flick cannot wrap. `1.0` is 1:1.
+pub fn scale_delta(v: i16, sensitivity: f32) -> i32 {
+    if sensitivity == 1.0 {
+        return i32::from(v);
+    }
+    let scaled = (f32::from(v) * sensitivity).round();
+    scaled.clamp(i32::MIN as f32, i32::MAX as f32) as i32
+}
+
+/// A relative-move action with the deltas scaled by `sensitivity`.
+pub fn relative_action_scaled(dx: i16, dy: i16, sensitivity: f32) -> MouseAction {
+    MouseAction {
+        flags: mouse_flags::MOVE,
+        data: 0,
+        dx: scale_delta(dx, sensitivity),
+        dy: scale_delta(dy, sensitivity),
+    }
+}
+
+/// Apply a radial deadzone to a stick: if the pair's magnitude is within
+/// `deadzone` (0..1) of centre, zero it; otherwise pass it through. `0.0` is a
+/// no-op, so the client's own deadzone handling is untouched by default.
+pub fn apply_deadzone(x: i16, y: i16, deadzone: f32) -> (i16, i16) {
+    if deadzone <= 0.0 {
+        return (x, y);
+    }
+    let threshold = deadzone.clamp(0.0, 1.0) * 32767.0;
+    let mag = ((f32::from(x)).hypot(f32::from(y))).abs();
+    if mag < threshold { (0, 0) } else { (x, y) }
+}
+
 /// Absolute motion across the whole virtual desktop.
 ///
 /// The protocol already carries 0–65535 normalised, which is the range
@@ -568,5 +600,26 @@ mod tests {
         assert_eq!(a.flags, mouse_flags::MOVE);
         assert_eq!((a.dx, a.dy), (-300, 42));
         assert!(a.flags & mouse_flags::ABSOLUTE == 0);
+    }
+
+    #[test]
+    fn sensitivity_scales_and_1_0_is_identity() {
+        assert_eq!(scale_delta(100, 1.0), 100);
+        assert_eq!(scale_delta(-100, 1.0), -100);
+        assert_eq!(scale_delta(100, 2.0), 200);
+        assert_eq!(scale_delta(100, 0.5), 50);
+        // A big flick scaled up stays exact in i32 rather than wrapping i16.
+        assert_eq!(scale_delta(30_000, 4.0), 120_000);
+        let a = relative_action_scaled(-50, 20, 2.0);
+        assert_eq!((a.dx, a.dy), (-100, 40));
+    }
+
+    #[test]
+    fn deadzone_zeroes_only_within_the_radius() {
+        // 0 is a no-op — the client's own deadzone is untouched.
+        assert_eq!(apply_deadzone(1000, 0, 0.0), (1000, 0));
+        // Inside a 10% radius (≈3276) is zeroed; outside passes through.
+        assert_eq!(apply_deadzone(2000, 0, 0.10), (0, 0));
+        assert_eq!(apply_deadzone(30_000, 0, 0.10), (30_000, 0));
     }
 }

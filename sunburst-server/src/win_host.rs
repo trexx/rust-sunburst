@@ -17,7 +17,7 @@
 
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sunburst_core::instr::{DrainHandle, Report};
@@ -45,6 +45,10 @@ pub struct WindowsHost {
     started: Instant,
     running: Mutex<Option<Launched>>,
     drain: Option<DrainHandle>,
+    /// The live-session view, shared with the session manager on the endpoint
+    /// thread. Reads for `GET /api/sessions`; a disconnect is requested through
+    /// it and acted on by the manager.
+    sessions: Arc<crate::session::Sessions>,
 }
 
 struct Launched {
@@ -56,11 +60,12 @@ struct Launched {
 }
 
 impl WindowsHost {
-    pub fn new(drain: Option<DrainHandle>) -> WindowsHost {
+    pub fn new(drain: Option<DrainHandle>, sessions: Arc<crate::session::Sessions>) -> WindowsHost {
         WindowsHost {
             started: Instant::now(),
             running: Mutex::new(None),
             drain,
+            sessions,
         }
     }
 
@@ -154,14 +159,24 @@ impl Host for WindowsHost {
 
     fn running_app(&self) -> Option<RunningApp> {
         let mut running = self.running.lock().expect("not poisoned");
-        let launched = running.as_mut()?;
 
         // Reap first: an app the user closed themselves should stop being
         // reported as running, or the next launch is refused with a conflict.
-        if let Some(child) = launched.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            *running = None;
+        let exited = running.as_mut().is_some_and(|l| {
+            l.child
+                .as_mut()
+                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+        });
+        if exited {
+            // Undo the prep it applied, exactly as `terminate` would — a game
+            // that quit on its own must still restore what it changed.
+            if let Some(launched) = running.take() {
+                for step in launched.app.prep.iter().rev() {
+                    if let Some(undo) = &step.undo {
+                        let _ = run_shell(undo);
+                    }
+                }
+            }
             return None;
         }
         running.as_ref().map(|l| l.info.clone())
@@ -233,17 +248,28 @@ impl Host for WindowsHost {
     }
 
     fn sessions(&self) -> Vec<SessionSummary> {
-        // Nothing streams yet. Reporting an empty list is the truth; inventing a
-        // placeholder session would be a lie the UI would render as fact.
-        Vec::new()
+        self.sessions.list()
     }
 
     fn disconnect(&self, session_id: u32) -> Result<(), HostError> {
-        Err(HostError::UnknownSession(session_id))
+        // The manager owns the pipeline; ask it to drop this one. It acts on the
+        // request on its next tick.
+        if self.sessions.request_disconnect(session_id) {
+            Ok(())
+        } else {
+            Err(HostError::UnknownSession(session_id))
+        }
     }
 
     fn metrics(&self) -> Option<Report> {
         self.drain.as_ref()?.report()
+    }
+
+    fn audio_devices(&self) -> Vec<String> {
+        // Called on the web thread, so `list_render_endpoints` initialises COM
+        // itself; an empty list means enumeration failed and the picker falls
+        // back to free text.
+        sunburst_audio::device::list_render_endpoints()
     }
 }
 

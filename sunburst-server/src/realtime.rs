@@ -42,8 +42,20 @@ impl RealtimeThread {
     /// `TIME_CRITICAL`. Call once, first thing on the thread; drop it when the
     /// thread ends to revert.
     pub fn register() -> RealtimeThread {
-        // "Games" as a NUL-terminated UTF-16 string.
-        let task: Vec<u16> = "Games".encode_utf16().chain(std::iter::once(0)).collect();
+        Self::register_task("Games")
+    }
+
+    /// Register the calling thread as an MMCSS "Pro Audio" task — the audio
+    /// pipeline's class, so its 5 ms cadence is not starved behind the frame
+    /// path.
+    pub fn register_audio() -> RealtimeThread {
+        Self::register_task("Pro Audio")
+    }
+
+    /// Register the calling thread under a named MMCSS task at `TIME_CRITICAL`.
+    fn register_task(task_name: &str) -> RealtimeThread {
+        // The task name as a NUL-terminated UTF-16 string.
+        let task: Vec<u16> = task_name.encode_utf16().chain(std::iter::once(0)).collect();
         let mut index: u32 = 0;
         // SAFETY: `task` is NUL-terminated and outlives the call; `index` is a
         // valid out pointer. A null return means MMCSS declined, which we carry

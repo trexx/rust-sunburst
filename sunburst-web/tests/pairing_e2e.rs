@@ -91,7 +91,7 @@ impl Harness {
         let injected = RecordedInput::default();
         let mut endpoint = Endpoint::bind(
             "127.0.0.1:0".parse().expect("literal"),
-            WebHandler::new(Arc::clone(&state), injected.clone()),
+            WebHandler::new(Arc::clone(&state), injected.clone(), sunburst_net::NoStream),
         )
         .expect("bind");
         let udp = endpoint.local_addr().expect("addr");

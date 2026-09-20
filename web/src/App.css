@@ -239,3 +239,41 @@ code {
 .gate input {
   margin: var(--space) auto;
 }
+
+/* Settings: checkboxes read as a row, not a full-width text field; the
+   Advanced disclosure hides the knobs most installs never touch; a subheading
+   separates the groups inside one card. */
+input[type="checkbox"] {
+  display: inline-block;
+  width: auto;
+  max-width: none;
+  margin: 0 8px 0 0;
+  vertical-align: middle;
+}
+
+label.check {
+  display: flex;
+  align-items: center;
+  color: var(--text);
+}
+
+.card h3 {
+  margin: var(--space) 0 4px;
+  font-size: 14px;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+details.advanced {
+  margin-top: var(--space);
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+details.advanced > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  list-style: revert;
+}
