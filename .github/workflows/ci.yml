@@ -126,6 +126,22 @@ jobs:
       - name: armeabi-v7a (Homatics)
         run: cargo build -p sunburst-android --target armv7-linux-androideabi
 
+      # On a push to main (and on demand) the shippable APK bundles the MT7612U
+      # dongle firmware. It is Microsoft's and not committed (CLAUDE.md
+      # "Licensing"); fetch-firmware.sh extracts it into the gitignored asset path
+      # so the assembleDebug below packages it. PRs skip this and build a
+      # firmware-less APK — wired pads need no firmware; only the adapter does —
+      # so a PR never fetches or redistributes Microsoft's blob.
+      - name: Fetch the dongle firmware (bundled into the published APK)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          # Optional: set this repo secret to verify the extracted blob against a
+          # pinned hash. Unset leaves it unverified (the script warns + prints it).
+          SUNBURST_FW_SHA256: ${{ secrets.SUNBURST_FW_SHA256 }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y cabextract
+          scripts/fetch-firmware.sh
+
       - name: Gradle build and unit tests
         # The Gradle wrapper fetches its own JDK via the toolchain resolver, and
         # `ndkVersion` in app/build.gradle installs the pinned NDK if the
@@ -147,3 +163,26 @@ jobs:
               || { echo "missing lib/$abi/libsunburst_android.so in the APK"; exit 1; }
           done
           echo "both ABIs packaged"
+
+      # Published builds carry the dongle firmware, so fail loudly rather than
+      # ship a silently firmware-less APK if the fetch above regressed.
+      - name: Assert the firmware is packaged (published build only)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          unzip -l "$apk" | grep -q "assets/xone_dongle_fw.bin" \
+            || { echo "firmware not packaged in the APK"; exit 1; }
+          echo "firmware packaged"
+
+      # The sideloadable client for the Shield + Homatics, so the boxes get an
+      # APK (both ABIs, firmware bundled) without building on them — the Android
+      # twin of the Windows `package` job. Debug-signed: installable via sideload,
+      # not Play. Push/dispatch only, so PRs stay fast.
+      - name: Publish the APK
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunburst-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
