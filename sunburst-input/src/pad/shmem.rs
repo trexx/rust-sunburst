@@ -186,8 +186,21 @@ mod win {
 
         fn read_u32(&self, offset: usize) -> u32 {
             debug_assert!(offset + 4 <= self.len);
-            // SAFETY: within the view; another process writes it, so reads are volatile.
-            unsafe { std::ptr::read_volatile(self.base.add(offset).cast::<u32>()) }
+            // Aligned u32 fields (the seqlock counters) get a single volatile
+            // read. IN_EXT_SIZE sits at a 2-misaligned offset in the fixed
+            // layout, where `read_volatile::<u32>` is UB and aborts under the
+            // Windows debug misalignment check, so read it byte-wise like the
+            // u16 fields — it is a seqlock-guarded size, not a counter, so a torn
+            // read only forces a retry.
+            if (self.base as usize + offset).is_multiple_of(4) {
+                // SAFETY: aligned and within the view; volatile because another
+                // process writes it.
+                unsafe { std::ptr::read_volatile(self.base.add(offset).cast::<u32>()) }
+            } else {
+                let mut bytes = [0u8; 4];
+                self.read_bytes(offset, &mut bytes);
+                u32::from_le_bytes(bytes)
+            }
         }
 
         fn read_u16(&self, offset: usize) -> u16 {
@@ -198,8 +211,15 @@ mod win {
 
         fn write_u32(&self, offset: usize, value: u32) {
             debug_assert!(offset + 4 <= self.len);
-            // SAFETY: within the view, mapped writable.
-            unsafe { std::ptr::write_volatile(self.base.add(offset).cast::<u32>(), value) }
+            // See read_u32: aligned counters get a single volatile write; the
+            // lone misaligned size field (IN_EXT_SIZE) is written byte-wise to
+            // avoid a misaligned u32 store, safe under the seqlock.
+            if (self.base as usize + offset).is_multiple_of(4) {
+                // SAFETY: aligned and within the view, mapped writable.
+                unsafe { std::ptr::write_volatile(self.base.add(offset).cast::<u32>(), value) }
+            } else {
+                self.write_bytes(offset, &value.to_le_bytes());
+            }
         }
 
         fn write_bytes(&self, offset: usize, bytes: &[u8]) {
