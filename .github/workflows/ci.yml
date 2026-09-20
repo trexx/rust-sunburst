@@ -132,7 +132,9 @@ jobs:
         # runner's differs. The app's `cargoBuildJni` task cross-compiles the
         # client cdylib for both ABIs and stages it in jniLibs, so assembleDebug
         # produces an APK that actually contains the native library.
-        run: ./gradlew -p android testDebugUnitTest assembleDebug --console=plain
+        # The wrapper lives in android/, so run from there (there is no root gradlew).
+        working-directory: android
+        run: ./gradlew testDebugUnitTest assembleDebug --console=plain
 
       - name: Assert the client library is packaged in the APK
         # The whole point of the build wiring: a debug APK with no `lib/*.so`

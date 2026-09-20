@@ -34,8 +34,8 @@ use windows::Win32::System::Performance::QueryPerformanceFrequency;
 
 use crate::audio_pipeline::{self, AudioPipeline};
 use crate::cursor::CursorPoller;
-use crate::mic_pipeline::MicPipeline;
 use crate::display::{self, DisplayGuard, EppGuard, VirtualDisplay};
+use crate::mic_pipeline::MicPipeline;
 use crate::pipeline::{CodecHeaders, Pipeline, PipelineParams, StreamShared, retransmit_ring};
 
 /// The live-session view the web UI reads and the disconnect it can request.

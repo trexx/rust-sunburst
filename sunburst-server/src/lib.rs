@@ -10,8 +10,8 @@
 
 pub mod audio_pipeline;
 pub mod cursor;
-pub mod mic_pipeline;
 pub mod display;
+pub mod mic_pipeline;
 pub mod pipeline;
 pub mod realtime;
 pub mod session;

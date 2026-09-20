@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use sunburst_core::proto::pairing::{NONCE_LEN, confirm_tag, derive_secret};
 use sunburst_core::proto::{
-    AppListing, ClientControl, GamepadState, Hello, InputEvent, InputPacket, PairRequest,
-    Seq16, ServerControl, SessionKey,
+    AppListing, ClientControl, GamepadState, Hello, InputEvent, InputPacket, PairRequest, Seq16,
+    ServerControl, SessionKey,
 };
 use sunburst_net::endpoint::ClientEndpoint;
 use sunburst_net::{Endpoint, Recording};
@@ -357,7 +357,12 @@ fn pad_mic_audio_in_from_an_unknown_address_is_dropped() {
         .send_audio_in(0, Seq16(1), 0, &[0u8; 40])
         .expect("send");
     std::thread::sleep(Duration::from_millis(200));
-    server.recording(|r| assert!(r.audio_ins.is_empty(), "unattributed mic audio was accepted"));
+    server.recording(|r| {
+        assert!(
+            r.audio_ins.is_empty(),
+            "unattributed mic audio was accepted"
+        )
+    });
 }
 
 #[test]

@@ -90,14 +90,7 @@ impl RenderPlayback {
 
             // 200 ms shared buffer; periodicity 0 for a shared timer-driven sink.
             let hns_buffer = 200 * 10_000;
-            let init = client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                0,
-                hns_buffer,
-                0,
-                mix,
-                None,
-            );
+            let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hns_buffer, 0, mix, None);
             CoTaskMemFree(Some(mix as *const _));
             init?;
 

@@ -240,7 +240,10 @@ mod tests {
         // Re-quantising loses at most 1 LSB (the 32768-vs-32767 scaling
         // asymmetry plus truncation in `f32_to_i16`); it never diverges.
         for s in [-32768i16, -12345, -1, 0, 1, 12345, 32767] {
-            assert!((f32_to_i16(i16_to_f32(s)) - s).abs() <= 1, "round-trip of {s}");
+            assert!(
+                (f32_to_i16(i16_to_f32(s)) - s).abs() <= 1,
+                "round-trip of {s}"
+            );
         }
     }
 

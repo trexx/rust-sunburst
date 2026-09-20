@@ -879,7 +879,9 @@ impl ClientEndpoint {
     ) -> io::Result<()> {
         let mut buf = [0u8; crate::audio::MAX_AUDIO_PACKET];
         let n = crate::audio::encode_audio_in_packet(pad_index, seq, qpc, opus, &mut buf)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "audio-in body too large"))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "audio-in body too large")
+            })?;
         self.socket.send_to(&buf[..n], self.server)?;
         Ok(())
     }

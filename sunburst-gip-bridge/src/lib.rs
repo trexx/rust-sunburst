@@ -226,25 +226,40 @@ mod tests {
         // MS-GIPUSB 3.2.5.1.2: the codes measured on a real headset and the extremes.
         assert_eq!(
             decode_audio_format(0x09),
-            Some(MicFormat { rate: 24000, channels: 1 }),
+            Some(MicFormat {
+                rate: 24000,
+                channels: 1
+            }),
             "0x09 is 24 kHz mono — the Xbox chat mic"
         );
         assert_eq!(
             decode_audio_format(0x10),
-            Some(MicFormat { rate: 48000, channels: 2 }),
+            Some(MicFormat {
+                rate: 48000,
+                channels: 2
+            }),
             "0x10 is 48 kHz stereo — the headset speaker"
         );
         assert_eq!(
             decode_audio_format(0x0f),
-            Some(MicFormat { rate: 48000, channels: 1 })
+            Some(MicFormat {
+                rate: 48000,
+                channels: 1
+            })
         );
         assert_eq!(
             decode_audio_format(0x01),
-            Some(MicFormat { rate: 8000, channels: 1 })
+            Some(MicFormat {
+                rate: 8000,
+                channels: 1
+            })
         );
         assert_eq!(
             decode_audio_format(0x0a),
-            Some(MicFormat { rate: 24000, channels: 2 })
+            Some(MicFormat {
+                rate: 24000,
+                channels: 2
+            })
         );
         // 0 (no audio), negative (no such pad), and out-of-range all decode to None.
         assert_eq!(decode_audio_format(0), None);
