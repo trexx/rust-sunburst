@@ -20,10 +20,12 @@ set -euo pipefail
 # check below, not the transport.
 DRIVER_URL="http://download.windowsupdate.com/c/msdownload/update/driver/drvs/2017/07/1cd6a87c-623f-4407-a52d-c31be49e925c_e19f60808bdcbfbd3c3df6be3e71ffc52e43261e.cab"
 
-# SHA-256 of the extracted FW_ACC_00U.bin. Leave empty to run unverified (the
-# script prints the hash it got); pin it to the value cross-checked against
-# xone's install/firmware.sh so a reissued or tampered package is rejected.
-EXPECTED_SHA256="${SUNBURST_FW_SHA256:-}"
+# SHA-256 of the extracted FW_ACC_00U.bin, pinned so a reissued or tampered
+# package is rejected — the download is plain http, so integrity rests here.
+# Cross-checked against xone's install/firmware.sh (medusalix/xone). Override with
+# SUNBURST_FW_SHA256 if Microsoft ever reissues the firmware (update xone's
+# reference too), or set it empty there to fetch unverified.
+EXPECTED_SHA256="${SUNBURST_FW_SHA256:-48084d9fa53b9bb04358f3bb127b7495dc8f7bb0b3ca1437bd24ef2b6eabdf66}"
 
 FIRMWARE_NAME="FW_ACC_00U.bin"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
