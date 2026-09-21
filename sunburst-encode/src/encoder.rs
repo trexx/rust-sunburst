@@ -19,14 +19,14 @@
 //! caps) are transmuted to their real signatures here rather than re-typing the
 //! shared function-list struct.
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 
 use sunburst_capture::HdrMetadata;
 
 use crate::hdr::{ContentLightLevel, MasteringDisplayInfo};
 use crate::nvenc::{
-    Guid, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, Nvenc,
-    NvencStatus, Session, struct_version,
+    Guid, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
+    NvEncodeApiFunctionList, Nvenc, NvencStatus, Session, struct_version,
 };
 
 /// The codec an [`Encoder`] targets.
@@ -119,6 +119,11 @@ const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
 const NV_ENC_BUFFER_FORMAT_YUV420_10BIT: u32 = 0x0001_0000;
 /// `NV_ENC_BUFFER_FORMAT_NV12` — 8-bit semi-planar input, for the H.264 SDR path.
 const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x0000_0001;
+/// `NV_ENC_BIT_DEPTH_10`. SDK 13.x configures 10-bit via `inputBitDepth` /
+/// `outputBitDepth` enums (value = the bit count), not the old
+/// `pixelBitDepthMinus8`. Leaving it unset keeps the session 8-bit, and then
+/// nvEncRegisterResource rejects a P010 surface with INVALID_PARAM.
+const NV_ENC_BIT_DEPTH_10: u32 = 10;
 /// `NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX`.
 const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0;
 /// `NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR`.
@@ -303,6 +308,13 @@ struct HevcConfigHead {
     pps_id: u32,
     slice_mode: u32,
     slice_mode_data: u32,
+    /// `maxTemporalLayersMinus1` (@60) through `disableDeblockingFilterIDC`,
+    /// including the embedded VUI parameters — opaque here, left at the preset
+    /// default. 140 bytes so `output_bit_depth` lands at offset 200.
+    _reserved_to_bit_depth: [u32; 35],
+    /// `NV_ENC_CONFIG_HEVC::outputBitDepth` (@200) / `inputBitDepth` (@204).
+    output_bit_depth: u32,
+    input_bit_depth: u32,
 }
 
 /// The head of `NV_ENC_CONFIG_AV1`, up to `numTileColumns`/`numTileRows`. Overlaid
@@ -322,6 +334,13 @@ struct Av1ConfigHead {
     max_num_ref_frames_in_dpb: u32,
     num_tile_columns: u32,
     num_tile_rows: u32,
+    /// `reserved2` (@44) through `numBwdRefs`, including the tile and
+    /// film-grain pointers — opaque here, left at the preset default. 68 bytes
+    /// so `output_bit_depth` lands at offset 112.
+    _reserved_to_bit_depth: [u32; 17],
+    /// `NV_ENC_CONFIG_AV1::outputBitDepth` (@112) / `inputBitDepth` (@116).
+    output_bit_depth: u32,
+    input_bit_depth: u32,
 }
 
 /// The head of `NV_ENC_CONFIG_H264`, up to `sliceMode`/`sliceModeData`. Overlaid
@@ -432,8 +451,15 @@ struct NvEncPresetConfig {
     reserved2: [*mut c_void; 64],
 }
 
-/// `NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE` — a single bitfield word.
-type MeHintCounts = u32;
+/// `NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE`: one bitfield word (four
+/// `numCandsPerBlk*:4` fields + `reserved:16`) *plus* `reserved1[3]` — 16
+/// bytes, not 4. This width is load-bearing: the field sits before `tuningInfo`
+/// in NV_ENC_INITIALIZE_PARAMS, so a 4-byte version shifts `tuningInfo` (and
+/// every field after it) back 24 bytes and the driver reads a zeroed
+/// tuningInfo — "Presets P1-P7 are only supported with valid ...tuningInfo".
+/// We never emit external ME hints, so the words stay zero; only the width
+/// matters. Same fix corrects the copy in `NvEncPicParams`.
+type MeHintCounts = [u32; 4];
 
 #[repr(C)]
 struct NvEncInitializeParams {
@@ -594,6 +620,7 @@ type FnGetSequenceParams =
     unsafe extern "C" fn(*mut c_void, *mut NvEncSequenceParamPayload) -> NvencStatus;
 type FnReconfigure = unsafe extern "C" fn(*mut c_void, *mut NvEncReconfigureParams) -> NvencStatus;
 type FnInvalidate = unsafe extern "C" fn(*mut c_void, u64) -> NvencStatus;
+type FnLastError = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 
 /// `NV_ENC_RECONFIGURE_PARAMS` — a re-init params block plus two flag bits.
 #[repr(C)]
@@ -698,7 +725,7 @@ impl<'a> Encoder<'a> {
         // SAFETY: live encoder; `init` is correctly versioned and its
         // `encode_config` points at `preset`, alive for this call.
         let status = unsafe { initialize(encoder, &mut init) };
-        check(status, "nvEncInitializeEncoder")?;
+        check(status, "nvEncInitializeEncoder", encoder, &nvenc.list)?;
 
         // One reusable output bitstream buffer.
         let create_bs: FnCreateBitstream = fnptr(nvenc.list.create_bitstream_buffer, "create_bs")?;
@@ -707,7 +734,7 @@ impl<'a> Encoder<'a> {
         bs.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         // SAFETY: live encoder; correctly versioned out-param.
         let status = unsafe { create_bs(encoder, &mut bs) };
-        check(status, "nvEncCreateBitstreamBuffer")?;
+        check(status, "nvEncCreateBitstreamBuffer", encoder, &nvenc.list)?;
 
         Ok(Encoder {
             session,
@@ -742,6 +769,8 @@ impl<'a> Encoder<'a> {
         check(
             unsafe { f(self.session.encoder, timestamp) },
             "nvEncInvalidateRefFrames",
+            self.session.encoder,
+            &self.session.nvenc.list,
         )
     }
 
@@ -767,7 +796,7 @@ impl<'a> Encoder<'a> {
         // SAFETY: live encoder; `params.re_init_encode_params.encode_config`
         // points at `preset`, alive for this call.
         let status = unsafe { reconfigure(encoder, &mut params) };
-        check(status, "nvEncReconfigureEncoder")?;
+        check(status, "nvEncReconfigureEncoder", encoder, &nvenc.list)?;
         self.cfg = cfg;
         Ok(())
     }
@@ -816,7 +845,12 @@ impl<'a> Encoder<'a> {
         p.out_spspps_payload_size = &mut size;
         // SAFETY: live encoder; `buf`/`size` are sized above and outlive the call.
         let status = unsafe { f(self.session.encoder, &mut p) };
-        check(status, "nvEncGetSequenceParams")?;
+        check(
+            status,
+            "nvEncGetSequenceParams",
+            self.session.encoder,
+            &self.session.nvenc.list,
+        )?;
         buf.truncate(size as usize);
         Ok(buf)
     }
@@ -923,7 +957,12 @@ impl<'a> Encoder<'a> {
         reg.buffer_usage = NV_ENC_INPUT_IMAGE;
         // SAFETY: live encoder; `input` is a live P010/NV12 surface of this size.
         let status = unsafe { register(self.session.encoder, &mut reg) };
-        check(status, "nvEncRegisterResource")?;
+        check(
+            status,
+            "nvEncRegisterResource",
+            self.session.encoder,
+            &self.session.nvenc.list,
+        )?;
         self.registered = Some((input, reg.registered_resource));
         Ok(reg.registered_resource)
     }
@@ -1033,7 +1072,7 @@ fn preset_config(
             &mut preset,
         )
     };
-    check(status, "nvEncGetEncodePresetConfigEx")?;
+    check(status, "nvEncGetEncodePresetConfigEx", encoder, &nvenc.list)?;
     preset.preset_cfg.version = NV_ENC_CONFIG_VER;
 
     // Rate control (CBR default, VBR when asked), one-frame VBV, one P per frame,
@@ -1076,6 +1115,10 @@ fn preset_config(
                 // outputMaxCll (bit 23) + outputMasteringDisplay (bit 24).
                 hevc.bitfields |= (1 << 23) | (1 << 24);
             }
+            // HEVC here is always 10-bit P010: tell NVENC so, in and out. Without
+            // it the session stays 8-bit and rejects the P010 input surface.
+            hevc.input_bit_depth = NV_ENC_BIT_DEPTH_10;
+            hevc.output_bit_depth = NV_ENC_BIT_DEPTH_10;
         }
         Codec::Av1 => {
             // SAFETY: the union begins with NV_ENC_CONFIG_AV1.
@@ -1095,6 +1138,9 @@ fn preset_config(
                 // outputMaxCll (bit 14) + outputMasteringDisplay (bit 15).
                 av1.bitfields |= (1 << 14) | (1 << 15);
             }
+            // AV1 here is always 10-bit P010: configure 10-bit in and out.
+            av1.input_bit_depth = NV_ENC_BIT_DEPTH_10;
+            av1.output_bit_depth = NV_ENC_BIT_DEPTH_10;
         }
         Codec::H264 => {
             // SAFETY: the union is NV_ENC_CONFIG_H264 for an H.264 encoder.
@@ -1150,10 +1196,41 @@ fn fnptr<T: Copy>(slot: *mut c_void, what: &str) -> Result<T, String> {
     Ok(unsafe { *(&slot as *const *mut c_void).cast::<T>() })
 }
 
-/// Turn a non-success status into an error.
-fn check(status: NvencStatus, what: &str) -> Result<(), String> {
+/// NVENC's own reason for the last failure on `encoder`, via
+/// `nvEncGetLastErrorString`. Returns `None` — and never fails — when the
+/// function slot, the handle, or the message is unavailable, so it can be called
+/// from the error path without itself becoming a source of errors.
+fn last_error(encoder: *mut c_void, list: &NvEncodeApiFunctionList) -> Option<String> {
+    if encoder.is_null() {
+        return None;
+    }
+    let get: FnLastError = fnptr(list.get_last_error_string, "nvEncGetLastErrorString").ok()?;
+    // SAFETY: `get` is the get_last_error_string slot from the function list and
+    // `encoder` is a live session handle. NVENC returns a pointer to a static,
+    // NUL-terminated C string (or null), owned by the driver and valid to read now.
+    let msg = unsafe { get(encoder) };
+    if msg.is_null() {
+        return None;
+    }
+    // SAFETY: `msg` is a non-null, NUL-terminated C string from the driver.
+    let msg = unsafe { CStr::from_ptr(msg) }
+        .to_string_lossy()
+        .into_owned();
+    (!msg.is_empty()).then_some(msg)
+}
+
+/// Turn a non-success status into an error, appending NVENC's own reason for the
+/// last failure on `encoder` when one is available.
+fn check(
+    status: NvencStatus,
+    what: &str,
+    encoder: *mut c_void,
+    list: &NvEncodeApiFunctionList,
+) -> Result<(), String> {
     if status == NV_ENC_SUCCESS {
         Ok(())
+    } else if let Some(msg) = last_error(encoder, list) {
+        Err(format!("{what} failed with {status}: {msg}"))
     } else {
         Err(format!("{what} failed with {status}"))
     }
@@ -1162,6 +1239,21 @@ fn check(status: NvencStatus, what: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The diagnostics path must never itself panic when NVENC's error-string
+    // slot or the encoder handle is unavailable: `check` then falls back to the
+    // bare numeric message rather than dereferencing a null.
+    #[test]
+    fn check_falls_back_to_the_numeric_message_without_an_encoder() {
+        // SAFETY: NvEncodeApiFunctionList is plain pointers + ints, so all-zero
+        // is a valid (inert) value; `last_error` guards the null encoder before
+        // it would ever read the (also null) error-string slot.
+        let list: NvEncodeApiFunctionList = unsafe { std::mem::zeroed() };
+        // 8 is NV_ENC_ERR_INVALID_PARAM — the code the box reported.
+        let err = check(8, "x", std::ptr::null_mut(), &list).unwrap_err();
+        assert_eq!(err, "x failed with 8");
+        assert!(check(NV_ENC_SUCCESS, "x", std::ptr::null_mut(), &list).is_ok());
+    }
 
     // The layouts are ABI contracts; a slip is caught here rather than as a
     // driver INVALID_VERSION on the box.
@@ -1173,5 +1265,25 @@ mod tests {
         // load-bearing; the codec union + reserved dominate it.
         assert_eq!(size_of::<NvEncConfig>() % 8, 0);
         assert!(size_of::<NvEncPicParams>() > 1024);
+        // NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE is 16 bytes; a 4-byte
+        // alias shifted tuningInfo off offset 0x88 and the driver rejected
+        // every P-preset init as "tuningInfo undefined".
+        assert_eq!(size_of::<MeHintCounts>(), 16);
+        assert_eq!(
+            std::mem::offset_of!(NvEncInitializeParams, tuning_info),
+            136
+        );
+        assert_eq!(
+            std::mem::offset_of!(NvEncInitializeParams, buffer_format),
+            140
+        );
+        // The 10-bit config enums must land where NVENC reads them
+        // (nvEncodeAPI 13.1.15), or a P010 session silently stays 8-bit.
+        assert_eq!(std::mem::offset_of!(HevcConfigHead, slice_mode_data), 56);
+        assert_eq!(std::mem::offset_of!(HevcConfigHead, output_bit_depth), 200);
+        assert_eq!(std::mem::offset_of!(HevcConfigHead, input_bit_depth), 204);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, num_tile_rows), 40);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, output_bit_depth), 112);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, input_bit_depth), 116);
     }
 }
