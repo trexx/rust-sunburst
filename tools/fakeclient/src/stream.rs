@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use sunburst_core::instr::{self, Collector, Stage};
 use sunburst_core::proto::{
-    Feedback, Hello, Seq16, ServerControl, StreamCodec, pairing::NONCE_LEN,
+    ClientControl, Feedback, Hello, Seq16, ServerControl, StreamCodec, pairing::NONCE_LEN,
 };
 use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
@@ -98,6 +98,13 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
         }
     }
     let config = config.ok_or("no SessionConfig arrived; is the server streaming?")?;
+
+    // Ask for an IDR now that we're consuming: the server fired its startup IDR
+    // the instant it spawned the pipeline, before this negotiation finished, so
+    // the reassembler missed it. A real client requests one the same way.
+    client
+        .send_control(&ClientControl::RequestIdr)
+        .map_err(|e| e.to_string())?;
 
     // The decoder-config bytes lead the dump so it stands alone; the forced-IDR
     // also inlines them, but a leading copy makes a raw file playable from byte 0.
