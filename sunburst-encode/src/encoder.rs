@@ -1066,7 +1066,13 @@ impl<'a> Encoder<'a> {
             let mut lb: NvEncLockBitstream = unsafe { std::mem::zeroed() };
             lb.version = NV_ENC_LOCK_BITSTREAM_VER;
             lb.output_bitstream = self.bitstream;
-            lb.bitfields = 1; // doNotWait — never block the drain
+            // Block on the first read so we wait for this frame's output to exist,
+            // then poll (doNotWait) for any further slices. A 4K AV1 frame is not
+            // ready within a busy-poll and does not trickle out incrementally the
+            // way HEVC slices do; with doNotWait-only the drain timed out, the frame
+            // (including the keyframe) was lost, and output accrued into a later
+            // giant drain. Synchronous encode (no completion event), so this is safe.
+            lb.bitfields = if consumed == 0 { 0 } else { 1 };
             // SAFETY: live encoder; `bitstream` is a live output buffer.
             if unsafe { lock(encoder, &mut lb) } == NV_ENC_SUCCESS {
                 let total = lb.bitstream_size_in_bytes as usize;
