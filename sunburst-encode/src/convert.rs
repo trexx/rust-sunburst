@@ -92,10 +92,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
 }
 "#;
 
-/// The scRGB FP16 → NV12 (BT.709 SDR) compute shader — the H.264 path. Same 2×2
-/// structure as the P010 shader, but 8-bit and Rec.709. With `TONEMAP` defined
-/// (an HDR-range source) it rolls HDR off to SDR with an ACES curve; otherwise it
-/// clamps an already-SDR source.
+/// The BT.709 SDR compute shader. Same 2×2 structure as the P010 shader, Rec.709.
+/// `TEN_BIT` selects 10-bit P010 output (SDR HEVC/AV1) vs 8-bit NV12 (H.264).
+/// `TONEMAP` (an HDR-range source) rolls HDR off to SDR with an ACES curve, else it
+/// clamps an already-SDR source. `SRGB_INPUT` decodes an 8-bit gamma desktop (DDA
+/// in SDR) to linear; without it the input is scRGB FP16 (already linear).
 const SDR_SHADER_HLSL: &[u8] = br#"
 Texture2D<float4>   src   : register(t0);   // scRGB linear FP16 (1.0 == 80 nits)
 RWTexture2D<float>  dstY  : register(u0);   // NV12 luma plane (R8)
@@ -113,8 +114,21 @@ float bt709_oetf(float c) {
     return c < 0.018 ? 4.5 * c : 1.099 * pow(c, 0.45) - 0.099;
 }
 
+#ifdef SRGB_INPUT
+// sRGB EOTF: an 8-bit gamma-encoded desktop (DDA in SDR) decoded to linear.
+float srgb_to_linear1(float c) {
+    c = saturate(c);
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+float3 decode_input(float3 c) {
+    return float3(srgb_to_linear1(c.r), srgb_to_linear1(c.g), srgb_to_linear1(c.b));
+}
+#else
+float3 decode_input(float3 c) { return c; }   // scRGB FP16 is already linear
+#endif
+
 float3 to_display(float3 rgb) {
-    float3 lin = max(rgb, 0.0);   // scRGB linear, 1.0 == 80 nits (SDR white)
+    float3 lin = decode_input(max(rgb, 0.0));   // linear, 1.0 == 80 nits (SDR white)
 #ifdef TONEMAP
     lin = aces(lin);              // HDR source: compress to SDR range
 #else
@@ -128,11 +142,20 @@ float3 rgb_to_ycbcr(float3 c) {   // c is gamma-encoded [0, 1]
     float y  = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
     float cb = (c.b - y) / 1.8556;
     float cr = (c.r - y) / 1.5748;
+#ifdef TEN_BIT
+    return float3(64.0 + y * 876.0, 512.0 + cb * 896.0, 512.0 + cr * 896.0);
+#else
     return float3(16.0 + y * 219.0, 128.0 + cb * 224.0, 128.0 + cr * 224.0);
+#endif
 }
 
-// An 8-bit code into an R8_UNORM texel.
-float nv8(float code8) { return saturate(code8 / 255.0); }
+// A code into its UNORM texel: 10-bit left-justified into R16 (P010) under
+// TEN_BIT, else 8-bit into R8 (NV12).
+#ifdef TEN_BIT
+float pack(float code) { return saturate(code * 64.0 / 65535.0); }
+#else
+float pack(float code) { return saturate(code / 255.0); }
+#endif
 
 float3 sample_ycc(uint2 p) { return rgb_to_ycbcr(to_display(src[p].rgb)); }
 
@@ -143,13 +166,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float3 b = sample_ycc(p + uint2(1, 0));
     float3 c = sample_ycc(p + uint2(0, 1));
     float3 d = sample_ycc(p + uint2(1, 1));
-    dstY[p + uint2(0, 0)] = nv8(a.x);
-    dstY[p + uint2(1, 0)] = nv8(b.x);
-    dstY[p + uint2(0, 1)] = nv8(c.x);
-    dstY[p + uint2(1, 1)] = nv8(d.x);
+    dstY[p + uint2(0, 0)] = pack(a.x);
+    dstY[p + uint2(1, 0)] = pack(b.x);
+    dstY[p + uint2(0, 1)] = pack(c.x);
+    dstY[p + uint2(1, 1)] = pack(d.x);
     float cb = (a.y + b.y + c.y + d.y) * 0.25;
     float cr = (a.z + b.z + c.z + d.z) * 0.25;
-    dstUV[tid.xy] = float2(nv8(cb), nv8(cr));
+    dstUV[tid.xy] = float2(pack(cb), pack(cr));
 }
 "#;
 
@@ -157,7 +180,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
 /// HEVC/AV1) or 8-bit NV12 (BT.709 SDR, for H.264).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConvertOutput {
+    /// 10-bit P010, BT.2020 PQ — HDR HEVC/AV1.
     P010,
+    /// 10-bit P010, BT.709 — SDR HEVC/AV1 (same surface as `P010`, SDR transfer).
+    P010Sdr,
+    /// 8-bit NV12, BT.709 — H.264 SDR.
     Nv12,
 }
 
@@ -165,7 +192,7 @@ impl ConvertOutput {
     /// The output texture format and its (luma, chroma) plane view formats.
     fn formats(self) -> (DXGI_FORMAT, DXGI_FORMAT, DXGI_FORMAT) {
         match self {
-            ConvertOutput::P010 => (
+            ConvertOutput::P010 | ConvertOutput::P010Sdr => (
                 DXGI_FORMAT_P010,
                 DXGI_FORMAT_R16_UNORM,
                 DXGI_FORMAT_R16G16_UNORM,
@@ -207,6 +234,7 @@ impl Converter {
         like: &ID3D11Texture2D,
         output: ConvertOutput,
         hdr_source: bool,
+        srgb_input: bool,
     ) -> Result<Converter, String> {
         // SAFETY: `like` is a live texture; GetDevice/GetImmediateContext hand
         // back refcounted interfaces `windows` releases.
@@ -215,11 +243,13 @@ impl Converter {
         let context =
             unsafe { device.GetImmediateContext() }.map_err(err("GetImmediateContext"))?;
 
-        let (src, tonemap) = match output {
-            ConvertOutput::P010 => (SHADER_HLSL, false),
-            ConvertOutput::Nv12 => (SDR_SHADER_HLSL, hdr_source),
+        let (src, tonemap, ten_bit) = match output {
+            ConvertOutput::P010 => (SHADER_HLSL, false, false),
+            // P010Sdr is SDR content, so never tonemap; 10-bit P010 packing.
+            ConvertOutput::P010Sdr => (SDR_SHADER_HLSL, false, true),
+            ConvertOutput::Nv12 => (SDR_SHADER_HLSL, hdr_source, false),
         };
-        let bytecode = compile(src, tonemap)?;
+        let bytecode = compile(src, tonemap, ten_bit, srgb_input)?;
         let mut shader = None;
         // SAFETY: `bytecode` is valid DXBC from D3DCompile; out-param is written.
         unsafe { device.CreateComputeShader(&bytecode, None, Some(&mut shader)) }
@@ -357,21 +387,38 @@ impl Converter {
 
 /// Runtime-compile `src` to DXBC. `tonemap` defines `TONEMAP` for the SDR shader
 /// (HDR→SDR roll-off); it is inert in the P010 shader.
-fn compile(src: &[u8], tonemap: bool) -> Result<Vec<u8>, String> {
+fn compile(src: &[u8], tonemap: bool, ten_bit: bool, srgb_input: bool) -> Result<Vec<u8>, String> {
     let mut code = None;
     let mut errors = None;
     // A `{name, definition}` list terminated by `{null, null}`, per D3DCompile.
-    let defines = [
-        D3D_SHADER_MACRO {
+    let mut defines: Vec<D3D_SHADER_MACRO> = Vec::new();
+    if tonemap {
+        defines.push(D3D_SHADER_MACRO {
             Name: s!("TONEMAP"),
             Definition: s!("1"),
-        },
-        D3D_SHADER_MACRO {
+        });
+    }
+    if ten_bit {
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("TEN_BIT"),
+            Definition: s!("1"),
+        });
+    }
+    if srgb_input {
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("SRGB_INPUT"),
+            Definition: s!("1"),
+        });
+    }
+    let pdefines = if defines.is_empty() {
+        None
+    } else {
+        defines.push(D3D_SHADER_MACRO {
             Name: PCSTR::null(),
             Definition: PCSTR::null(),
-        },
-    ];
-    let pdefines = tonemap.then_some(defines.as_ptr());
+        });
+        Some(defines.as_ptr())
+    };
     // SAFETY: source is a valid byte slice; entry/target are NUL-terminated; the
     // macro list is NUL-terminated and outlives the call; out-params are written.
     let hr = unsafe {

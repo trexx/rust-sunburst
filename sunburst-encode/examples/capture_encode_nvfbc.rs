@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp: written as u64,
             force_idr: written == 0,
         };
-        enc.encode_slices(p010 as *mut c_void, req, |slice| {
+        enc.encode_slices(p010 as *mut c_void, req, |slice, _is_idr| {
             bytes += slice.len();
             let _ = file.write_all(slice);
         })?;

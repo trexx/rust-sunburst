@@ -237,6 +237,36 @@ impl StreamControl for SessionManager {
         // H.264 is SDR (tonemapped): never enable HDR on the desktop for it.
         let want_hdr = settings.hdr && codec != StreamCodec::H264;
 
+        // Set the display up BEFORE spawning the pipeline, so capture starts on the
+        // final desktop (correct HDR state + resolution) instead of the old one.
+        // Otherwise the pipeline captures the pre-toggle desktop, encodes a burst of
+        // SDR frames with the wrong colour signalling, then takes an AccessLost when
+        // the mode changes. Bring the virtual display up first (if opted in), so it
+        // is an active output before HDR is toggled; absent, fall back to physical.
+        let vdd = if settings.virtual_display {
+            let enabled = VirtualDisplay::enable();
+            if enabled.is_none() {
+                eprintln!(
+                    "display: virtual_display requested but no VDD is installed; \
+                     streaming the physical display"
+                );
+            }
+            enabled
+        } else {
+            None
+        };
+        // Resolution matching only touches the physical display; when the virtual
+        // display is active it provides the resolution instead (Phase 7 commit 4).
+        let resolution = (settings.match_resolution && !settings.virtual_display).then(|| {
+            (
+                hello.width,
+                hello.height,
+                display::refresh_hz(hello.refresh_mhz),
+            )
+        });
+        let display_guard = DisplayGuard::apply(want_hdr, resolution);
+        let epp_guard = settings.disable_epp.then(EppGuard::disable);
+
         let socket = self.socket.try_clone().ok()?;
         let shared = StreamShared::new(bitrate_kbps);
         let (headers_tx, headers_rx) = mpsc::channel();
@@ -322,34 +352,6 @@ impl StreamControl for SessionManager {
             .as_deref()
             .filter(|d| !d.is_empty())
             .map(|d| MicPipeline::spawn(d.to_string()));
-
-        // Bring up the virtual display first (if opted in and installed), so it is
-        // an active output before HDR is toggled; absent, fall back to physical.
-        let vdd = if settings.virtual_display {
-            let enabled = VirtualDisplay::enable();
-            if enabled.is_none() {
-                eprintln!(
-                    "display: virtual_display requested but no VDD is installed; \
-                     streaming the physical display"
-                );
-            }
-            enabled
-        } else {
-            None
-        };
-
-        // Set the display up for the session and hold the guard that restores it.
-        // Resolution matching only touches the physical display; when the virtual
-        // display is active it provides the resolution instead (Phase 7 commit 4).
-        let resolution = (settings.match_resolution && !settings.virtual_display).then(|| {
-            (
-                hello.width,
-                hello.height,
-                display::refresh_hz(hello.refresh_mhz),
-            )
-        });
-        let display_guard = DisplayGuard::apply(want_hdr, resolution);
-        let epp_guard = settings.disable_epp.then(EppGuard::disable);
 
         // Rate-controller bounds from config: the floor (never above the target),
         // and a ceiling the controller may climb to (the explicit max when set,

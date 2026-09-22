@@ -124,6 +124,50 @@ const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x0000_0001;
 /// `pixelBitDepthMinus8`. Leaving it unset keeps the session 8-bit, and then
 /// nvEncRegisterResource rejects a P010 surface with INVALID_PARAM.
 const NV_ENC_BIT_DEPTH_10: u32 = 10;
+/// `NV_ENC_VUI_*` color-description enum values (nvEncodeAPI 13.1.15): BT.709 for
+/// SDR, BT.2020 primaries + PQ (SMPTE 2084) transfer + BT.2020 non-constant-luminance
+/// matrix for HDR10. Written into the HEVC VUI / AV1 sequence-header color_config.
+const NV_ENC_VUI_PRIMARIES_BT709: u32 = 1;
+const NV_ENC_VUI_PRIMARIES_BT2020: u32 = 9;
+const NV_ENC_VUI_TRANSFER_BT709: u32 = 1;
+const NV_ENC_VUI_TRANSFER_SMPTE2084: u32 = 16;
+const NV_ENC_VUI_MATRIX_BT709: u32 = 1;
+const NV_ENC_VUI_MATRIX_BT2020_NCL: u32 = 9;
+/// `NV_ENC_PIC_TYPE` values NVENC reports in `NV_ENC_LOCK_BITSTREAM::pictureType`.
+/// Only IDR matters here: it is the wire keyframe flag, set from what NVENC
+/// actually produced (so an auto-inserted periodic IDR is flagged too), not from
+/// the force-IDR request.
+const NV_ENC_PIC_TYPE_IDR: u32 = 0x03;
+
+/// The colorimetry the encoder tags the bitstream with (HEVC VUI / AV1 sequence
+/// header), matched to what the convert stage produced so the decoder interprets
+/// the pixels correctly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColorSpace {
+    /// BT.709 primaries + transfer + matrix — SDR.
+    Bt709,
+    /// BT.2020 primaries, PQ transfer, BT.2020-NCL matrix — HDR10.
+    Bt2020Pq,
+}
+
+impl ColorSpace {
+    /// `(colour_primaries, transfer_characteristics, matrix_coefficients)` as
+    /// `NV_ENC_VUI_*` enum values.
+    fn vui(self) -> (u32, u32, u32) {
+        match self {
+            ColorSpace::Bt709 => (
+                NV_ENC_VUI_PRIMARIES_BT709,
+                NV_ENC_VUI_TRANSFER_BT709,
+                NV_ENC_VUI_MATRIX_BT709,
+            ),
+            ColorSpace::Bt2020Pq => (
+                NV_ENC_VUI_PRIMARIES_BT2020,
+                NV_ENC_VUI_TRANSFER_SMPTE2084,
+                NV_ENC_VUI_MATRIX_BT2020_NCL,
+            ),
+        }
+    }
+}
 /// `NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX`.
 const NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX: u32 = 0;
 /// `NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR`.
@@ -172,6 +216,8 @@ pub struct EncoderConfig {
     /// subframe readback.
     pub slices: u32,
     pub hdr: Option<HdrMetadata>,
+    /// The colorimetry to tag the bitstream with, matched to the convert output.
+    pub color: ColorSpace,
     /// `(period, count)` for gradual intra refresh, or `None`. Gated on the
     /// decoder's quirks and the encoder's caps by the caller.
     pub intra_refresh: Option<(u32, u32)>,
@@ -205,6 +251,7 @@ impl EncoderConfig {
             bitrate_kbps: 120_000,
             slices,
             hdr: None,
+            color: ColorSpace::Bt709,
             intra_refresh: None,
             dpb_depth: 8,
             preset: 1,
@@ -308,10 +355,19 @@ struct HevcConfigHead {
     pps_id: u32,
     slice_mode: u32,
     slice_mode_data: u32,
-    /// `maxTemporalLayersMinus1` (@60) through `disableDeblockingFilterIDC`,
-    /// including the embedded VUI parameters — opaque here, left at the preset
-    /// default. 140 bytes so `output_bit_depth` lands at offset 200.
-    _reserved_to_bit_depth: [u32; 35],
+    max_temporal_layers_minus1: u32, // @60
+    // NV_ENC_CONFIG_HEVC_VUI_PARAMETERS (@64, 112 bytes); only the color-signaling
+    // words are named, the rest is opaque (left at the preset default).
+    _vui_pad0: [u32; 2],                  // overscan* (@64,@68)
+    video_signal_type_present_flag: u32,  // @72
+    _vui_pad1: u32,                       // videoFormat (@76)
+    video_full_range_flag: u32,           // @80
+    colour_description_present_flag: u32, // @84
+    colour_primaries: u32,                // @88
+    transfer_characteristics: u32,        // @92
+    colour_matrix: u32,                   // @96
+    // rest of the VUI (@100) through disableDeblockingFilterIDC (@196) — 100 bytes.
+    _reserved_to_bit_depth: [u32; 25],
     /// `NV_ENC_CONFIG_HEVC::outputBitDepth` (@200) / `inputBitDepth` (@204).
     output_bit_depth: u32,
     input_bit_depth: u32,
@@ -334,40 +390,59 @@ struct Av1ConfigHead {
     max_num_ref_frames_in_dpb: u32,
     num_tile_columns: u32,
     num_tile_rows: u32,
-    /// `reserved2` (@44) through `numBwdRefs`, including the tile and
-    /// film-grain pointers — opaque here, left at the preset default. 68 bytes
-    /// so `output_bit_depth` lands at offset 112.
-    _reserved_to_bit_depth: [u32; 17],
+    // reserved2 (@44), tileWidths (@48, ptr), tileHeights (@56, ptr),
+    // maxTemporalLayersMinus1 (@64) — opaque, left at the preset default.
+    _pad_to_color: [u32; 6],       // @44..68
+    color_primaries: u32,          // @68
+    transfer_characteristics: u32, // @72
+    matrix_coefficients: u32,      // @76
+    color_range: u32,              // @80
+    // chromaSamplePosition (@84) through numBwdRefs (@108), incl. filmGrainParams
+    // (ptr) + its alignment pad — opaque. 28 bytes.
+    _reserved_to_bit_depth: [u32; 7],
     /// `NV_ENC_CONFIG_AV1::outputBitDepth` (@112) / `inputBitDepth` (@116).
     output_bit_depth: u32,
     input_bit_depth: u32,
 }
 
-/// The head of `NV_ENC_CONFIG_H264`, up to `sliceMode`/`sliceModeData`. Overlaid
-/// on the codec-config union (which is a `NV_ENC_CONFIG_H264` for an H.264
-/// encoder) to set slicing and intra-refresh, without transcribing all ~90
-/// fields. `enableIntraRefresh` is bit 10 of the first flag word (counting from
-/// `enableTemporalSVC`). The five enum fields between `idrPeriod` and
-/// `intraRefreshPeriod` (adaptive-transform, FMO, B-direct, entropy-coding,
-/// stereo) are left at the driver default (0).
+/// The head of `NV_ENC_CONFIG_H264` — up to the VUI colour description — overlaid
+/// on the codec-config union for an H.264 encoder to set slicing, intra-refresh
+/// and the BT.709 colour signalling, without transcribing all ~90 fields.
+/// `enableIntraRefresh` is bit 10 of the first flag word (from `enableTemporalSVC`).
+/// The fields after `idrPeriod` are separate `uint32_t`s (`separateColourPlaneFlag`,
+/// `disableDeblockingFilterIDC`, `numTemporalLayers`, `spsId`, `ppsId`), NOT one
+/// packed word — modelling them as one shifted `maxNumRefFrames`/`sliceMode` 16
+/// bytes low, so slicing/refs were silently misconfigured. Offsets asserted below.
 #[repr(C)]
 struct H264ConfigHead {
-    /// `enableTemporalSVC:1 … enableIntraRefresh:1 (bit 10) … reserved`.
-    flags: u32,
-    level: u32,
-    idr_period: u32,
-    /// `separateColourPlaneFlag:1, disableDeblockingFilterIDC:2, numTemporalLayers:4, spsId:8, ppsId:8, …`.
-    bitfields2: u32,
-    adaptive_transform_mode: u32,
-    fmo_mode: u32,
-    bdirect_mode: u32,
-    entropy_coding_mode: u32,
-    stereo_mode: u32,
-    intra_refresh_period: u32,
-    intra_refresh_cnt: u32,
-    max_num_ref_frames: u32,
-    slice_mode: u32,
-    slice_mode_data: u32,
+    /// `enableTemporalSVC:1 … enableIntraRefresh:1 (bit 10) … reservedBitFields:10`.
+    flags: u32, // @0
+    level: u32,                         // @4
+    idr_period: u32,                    // @8
+    separate_colour_plane_flag: u32,    // @12
+    disable_deblocking_filter_idc: u32, // @16
+    num_temporal_layers: u32,           // @20
+    sps_id: u32,                        // @24
+    pps_id: u32,                        // @28
+    adaptive_transform_mode: u32,       // @32
+    fmo_mode: u32,                      // @36
+    bdirect_mode: u32,                  // @40
+    entropy_coding_mode: u32,           // @44
+    stereo_mode: u32,                   // @48
+    intra_refresh_period: u32,          // @52
+    intra_refresh_cnt: u32,             // @56
+    max_num_ref_frames: u32,            // @60
+    slice_mode: u32,                    // @64
+    slice_mode_data: u32,               // @68
+    // h264VUIParameters (@72, 112 bytes); only the colour words are named.
+    _vui_pad0: [u32; 2],                  // overscan* (@72,@76)
+    video_signal_type_present_flag: u32,  // @80
+    _vui_pad1: u32,                       // videoFormat (@84)
+    video_full_range_flag: u32,           // @88
+    colour_description_present_flag: u32, // @92
+    colour_primaries: u32,                // @96
+    transfer_characteristics: u32,        // @100
+    colour_matrix: u32,                   // @104
 }
 
 /// `NV_ENC_CONFIG_H264`'s `enableIntraRefresh` — bit 10 of the first flag word.
@@ -398,6 +473,10 @@ struct HevcPicParamsHead {
     time_code: [u32; 8],
     num_temporal_layers: u32,
     view_id: u32,
+    /// `p3DReferenceDisplayInfo` (@112) — left null. Omitting it lands
+    /// `p_max_cll`/`p_mastering_display` 8 bytes low, so NVENC dereferences
+    /// garbage on the HDR path (a crash the first time HDR is actually active).
+    p_3d_reference_display_info: *mut c_void,
     p_max_cll: *const c_void,
     p_mastering_display: *const c_void,
 }
@@ -550,7 +629,10 @@ struct NvEncPicParams {
     buffer_fmt: u32,
     picture_struct: u32,
     picture_type: u32,
-    codec_pic_params: [u32; 256],
+    /// `NV_ENC_CODEC_PIC_PARAMS` (1544 bytes). `u64` not `u32` so the union is
+    /// 8-byte aligned at offset 80, matching NVENC — a `[u32; 256]` lands it at 76
+    /// and every pointer written into it (HDR SEI) is 4 bytes off (NVENC crash).
+    codec_pic_params: [u64; 193],
     me_hint_counts_per_block: [MeHintCounts; 2],
     me_external_hints: *mut c_void,
     reserved2: [u32; 7],
@@ -881,8 +963,8 @@ impl<'a> Encoder<'a> {
         &mut self,
         input: *mut c_void,
         req: PicRequest,
-        mut on_slice: impl FnMut(&[u8]),
-    ) -> Result<(), String> {
+        mut on_slice: impl FnMut(&[u8], bool),
+    ) -> Result<bool, String> {
         let registered = self.ensure_registered(input)?;
         let list = &self.session.nvenc.list;
         let encoder = self.session.encoder;
@@ -969,7 +1051,7 @@ impl<'a> Encoder<'a> {
 
     /// Drain the bitstream slice-by-slice with non-blocking locks, emitting each
     /// newly-available chunk. Stops once locks stop yielding new bytes.
-    fn drain_slices(&self, on_slice: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+    fn drain_slices(&self, on_slice: &mut dyn FnMut(&[u8], bool)) -> Result<bool, String> {
         let list = &self.session.nvenc.list;
         let encoder = self.session.encoder;
         let lock: FnLock = fnptr(list.lock_bitstream, "lock")?;
@@ -977,6 +1059,7 @@ impl<'a> Encoder<'a> {
 
         let mut consumed = 0usize;
         let mut idle = 0u32;
+        let mut is_idr = false;
         // Bounded so a misbehaving driver cannot spin forever.
         for _ in 0..1024 {
             // SAFETY: plain data.
@@ -996,7 +1079,8 @@ impl<'a> Encoder<'a> {
                             total - consumed,
                         )
                     };
-                    on_slice(slice);
+                    is_idr = lb.picture_type == NV_ENC_PIC_TYPE_IDR;
+                    on_slice(slice, is_idr);
                     consumed = total;
                     idle = 0;
                 } else {
@@ -1012,7 +1096,7 @@ impl<'a> Encoder<'a> {
             }
             std::thread::yield_now();
         }
-        Ok(())
+        Ok(is_idr)
     }
 
     fn unregister(&self, registered: *mut c_void) {
@@ -1119,6 +1203,15 @@ fn preset_config(
             // it the session stays 8-bit and rejects the P010 input surface.
             hevc.input_bit_depth = NV_ENC_BIT_DEPTH_10;
             hevc.output_bit_depth = NV_ENC_BIT_DEPTH_10;
+            // Signal the color description so the decoder reads the pixels the
+            // convert stage produced (BT.709 SDR vs BT.2020 PQ), not a guess.
+            let (primaries, transfer, matrix) = cfg.color.vui();
+            hevc.video_signal_type_present_flag = 1;
+            hevc.colour_description_present_flag = 1;
+            hevc.video_full_range_flag = 0; // limited range, matching the shaders
+            hevc.colour_primaries = primaries;
+            hevc.transfer_characteristics = transfer;
+            hevc.colour_matrix = matrix;
         }
         Codec::Av1 => {
             // SAFETY: the union begins with NV_ENC_CONFIG_AV1.
@@ -1141,6 +1234,12 @@ fn preset_config(
             // AV1 here is always 10-bit P010: configure 10-bit in and out.
             av1.input_bit_depth = NV_ENC_BIT_DEPTH_10;
             av1.output_bit_depth = NV_ENC_BIT_DEPTH_10;
+            // AV1 sequence-header color_config (always present, no gating flag).
+            let (primaries, transfer, matrix) = cfg.color.vui();
+            av1.color_primaries = primaries;
+            av1.transfer_characteristics = transfer;
+            av1.matrix_coefficients = matrix;
+            av1.color_range = 0; // studio/limited, matching the shaders
         }
         Codec::H264 => {
             // SAFETY: the union is NV_ENC_CONFIG_H264 for an H.264 encoder.
@@ -1155,7 +1254,14 @@ fn preset_config(
                 h264.intra_refresh_period = period;
                 h264.intra_refresh_cnt = count;
             }
-            // No HDR arm: NVENC H.264 is 8-bit SDR (cfg.hdr is None here).
+            // H.264 is always 8-bit SDR BT.709 (no HDR): signal it so the decoder
+            // does not guess, matching the NV12 BT.709 convert.
+            h264.video_signal_type_present_flag = 1;
+            h264.colour_description_present_flag = 1;
+            h264.video_full_range_flag = 0;
+            h264.colour_primaries = NV_ENC_VUI_PRIMARIES_BT709;
+            h264.transfer_characteristics = NV_ENC_VUI_TRANSFER_BT709;
+            h264.colour_matrix = NV_ENC_VUI_MATRIX_BT709;
         }
     }
     Ok(preset)
@@ -1264,7 +1370,10 @@ mod tests {
         // NV_ENC_CONFIG is embedded in NV_ENC_PRESET_CONFIG, so its size is
         // load-bearing; the codec union + reserved dominate it.
         assert_eq!(size_of::<NvEncConfig>() % 8, 0);
-        assert!(size_of::<NvEncPicParams>() > 1024);
+        assert_eq!(size_of::<NvEncPicParams>(), 3360);
+        // The codec-pic-params union must be 8-byte aligned at 80, or the HDR-SEI
+        // pointers written into it land 4 bytes off and NVENC dereferences garbage.
+        assert_eq!(std::mem::offset_of!(NvEncPicParams, codec_pic_params), 80);
         // NVENC_EXTERNAL_ME_HINT_COUNTS_PER_BLOCKTYPE is 16 bytes; a 4-byte
         // alias shifted tuningInfo off offset 0x88 and the driver rejected
         // every P-preset init as "tuningInfo undefined".
@@ -1285,5 +1394,51 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Av1ConfigHead, num_tile_rows), 40);
         assert_eq!(std::mem::offset_of!(Av1ConfigHead, output_bit_depth), 112);
         assert_eq!(std::mem::offset_of!(Av1ConfigHead, input_bit_depth), 116);
+        // Color-description fields must land where NVENC reads them (13.1.15).
+        assert_eq!(
+            std::mem::offset_of!(HevcConfigHead, video_signal_type_present_flag),
+            72
+        );
+        assert_eq!(
+            std::mem::offset_of!(HevcConfigHead, video_full_range_flag),
+            80
+        );
+        assert_eq!(
+            std::mem::offset_of!(HevcConfigHead, colour_description_present_flag),
+            84
+        );
+        assert_eq!(std::mem::offset_of!(HevcConfigHead, colour_primaries), 88);
+        assert_eq!(
+            std::mem::offset_of!(HevcConfigHead, transfer_characteristics),
+            92
+        );
+        assert_eq!(std::mem::offset_of!(HevcConfigHead, colour_matrix), 96);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, color_primaries), 68);
+        assert_eq!(
+            std::mem::offset_of!(Av1ConfigHead, transfer_characteristics),
+            72
+        );
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, matrix_coefficients), 76);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, color_range), 80);
+        // HDR-SEI pointer offsets in the pic params — a slip dereferences garbage
+        // in NVENC (segfault) the first time HDR is active.
+        assert_eq!(std::mem::offset_of!(HevcPicParamsHead, p_max_cll), 120);
+        assert_eq!(
+            std::mem::offset_of!(HevcPicParamsHead, p_mastering_display),
+            128
+        );
+        assert_eq!(std::mem::offset_of!(Av1PicParamsHead, p_max_cll), 88);
+        assert_eq!(
+            std::mem::offset_of!(Av1PicParamsHead, p_mastering_display),
+            96
+        );
+        // H.264 config layout (the fields after idrPeriod are separate u32s) + VUI.
+        assert_eq!(std::mem::offset_of!(H264ConfigHead, max_num_ref_frames), 60);
+        assert_eq!(std::mem::offset_of!(H264ConfigHead, slice_mode_data), 68);
+        assert_eq!(
+            std::mem::offset_of!(H264ConfigHead, video_signal_type_present_flag),
+            80
+        );
+        assert_eq!(std::mem::offset_of!(H264ConfigHead, colour_primaries), 96);
     }
 }

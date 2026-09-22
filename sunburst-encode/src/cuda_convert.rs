@@ -63,7 +63,7 @@ impl CudaConverter {
 
         // Pick the kernel, its output pitch/size, and destination element stride.
         let (ptx_src, kernel_name, pitch_bytes, bytes) = match output {
-            ConvertOutput::P010 => (
+            ConvertOutput::P010 | ConvertOutput::P010Sdr => (
                 KERNEL_PTX_P010,
                 "argb10_to_p010",
                 width * 2,
@@ -84,7 +84,7 @@ impl CudaConverter {
         };
         // Elements: u16 for P010 (pitch/2), u8 for NV12 (pitch).
         let dst_pitch_elems = match output {
-            ConvertOutput::P010 => (pitch_bytes / 2) as i32,
+            ConvertOutput::P010 | ConvertOutput::P010Sdr => (pitch_bytes / 2) as i32,
             ConvertOutput::Nv12 => pitch_bytes as i32,
         };
 

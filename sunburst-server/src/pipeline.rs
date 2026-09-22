@@ -33,12 +33,12 @@ use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use sunburst_capture::cuda::{CuContext, CuDevicePtr};
-use sunburst_capture::{CaptureError, Frame, OutputSelect, select};
+use sunburst_capture::{CaptureError, Frame, OutputSelect, TextureFormat, select};
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{Header, Nack, Seq16};
 use sunburst_encode::convert::{ConvertOutput, Converter};
 use sunburst_encode::cuda_convert::CudaConverter;
-use sunburst_encode::encoder::{Codec, Encoder, EncoderConfig, PicRequest};
+use sunburst_encode::encoder::{Codec, ColorSpace, Encoder, EncoderConfig, PicRequest};
 use sunburst_encode::nvenc::Nvenc;
 use sunburst_net::send::Sender;
 use sunburst_net::send::windows::WsaSender;
@@ -287,6 +287,7 @@ fn gpu_loop(
     let mut frame_id = Seq16(0);
     let mut frame_ts: u64 = 0;
     let mut need_keyframe = true;
+    let mut current_color: Option<ConvertOutput> = None;
     let mut last_kbps = params.target_kbps_seed();
 
     // The frame-rate governor: one encode per client frame interval, taking the
@@ -334,10 +335,18 @@ fn gpu_loop(
 
         // Convert to P010 on the surface's own path, building the spine and the
         // encoder (and emitting the codec headers) on the first frame.
-        let (input, first_build) =
-            build_and_convert(&mut spine, &nvenc, params, capture.as_ref(), frame)?;
+        let (input, first_build) = build_and_convert(
+            &mut spine,
+            &nvenc,
+            params,
+            capture.as_ref(),
+            frame,
+            &mut current_color,
+        )?;
         instr::record(Stage::ColorConvert, fid.0 as u32);
         if first_build {
+            // A freshly (re)built encoder must open on an IDR.
+            need_keyframe = true;
             let enc = spine.as_mut().expect("just built").encoder();
             let sequence = match params.codec {
                 // HEVC and H.264 send their Annex-B parameter sets (VPS/SPS/PPS,
@@ -385,25 +394,38 @@ fn gpu_loop(
 
         instr::record(Stage::EncodeSubmit, fid.0 as u32);
         need_keyframe = false;
-        packetizer.begin_frame(fid, qpc, force_idr);
         let req = PicRequest {
             timestamp: frame_ts,
             force_idr,
         };
-        enc.encode_slices(input, req, |unit| {
+        // The wire keyframe flag comes from NVENC's actual encoded picture type,
+        // not the request, so an auto-inserted periodic IDR (finite idr_period) is
+        // flagged too. begin_frame is deferred to the first emitted unit, when the
+        // type is known.
+        let mut begun = false;
+        let is_idr = enc.encode_slices(input, req, |unit, unit_is_idr| {
             instr::record(Stage::EncodeUnitOut, fid.0 as u32);
+            if !begun {
+                packetizer.begin_frame(fid, qpc, unit_is_idr);
+                begun = true;
+            }
             packetizer.push_unit(unit, |pkt| {
                 producer.push(pkt);
             });
             instr::record(Stage::Packetize, fid.0 as u32);
             send_thread.unpark();
         })?;
+        if !begun {
+            // No units emitted (abnormal); open an empty frame so finish_frame has
+            // valid state.
+            packetizer.begin_frame(fid, qpc, is_idr);
+        }
         packetizer.finish_frame(|pkt| {
             producer.push(pkt);
         });
         send_thread.unpark();
 
-        refs.on_encoded(fid, frame_ts, force_idr);
+        refs.on_encoded(fid, frame_ts, is_idr);
         frame_id = frame_id.next();
         frame_ts += 1;
     }
@@ -418,6 +440,7 @@ fn build_and_convert<'a>(
     params: &PipelineParams,
     capture: &dyn sunburst_capture::Capture,
     frame: Frame,
+    current_color: &mut Option<ConvertOutput>,
 ) -> Result<(*mut c_void, bool), String> {
     let mut ecfg = EncoderConfig::new(params.codec, params.width, params.height);
     ecfg.fps = params.fps;
@@ -428,17 +451,30 @@ fn build_and_convert<'a>(
     ecfg.preset = params.preset;
     ecfg.vbr = params.vbr;
     ecfg.idr_period = params.idr_period;
-    // H.264 is 8-bit SDR: no HDR mastering, and an NV12 (tonemapped) convert.
-    let hdr_source = capture.caps().hdr_metadata.is_some();
-    let (output, sdr) = match params.codec {
-        Codec::H264 => (ConvertOutput::Nv12, true),
-        Codec::Hevc | Codec::Av1 => (ConvertOutput::P010, false),
+    // The color path follows the *actual* captured desktop state (per frame),
+    // not the codec: HEVC/AV1 encode BT.2020 PQ (P010) only when the source is
+    // genuinely HDR, else BT.709 (P010Sdr); H.264 is always BT.709 NV12. So a
+    // live HDR<->SDR flip changes `output` and rebuilds the spine below.
+    let frame_hdr = frame.meta().hdr;
+    let hdr_source = frame_hdr;
+    let (output, color) = match params.codec {
+        Codec::H264 => (ConvertOutput::Nv12, ColorSpace::Bt709),
+        Codec::Hevc | Codec::Av1 if frame_hdr => (ConvertOutput::P010, ColorSpace::Bt2020Pq),
+        Codec::Hevc | Codec::Av1 => (ConvertOutput::P010Sdr, ColorSpace::Bt709),
     };
-    ecfg.hdr = if sdr {
-        None
-    } else {
+    ecfg.color = color;
+    // Mastering-display / MaxCLL SEI only when the source is genuinely HDR.
+    ecfg.hdr = if frame_hdr {
         capture.caps().hdr_metadata
+    } else {
+        None
     };
+    // A color-path change with no AccessLost (e.g. Win11 per-app HDR) drops the
+    // spine so it rebuilds with the new shader + VUI; the caller forces an IDR.
+    if *current_color != Some(output) {
+        *spine = None;
+        *current_color = Some(output);
+    }
 
     match frame {
         Frame::Texture(tf) => {
@@ -450,7 +486,8 @@ fn build_and_convert<'a>(
                     unsafe { tf.texture.GetDevice() }.map_err(|e| e.to_string())?;
                 ecfg.width = w;
                 ecfg.height = h;
-                let converter = Converter::new(&tf.texture, output, hdr_source)?;
+                let srgb_input = matches!(tf.format, TextureFormat::Bgra8);
+                let converter = Converter::new(&tf.texture, output, hdr_source, srgb_input)?;
                 let encoder = Encoder::new(nvenc, device.as_raw(), &ecfg)?;
                 *spine = Some(Spine::D3d11 { converter, encoder });
             }

@@ -101,6 +101,24 @@ impl WgcCapture {
                     out.GetDesc().map_err(backend)?.Monitor
                 }
             };
+
+            // HDR state for the captured monitor, matched by HMONITOR, via the
+            // same DXGI-output query DDA uses: WGC's FP16 pool carries SDR and HDR
+            // alike, so this is what distinguishes them. SDR if no output matches.
+            let (hdr, hdr_metadata) = {
+                let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
+                let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).map_err(backend)?;
+                let mut found = (false, None);
+                let mut i = 0;
+                while let Ok(out) = adapter.EnumOutputs(i) {
+                    if out.GetDesc().map(|d| d.Monitor == hmon).unwrap_or(false) {
+                        found = crate::dda::output_hdr(&out);
+                        break;
+                    }
+                    i += 1;
+                }
+                found
+            };
             let interop: IGraphicsCaptureItemInterop =
                 windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                     .map_err(backend)?;
@@ -147,13 +165,13 @@ impl WgcCapture {
                 frame_ready,
                 caps: Caps {
                     backend: Backend::Wgc,
-                    // The FP16 pool carries scRGB; whether the output is true HDR
-                    // (PQ) + its mastering metadata is a DXGI-output query shared
-                    // with DDA — a refinement.
-                    hdr: false,
+                    // The FP16 pool carries scRGB for both SDR and HDR desktops;
+                    // `hdr` (from the DXGI output query above) is what says which,
+                    // so the convert stage picks BT.709 vs BT.2020 PQ correctly.
+                    hdr,
                     width: size.Width.max(0) as u32,
                     height: size.Height.max(0) as u32,
-                    hdr_metadata: None,
+                    hdr_metadata,
                 },
             })
         }

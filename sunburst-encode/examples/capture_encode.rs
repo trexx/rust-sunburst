@@ -60,7 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let conv = match &mut converter {
             Some(c) => c,
-            None => converter.insert(Converter::new(&tf.texture, output, hdr.is_some())?),
+            None => converter.insert(Converter::new(
+                &tf.texture,
+                output,
+                hdr.is_some(),
+                matches!(tf.format, sunburst_capture::TextureFormat::Bgra8),
+            )?),
         };
         let p010 = conv.convert(&tf.texture, w, h)?;
         let p010_raw = p010.as_raw();
@@ -82,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp: written as u64,
             force_idr: written == 0,
         };
-        enc.encode_slices(p010_raw, req, |slice| {
+        enc.encode_slices(p010_raw, req, |slice, _is_idr| {
             bytes += slice.len();
             let _ = file.write_all(slice);
         })?;
