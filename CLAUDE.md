@@ -432,7 +432,10 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
 - MediaCodec `csd-0` is an **av1C record**, not raw headers. Marker/version byte,
   `seq_profile`, `seq_level_idx`, `seq_tier`, bit-depth flags, then the sequence
   header OBU. Wrong av1C = decoder configures fine and silently outputs nothing.
-- Tiles replace slices for subframe packetization. Start at 2×2 for 4K.
+- Tiles replace slices for subframe packetization. Start at 2×2 for 4K. The
+  `slices` setting counts units per frame for every codec (4 = 2×2 tiles); the
+  grid comes from the AV1 spec's uniform spacing, which at 4K can give fewer
+  rows than asked (8 → 7), so the drain uses the derived grid, never `2^log2`.
 - AV1's reference model (8 slots, explicit signalling) differs enough from HEVC
   that reference invalidation needs a **separate** state machine, not a shared one.
 - Query `NvEncGetEncodeCaps` with `NV_ENC_CODEC_AV1_GUID` for

@@ -326,7 +326,7 @@ export function SettingsPanel() {
             />
           </label>
           <label>
-            Slices / tiles-per-axis (0 = codec default)
+            Slices / tiles per frame (0 = default, 4)
             <input
               inputMode="numeric"
               value={s.stream.slices}

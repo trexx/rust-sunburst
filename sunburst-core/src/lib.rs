@@ -6,5 +6,6 @@
 //! clock as well as the wire format: the client reports timings against the same
 //! [`instr::Stage`] values the server does.
 
+pub mod codec;
 pub mod instr;
 pub mod proto;

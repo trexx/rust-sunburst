@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("av1") => (Codec::Av1, "capture_nvfbc.obu"),
         _ => (Codec::Hevc, "capture_nvfbc.265"),
     };
-    let slices: u32 = if codec == Codec::Av1 { 2 } else { 4 };
+    let slices: u32 = 4; // 4 slices, or a 2×2 AV1 tile grid
 
     let mut capture = NvFbcCapture::new(true)?; // request 10-bit / HDR
     let context = capture.context(); // NvFBC's CUDA context — shared downstream

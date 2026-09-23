@@ -314,7 +314,7 @@ Server → client:
   u32  fps_mhz         millihertz, same unit as Hello.refresh_mhz
   u32  bitrate_kbps    initial target; the rate controller moves it afterwards
   u8   flags           bit0 hdr, bit1 intra_refresh_on, bit2 ref_invalidation_on, bit3 audio_on
-  u8   slices          HEVC slices per frame / AV1 tiles per axis
+  u8   slices          subframe units per frame: HEVC/H.264 slices, or AV1 tiles
   [16] server_nonce
   u64  qpc_freq_hz     ticks per second behind the video header's qpc_timestamp
   i64  server_ns       server clock when this was queued

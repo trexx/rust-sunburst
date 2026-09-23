@@ -135,7 +135,8 @@ pub struct StreamConfig {
     /// Stays inside `TUNING_INFO_ULTRA_LOW_LATENCY` — this is not a UHQ escape.
     pub preset: u8,
     pub rate_control: RateControl,
-    /// HEVC slices / AV1 tiles-per-axis; `0` = the codec default (HEVC 4, AV1 2).
+    /// Subframe units per frame — HEVC/H.264 slices, or AV1 tiles (laid out as
+    /// the nearest power-of-two grid the AV1 level allows); `0` = the default, 4.
     pub slices: u8,
     /// Forced IDR period in frames; `0` = infinite GOP (recovery via intra-refresh).
     pub idr_period: u32,

@@ -212,14 +212,12 @@ impl StreamControl for SessionManager {
         let bitrate_kbps = bounds.initial_kbps;
         let ref_invalidation = quirks.ref_invalidation;
         let intra_refresh = quirks.intra_refresh.then_some((240, 30));
-        // Slices: the config override, else the codec default.
+        // Subframe units per frame (HEVC/H.264 slices, AV1 tiles): the config
+        // override, else four — 4 slices, or a 2×2 AV1 tile grid.
         let slices = if settings.slices > 0 {
-            settings.slices as u32
+            u32::from(settings.slices)
         } else {
-            match enc_codec {
-                Codec::Hevc | Codec::H264 => 4,
-                Codec::Av1 => 2,
-            }
+            4
         };
         // Frame rate: the client's refresh, capped if the config asks. Whole
         // frames for the encoder (rounded, so a 59.94 Hz TV is 60), but the

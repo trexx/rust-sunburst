@@ -368,7 +368,8 @@ pub struct SessionConfig {
     /// and what the encoder supports.
     pub intra_refresh: bool,
     pub ref_invalidation: bool,
-    /// HEVC slices per frame, or AV1 tiles per axis.
+    /// Subframe units per frame: HEVC/H.264 slices, or AV1 tiles (the server
+    /// arranges them as the nearest power-of-two grid the level allows).
     pub slices: u8,
     pub server_nonce: [u8; NONCE_LEN],
     /// Ticks per second of the clock behind every video header's

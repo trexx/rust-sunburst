@@ -23,6 +23,31 @@ use sunburst_net::{
 
 use crate::ivf::IvfWriter;
 
+/// One line on the `av1C` record the server sent, and whether it agrees with the
+/// sequence-header OBU it wraps. A record that disagrees is CLAUDE.md's silent
+/// failure — the decoder configures and then outputs nothing — so this is
+/// checked on every AV1 run rather than trusted.
+fn describe_av1c(record: &[u8]) -> String {
+    use sunburst_core::codec::av1::parse_sequence_header;
+    if record.len() < 4 || record[0] != 0x81 {
+        return format!("av1C: malformed ({} bytes)", record.len());
+    }
+    let (profile, level, tier) = (record[1] >> 5, record[1] & 0x1f, record[2] >> 7);
+    let verdict = match parse_sequence_header(&record[4..]) {
+        Some(seq)
+            if (seq.seq_profile, seq.seq_level_idx, seq.seq_tier) == (profile, level, tier) =>
+        {
+            "matches its sequence header".to_string()
+        }
+        Some(seq) => format!(
+            "MISMATCH: the sequence header says profile {} level {} tier {}",
+            seq.seq_profile, seq.seq_level_idx, seq.seq_tier
+        ),
+        None => "no parsable sequence header inside".to_string(),
+    };
+    format!("av1C: profile {profile} level {level} tier {tier} — {verdict}")
+}
+
 pub struct StreamOpts {
     pub codecs: u8,
     /// A codec the client *requests* (tests the server honouring it); `None` = none.
@@ -91,6 +116,9 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
                 config = Some(c);
             }
             Some(Inbound::Control(ServerControl::CodecPrivate { codec, data })) => {
+                if codec == StreamCodec::Av1 {
+                    println!("{}", describe_av1c(&data));
+                }
                 headers = Some((codec, data));
             }
             Some(_) => {}
@@ -327,5 +355,39 @@ fn send_nack_for(
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod av1c_tests {
+    use super::describe_av1c;
+
+    /// NVENC's AV1 sequence-header OBU from a real 4K capture: level 13, High tier.
+    const SEQ: [u8; 17] = [
+        0x0a, 0x0f, 0x00, 0x00, 0x00, 0x6e, 0xef, 0xbf, 0xe1, 0xbc, 0x02, 0x19, 0xd0, 0x91, 0x00,
+        0x90, 0x40,
+    ];
+
+    fn record(profile: u8, level: u8, tier: u8) -> Vec<u8> {
+        let mut r = vec![0x81, (profile << 5) | level, (tier << 7) | 0x4c, 0];
+        r.extend_from_slice(&SEQ);
+        r
+    }
+
+    #[test]
+    fn a_record_that_agrees_with_its_obu_passes() {
+        assert!(describe_av1c(&record(0, 13, 1)).ends_with("matches its sequence header"));
+    }
+
+    #[test]
+    fn the_old_main_tier_record_is_caught() {
+        // What the server sent before it parsed NVENC's header: tier 0.
+        let line = describe_av1c(&record(0, 13, 0));
+        assert!(line.contains("MISMATCH"), "{line}");
+    }
+
+    #[test]
+    fn a_malformed_record_says_so() {
+        assert!(describe_av1c(&[0x00, 1, 2]).contains("malformed"));
     }
 }

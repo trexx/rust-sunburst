@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("h264") => (Codec::H264, "capture.264"),
         _ => (Codec::Hevc, "capture.265"),
     };
-    let slices: u32 = if codec == Codec::Av1 { 2 } else { 4 }; // AV1: 2×2 tiles
+    let slices: u32 = 4; // 4 slices, or a 2×2 AV1 tile grid
 
     // hdr-preferred D3D11 capture (NvFBC off), the runtime NVENC, an output file.
     let mut capture = select::build(false, None, true, OutputSelect::Primary)?;
