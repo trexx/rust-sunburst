@@ -35,6 +35,24 @@ pub const BATCH_BYTES: usize = MAX_BATCH * (HEADER_LEN + MAX_PAYLOAD);
 // Pacer
 // ===========================================================================
 
+/// The video pacer's rate, bits per second: twice the higher of the session's
+/// starting target and the rate controller's live target.
+///
+/// Twice, so a frame's bytes leave over about half its interval. **Never below
+/// the starting target**, because pacing below what the encoder actually emits
+/// is a feedback loop, not a slowdown: when congestion made the controller cut
+/// the target, AV1 at 4K kept producing more than the new target, packets
+/// queued behind the pacer, the client saw one-way delay climb and reported a
+/// steeper gradient, the controller cut again — and the send queue reached
+/// 1.2 s at p99 on the 4070 box (7.7 ms with the target pinned). The encoder's
+/// output is what the pacer must keep up with, and the target is only a proxy
+/// for it on the way down. On the way *up* it is the right bound: a configured
+/// ceiling can let the target climb past twice the starting rate, and a pacer
+/// stuck at the start would then be the bottleneck.
+pub fn video_pace_bps(initial_kbps: u32, target_kbps: u32) -> u64 {
+    u64::from(initial_kbps.max(target_kbps).max(1)) * 2_000
+}
+
 /// A leaky-bucket pacer: the wire is free again `bytes*8/rate` after each send,
 /// with a small burst allowance so an idle sender is not throttled on its first
 /// packet.
@@ -215,6 +233,21 @@ pub mod windows;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_video_pace_never_drops_below_the_starting_rate() {
+        // A congestion cut must not slow the pacer below what the encoder is
+        // still emitting — that fed back into a 1.2 s send queue on hardware.
+        assert_eq!(video_pace_bps(100_000, 20_000), 200_000_000);
+        assert_eq!(video_pace_bps(100_000, 100_000), 200_000_000);
+    }
+
+    #[test]
+    fn the_video_pace_follows_a_target_above_the_start() {
+        // A configured ceiling above twice the start must not be capped by the pacer.
+        assert_eq!(video_pace_bps(50_000, 150_000), 300_000_000);
+        assert_eq!(video_pace_bps(0, 0), 2_000, "never zero");
+    }
 
     const MS: u64 = 1_000_000;
 

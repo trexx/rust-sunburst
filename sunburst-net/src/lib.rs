@@ -35,10 +35,10 @@ pub use handler::{
     Recording, SessionSettings, StreamControl,
 };
 pub use owd::{OwdGradient, TickUnwrap};
-pub use rate::{Bounds, RateController};
+pub use rate::{BitrateAsk, Bounds, RateController, codec_ceiling_kbps, session_bitrate};
 pub use refinval::{Av1RefState, H264RefState, HevcRefState, IntraRefresh, Recovery, RefState};
 pub use reliable::{Reliable, ReliableError};
 pub use retransmit::RetransmitCache;
-pub use send::{Batch, MAX_BATCH, Pacer, PlainSender, Sender};
+pub use send::{Batch, MAX_BATCH, Pacer, PlainSender, Sender, video_pace_bps};
 pub use spsc::{Consumer, Producer, SLOT_BYTES, packet_ring};
 pub use video::{Accept, FrameRef, JitterBuffer, Packetizer, Reassembler, Released};

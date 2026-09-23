@@ -17,7 +17,7 @@
 //! Pure logic, clock as an argument. Runs on the control plane (feedback is
 //! 10/s); the frame path only ever reads the resulting target.
 
-use sunburst_core::proto::Feedback;
+use sunburst_core::proto::{Feedback, StreamCodec};
 
 /// Bitrate limits, kbps. `max` is the decoder's hint, the codec's ceiling and
 /// the configured target, whichever is lowest; `min` is where quality stops
@@ -27,6 +27,63 @@ pub struct Bounds {
     pub min_kbps: u32,
     pub max_kbps: u32,
     pub initial_kbps: u32,
+}
+
+/// No session streams below this, kbps: under it 4K stops being worth watching.
+pub const SESSION_FLOOR_KBPS: u32 = 10_000;
+
+/// The decoder-agnostic ceilings from CLAUDE.md, kbps: HEVC 150, AV1 100.
+pub fn codec_ceiling_kbps(codec: StreamCodec) -> u32 {
+    match codec {
+        StreamCodec::Hevc => 150_000,
+        StreamCodec::Av1 => 100_000,
+        // H.264 is less efficient than HEVC; give it the same practical ceiling
+        // (the Shield's decoder caps around here regardless).
+        StreamCodec::H264 => 150_000,
+    }
+}
+
+/// What a session's bitrate is derived from.
+#[derive(Clone, Copy, Debug)]
+pub struct BitrateAsk {
+    pub codec: StreamCodec,
+    /// The configured target, kbps.
+    pub target_kbps: u32,
+    /// The configured rate-control floor and ceiling, kbps; `max = 0` means
+    /// "no separate ceiling — the target is the ceiling".
+    pub min_kbps: u32,
+    pub max_kbps: u32,
+    /// The decoder's own ceiling from its quirks, **bits** per second.
+    pub decoder_hint_bps: u32,
+    /// The client's requested ceiling (`Hello::max_bitrate_kbps`); 0 = none.
+    pub client_max_kbps: u32,
+}
+
+/// A session's initial target and the range the rate controller may move in.
+///
+/// CLAUDE.md: the bitrate is the minimum of the server setting, the codec
+/// ceiling, and the client's ask — and that has to hold for where the
+/// controller may *climb to*, not only where it starts. A configured ceiling
+/// above the cap used to pass straight through, letting the controller push a
+/// decoder past its own hint or past what the client asked for.
+pub fn session_bitrate(ask: &BitrateAsk) -> Bounds {
+    let mut cap = codec_ceiling_kbps(ask.codec).min(ask.decoder_hint_bps / 1000);
+    if ask.client_max_kbps > 0 {
+        cap = cap.min(ask.client_max_kbps);
+    }
+    let initial = ask.target_kbps.min(cap).max(SESSION_FLOOR_KBPS);
+    // `.max(initial)`: the floor can lift the initial target above a tiny cap,
+    // and the bounds must never invert around it.
+    let max = if ask.max_kbps > 0 {
+        ask.max_kbps.min(cap).max(initial)
+    } else {
+        initial
+    };
+    Bounds {
+        min_kbps: ask.min_kbps.clamp(1, initial),
+        max_kbps: max,
+        initial_kbps: initial,
+    }
 }
 
 /// Gradient above which the path is judged to be queueing (µs/s: 0.5 % overload).
@@ -219,6 +276,84 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    fn ask(codec: StreamCodec) -> BitrateAsk {
+        BitrateAsk {
+            codec,
+            target_kbps: 120_000,
+            min_kbps: 10_000,
+            max_kbps: 0,
+            decoder_hint_bps: 200_000_000,
+            client_max_kbps: 0,
+        }
+    }
+
+    #[test]
+    fn a_configured_ceiling_cannot_exceed_the_codec_ceiling() {
+        let b = session_bitrate(&BitrateAsk {
+            max_kbps: 200_000,
+            ..ask(StreamCodec::Hevc)
+        });
+        assert_eq!(b.max_kbps, 150_000, "HEVC's ceiling is 150 Mbps");
+        let b = session_bitrate(&BitrateAsk {
+            max_kbps: 200_000,
+            ..ask(StreamCodec::Av1)
+        });
+        assert_eq!(b.max_kbps, 100_000, "AV1's ceiling is 100 Mbps");
+    }
+
+    #[test]
+    fn the_decoder_hint_caps_both_the_start_and_the_climb() {
+        let b = session_bitrate(&BitrateAsk {
+            max_kbps: 150_000,
+            decoder_hint_bps: 50_000_000,
+            ..ask(StreamCodec::Hevc)
+        });
+        assert_eq!(b.initial_kbps, 50_000);
+        assert_eq!(b.max_kbps, 50_000);
+    }
+
+    #[test]
+    fn the_client_ask_caps_the_climb_too() {
+        let b = session_bitrate(&BitrateAsk {
+            max_kbps: 150_000,
+            client_max_kbps: 80_000,
+            ..ask(StreamCodec::Hevc)
+        });
+        assert_eq!(b.initial_kbps, 80_000);
+        assert_eq!(b.max_kbps, 80_000);
+    }
+
+    #[test]
+    fn no_configured_ceiling_means_the_target_is_the_ceiling() {
+        let b = session_bitrate(&ask(StreamCodec::Hevc));
+        assert_eq!((b.initial_kbps, b.max_kbps), (120_000, 120_000));
+    }
+
+    #[test]
+    fn a_hint_below_the_floor_never_inverts_the_bounds() {
+        let b = session_bitrate(&BitrateAsk {
+            max_kbps: 150_000,
+            decoder_hint_bps: 2_000_000,
+            ..ask(StreamCodec::Hevc)
+        });
+        assert_eq!(b.initial_kbps, SESSION_FLOOR_KBPS);
+        assert!(
+            b.min_kbps <= b.initial_kbps && b.initial_kbps <= b.max_kbps,
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn the_floor_never_sits_above_the_start() {
+        let b = session_bitrate(&BitrateAsk {
+            min_kbps: 90_000,
+            client_max_kbps: 40_000,
+            ..ask(StreamCodec::Hevc)
+        });
+        assert_eq!(b.initial_kbps, 40_000);
+        assert_eq!(b.min_kbps, 40_000);
     }
 
     fn bounds() -> Bounds {

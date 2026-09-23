@@ -7,7 +7,7 @@
 //! Phase 4 will point it at the video path.
 //!
 //! ```text
-//! fakeclient pair   --server 127.0.0.1:47811
+//! fakeclient pair   --server 127.0.0.1:47811 [--max-bitrate-hint 150000]
 //! fakeclient apps   --server 127.0.0.1:47811
 //! fakeclient input  --server 127.0.0.1:47811 [--script gamepad-sweep]
 //! ```
@@ -28,8 +28,9 @@ use sunburst_core::proto::codecs;
 use sunburst_core::proto::input::buttons;
 use sunburst_core::proto::pairing::{NONCE_LEN, PIN_DIGITS, confirm_tag, derive_secret};
 use sunburst_core::proto::{
-    Battery, ClientControl, Finger, GamepadState, Hello, Imu, InputEvent, InputPacket, MouseButton,
-    MouseMotion, PairRequest, ServerControl, SessionKey, StreamCodec, Touchpad,
+    Battery, ClientControl, DecoderQuirks, Finger, GamepadState, Hello, Imu, InputEvent,
+    InputPacket, MouseButton, MouseMotion, PairRequest, ServerControl, SessionKey, StreamCodec,
+    Touchpad,
 };
 use sunburst_net::ClientEndpoint;
 
@@ -54,7 +55,10 @@ fn main() -> ExitCode {
         .unwrap_or_else(default_state_path);
 
     let result = match refs.first().copied() {
-        Some("pair") => pair(server, &secrets),
+        Some("pair") => match bitrate_hint(&refs) {
+            Ok(hint) => pair(server, &secrets, hint),
+            Err(e) => Err(e),
+        },
         Some("apps") => apps(server, &secrets),
         Some("input") => input(server, &secrets, option(&refs, "--script")),
         Some("stream") => stream_cmd(server, &secrets, &refs),
@@ -75,7 +79,7 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 usage:
-  fakeclient pair   [--server host:port] [--state path]
+  fakeclient pair   [--server host:port] [--state path] [--max-bitrate-hint KBPS]
   fakeclient apps   [--server host:port] [--state path]
   fakeclient input  [--server host:port] [--state path] [--script name]
   fakeclient stream [--server host:port] [--state path] [--codecs hevc,av1]
@@ -84,7 +88,29 @@ usage:
 
 scripts: gamepad-sweep (default), gamepad-rich, keyboard, mouse
 
-Pairing prints a PIN to type into the web UI. The PIN is never transmitted.";
+Pairing prints a PIN to type into the web UI. The PIN is never transmitted.
+
+--max-bitrate-hint is the decoder's bitrate ceiling, stored with the pairing.
+The default decoder quirks cap every session at 50 Mbps; pair with e.g. 100000
+(AV1) or 150000 (HEVC) to exercise real 4K bitrates. Changing it means pairing
+again.";
+
+/// The pair-time decoder bitrate ceiling, in kbps, if `--max-bitrate-hint` was
+/// given. Zero is refused: a zero hint makes the session's ceiling zero, which
+/// the server then lifts to its 10 Mbps floor — a silent 10 Mbps test.
+fn bitrate_hint(refs: &[&str]) -> Result<Option<u32>, String> {
+    let Some(raw) = option(refs, "--max-bitrate-hint") else {
+        return Ok(None);
+    };
+    match raw.parse::<u32>() {
+        Ok(0) => Err("--max-bitrate-hint must be above 0 kbps".into()),
+        Ok(kbps) if kbps > u32::MAX / 1000 => {
+            Err(format!("--max-bitrate-hint {kbps} kbps is out of range"))
+        }
+        Ok(kbps) => Ok(Some(kbps)),
+        Err(e) => Err(format!("bad --max-bitrate-hint {raw}: {e}")),
+    }
+}
 
 fn option<'a>(args: &[&'a str], name: &str) -> Option<&'a str> {
     let at = args.iter().position(|a| *a == name)?;
@@ -184,7 +210,7 @@ fn await_message(
     }
 }
 
-fn pair(server: SocketAddr, state: &PathBuf) -> Result<(), String> {
+fn pair(server: SocketAddr, state: &PathBuf, hint_kbps: Option<u32>) -> Result<(), String> {
     let mut client = ClientEndpoint::connect(server, None).map_err(|e| e.to_string())?;
 
     // Generated here and displayed, the way a TV would. It never goes on the
@@ -197,7 +223,13 @@ fn pair(server: SocketAddr, state: &PathBuf) -> Result<(), String> {
             name: "fakeclient".into(),
             model: "development".into(),
             abi: std::env::consts::ARCH.into(),
-            quirks: Default::default(),
+            quirks: match hint_kbps {
+                Some(kbps) => DecoderQuirks {
+                    max_bitrate_hint: kbps * 1000,
+                    ..Default::default()
+                },
+                None => Default::default(),
+            },
             client_nonce,
         }))
         .map_err(|e| e.to_string())?;

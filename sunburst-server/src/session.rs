@@ -26,8 +26,8 @@ use sunburst_core::proto::{
 };
 use sunburst_encode::encoder::Codec;
 use sunburst_net::{
-    Bounds, CaptureBackend as SessionBackend, Outbound, RateController, SessionSettings,
-    StreamControl,
+    BitrateAsk, CaptureBackend as SessionBackend, Outbound, RateController, SessionSettings,
+    StreamControl, session_bitrate,
 };
 use sunburst_web::host::SessionSummary;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
@@ -151,17 +151,6 @@ impl SessionManager {
     }
 }
 
-/// HEVC 150 Mbps / AV1 100 Mbps — the decoder-agnostic ceilings from CLAUDE.md.
-fn codec_ceiling_kbps(codec: StreamCodec) -> u32 {
-    match codec {
-        StreamCodec::Hevc => 150_000,
-        StreamCodec::Av1 => 100_000,
-        // H.264 is less efficient than HEVC; give it the same practical ceiling
-        // (the Shield's decoder caps around here regardless).
-        StreamCodec::H264 => 150_000,
-    }
-}
-
 fn qpc_freq_hz() -> u64 {
     let mut freq = 0i64;
     // SAFETY: QueryPerformanceFrequency writes the counter frequency and always
@@ -209,15 +198,18 @@ impl StreamControl for SessionManager {
             StreamCodec::H264 => Codec::H264,
         };
 
-        // Bitrate: the configured target, bounded by the codec ceiling and the
-        // decoder's own hint, then by any client-requested ceiling (the client
-        // can only lower it), with a 10 Mbps floor.
-        let ceiling = codec_ceiling_kbps(codec).min(quirks.max_bitrate_hint / 1000);
-        let mut bitrate_kbps = settings.bitrate_kbps.min(ceiling);
-        if hello.max_bitrate_kbps > 0 {
-            bitrate_kbps = bitrate_kbps.min(hello.max_bitrate_kbps);
-        }
-        let bitrate_kbps = bitrate_kbps.max(10_000);
+        // Bitrate: the configured target and the rate controller's range, both
+        // bounded by the codec ceiling, the decoder's own hint and any
+        // client-requested ceiling (the client can only lower it), with a floor.
+        let bounds = session_bitrate(&BitrateAsk {
+            codec,
+            target_kbps: settings.bitrate_kbps,
+            min_kbps: settings.min_bitrate_kbps,
+            max_kbps: settings.max_bitrate_kbps,
+            decoder_hint_bps: quirks.max_bitrate_hint,
+            client_max_kbps: hello.max_bitrate_kbps,
+        });
+        let bitrate_kbps = bounds.initial_kbps;
         let ref_invalidation = quirks.ref_invalidation;
         let intra_refresh = quirks.intra_refresh.then_some((240, 30));
         // Slices: the config override, else the codec default.
@@ -353,21 +345,6 @@ impl StreamControl for SessionManager {
             .filter(|d| !d.is_empty())
             .map(|d| MicPipeline::spawn(d.to_string()));
 
-        // Rate-controller bounds from config: the floor (never above the target),
-        // and a ceiling the controller may climb to (the explicit max when set,
-        // else the session target — today's behaviour).
-        let min_kbps = settings.min_bitrate_kbps.clamp(1, bitrate_kbps);
-        let max_kbps = if settings.max_bitrate_kbps > 0 {
-            settings.max_bitrate_kbps.max(bitrate_kbps)
-        } else {
-            bitrate_kbps
-        };
-        let bounds = Bounds {
-            min_kbps,
-            max_kbps,
-            initial_kbps: bitrate_kbps,
-        };
-
         self.sessions.set_active(Some(SessionSummary {
             id: session_id,
             client_id: client,
@@ -457,6 +434,7 @@ impl StreamControl for SessionManager {
             req.extend_from_slice(&frame_id.0.to_le_bytes());
             req.extend_from_slice(body);
             a.retransmit.push(&req);
+            a.pipeline.wake_send();
         }
     }
 

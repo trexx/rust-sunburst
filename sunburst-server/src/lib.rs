@@ -34,6 +34,10 @@ use sunburst_web::{Store, WebHandler, http};
 
 /// Load state, bind, and serve until the process ends.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // 1 ms timer resolution for the whole run: the frame path's timed waits (the
+    // capture governor's flush deadline, the send thread's idle park) would
+    // otherwise round up to the ~15.6 ms default tick.
+    let _timer = realtime::TimerResolution::one_ms();
     let store = Store::open_default()?;
     let config_dir = store.dir().to_path_buf();
 

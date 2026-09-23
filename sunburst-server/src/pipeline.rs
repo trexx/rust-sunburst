@@ -44,7 +44,7 @@ use sunburst_net::send::Sender;
 use sunburst_net::send::windows::WsaSender;
 use sunburst_net::{
     Av1RefState, Batch, Consumer, H264RefState, HevcRefState, Pacer, Packetizer, Producer,
-    Recovery, RefState, RetransmitCache, packet_ring,
+    Recovery, RefState, RetransmitCache, packet_ring, video_pace_bps,
 };
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::core::Interface;
@@ -169,7 +169,8 @@ impl Pipeline {
         let (producer, consumer) = packet_ring(RING_CAPACITY);
 
         let send_stop = Arc::clone(&stop);
-        let send_bitrate = params.bitrate_kbps;
+        let send_shared = Arc::clone(&shared);
+        let send_initial = params.bitrate_kbps;
         let send = std::thread::Builder::new()
             .name("sunburst-send".into())
             .spawn(move || {
@@ -179,7 +180,8 @@ impl Pipeline {
                     &retransmit,
                     &socket,
                     client,
-                    send_bitrate,
+                    &send_shared,
+                    send_initial,
                 )
             })?;
         let send_thread = send.thread().clone();
@@ -212,6 +214,15 @@ impl Pipeline {
 
     pub fn stop(mut self) {
         self.shutdown();
+    }
+
+    /// Wake the send thread now. The control thread calls this after queueing a
+    /// retransmit: the client is waiting on that packet, and without a wake it
+    /// sits in the ring until the send thread's idle park times out.
+    pub fn wake_send(&self) {
+        if let Some(s) = &self.send {
+            s.thread().unpark();
+        }
     }
 
     fn shutdown(&mut self) {
@@ -335,6 +346,11 @@ fn gpu_loop(
 
         // Convert to P010 on the surface's own path, building the spine and the
         // encoder (and emitting the codec headers) on the first frame.
+        // A (re)build starts at the rate controller's live target.
+        let live_kbps = match shared.target_kbps.load(Ordering::Relaxed) {
+            0 => params.bitrate_kbps,
+            t => t,
+        };
         let (input, first_build) = build_and_convert(
             &mut spine,
             &nvenc,
@@ -342,9 +358,14 @@ fn gpu_loop(
             capture.as_ref(),
             frame,
             &mut current_color,
+            live_kbps,
         )?;
         instr::record(Stage::ColorConvert, fid.0 as u32);
         if first_build {
+            // The encoder now runs at `live_kbps`; without this, an unchanged
+            // target would never be re-applied and `reconfigure_bitrate`'s
+            // equal-value early return would hide the mismatch.
+            last_kbps = live_kbps;
             // A freshly (re)built encoder must open on an IDR.
             need_keyframe = true;
             let enc = spine.as_mut().expect("just built").encoder();
@@ -441,10 +462,13 @@ fn build_and_convert<'a>(
     capture: &dyn sunburst_capture::Capture,
     frame: Frame,
     current_color: &mut Option<ConvertOutput>,
+    bitrate_kbps: u32,
 ) -> Result<(*mut c_void, bool), String> {
     let mut ecfg = EncoderConfig::new(params.codec, params.width, params.height);
     ecfg.fps = params.fps;
-    ecfg.bitrate_kbps = params.bitrate_kbps;
+    // The rate controller's current target, not the session's starting one: a
+    // rebuild (AccessLost, HDR<->SDR) must not snap a throttled stream back up.
+    ecfg.bitrate_kbps = bitrate_kbps;
     ecfg.slices = params.slices;
     ecfg.dpb_depth = params.dpb_depth;
     ecfg.intra_refresh = params.intra_refresh;
@@ -530,7 +554,8 @@ fn send_loop(
     retransmit: &Consumer,
     socket: &UdpSocket,
     client: SocketAddr,
-    bitrate_kbps: u32,
+    shared: &StreamShared,
+    initial_kbps: u32,
 ) {
     let _rt = RealtimeThread::register();
     instr::register_thread("send");
@@ -542,14 +567,24 @@ fn send_loop(
         WsaSender::new(socket)
     };
     let mut cache = RetransmitCache::default();
-    // Pace at twice the target so a frame's bytes leave over ~half its interval,
-    // with a small burst so the sender is not throttled after an idle gap.
-    let mut pacer = Pacer::new(bitrate_kbps as u64 * 1000 * 2, 500_000, 0);
+    // Pace at twice the rate so a frame's bytes leave over ~half its interval,
+    // with a small burst so the sender is not throttled after an idle gap. The
+    // rate follows the live target up but never below the session's start —
+    // see `video_pace_bps` for the feedback loop that pacing below the encoder's
+    // real output caused.
+    let mut paced_kbps = initial_kbps;
+    let mut pacer = Pacer::new(video_pace_bps(initial_kbps, initial_kbps), 500_000, 0);
     let mut batch = Batch::new();
     let origin = Instant::now();
     let now_ns = || origin.elapsed().as_nanos() as u64;
 
     while !stop.load(Ordering::Relaxed) {
+        let target = shared.target_kbps.load(Ordering::Relaxed);
+        if target != paced_kbps {
+            pacer.set_rate(video_pace_bps(initial_kbps, target));
+            paced_kbps = target;
+        }
+
         // Retransmits first: they are closing a gap the client already noticed.
         while retransmit.pop_with(|req| service_retransmit(req, &mut cache, socket, client)) {}
 
