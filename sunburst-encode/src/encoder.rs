@@ -133,6 +133,9 @@ const NV_ENC_VUI_TRANSFER_BT709: u32 = 1;
 const NV_ENC_VUI_TRANSFER_SMPTE2084: u32 = 16;
 const NV_ENC_VUI_MATRIX_BT709: u32 = 1;
 const NV_ENC_VUI_MATRIX_BT2020_NCL: u32 = 9;
+/// `NV_ENC_NUM_REF_FRAMES_1` — use one reference frame for prediction
+/// (`NV_ENC_NUM_REF_FRAMES`: AUTOSELECT = 0, 1..=4 map to their value).
+const NV_ENC_NUM_REF_FRAMES_1: u32 = 1;
 /// `NV_ENC_PIC_TYPE` values NVENC reports in `NV_ENC_LOCK_BITSTREAM::pictureType`.
 /// Only IDR matters here: it is the wire keyframe flag, set from what NVENC
 /// actually produced (so an auto-inserted periodic IDR is flagged too), not from
@@ -397,9 +400,14 @@ struct Av1ConfigHead {
     transfer_characteristics: u32, // @72
     matrix_coefficients: u32,      // @76
     color_range: u32,              // @80
-    // chromaSamplePosition (@84) through numBwdRefs (@108), incl. filmGrainParams
-    // (ptr) + its alignment pad — opaque. 28 bytes.
-    _reserved_to_bit_depth: [u32; 7],
+    // chromaSamplePosition (@84), useBFramesAsRef (@88), a 4-byte alignment pad,
+    // and filmGrainParams (ptr, @96) — opaque, left at the preset default. 20 bytes.
+    _reserved_a: [u32; 5],
+    /// `NV_ENC_CONFIG_AV1::numFwdRefs` (@104) / `numBwdRefs` (@108): how many
+    /// references NVENC uses for prediction. AV1's AUTOSELECT (0) yields no forward
+    /// reference (P-frames come out intra-sized) — see the Av1 arm.
+    num_fwd_refs: u32,
+    num_bwd_refs: u32,
     /// `NV_ENC_CONFIG_AV1::outputBitDepth` (@112) / `inputBitDepth` (@116).
     output_bit_depth: u32,
     input_bit_depth: u32,
@@ -1051,15 +1059,35 @@ impl<'a> Encoder<'a> {
 
     /// Drain the bitstream slice-by-slice with non-blocking locks, emitting each
     /// newly-available chunk. Stops once locks stop yielding new bytes.
+    ///
+    /// AV1 needs a stronger stop than the idle heuristic. Under subframe write the
+    /// driver re-reports stale tile bytes when polled past frame completion, so
+    /// `bitstream_size_in_bytes` keeps growing and the byte-window loop over-reads
+    /// ~16x (the real frame is 4 tiles ≈ 101 KB; the tail is duplicate tile-group
+    /// OBUs). So for AV1 we parse the OBUs we hold and stop at the tile group that
+    /// reports the last tile — an in-band signal the inflated size cannot fake.
     fn drain_slices(&self, on_slice: &mut dyn FnMut(&[u8], bool)) -> Result<bool, String> {
         let list = &self.session.nvenc.list;
         let encoder = self.session.encoder;
         let lock: FnLock = fnptr(list.lock_bitstream, "lock")?;
         let unlock: FnPtrArg = fnptr(list.unlock_bitstream, "unlock")?;
 
+        // AV1 tile geometry, when subframe readback is on. Both axes are set to
+        // `cfg.slices` in `preset_config`, and NVENC rounds each down to a power of
+        // two, so derive to match: NumTiles = 2^floor(log2 slices) per axis,
+        // squared. `slices = 2` → 4 tiles, tile_bits = 2.
+        let av1_subframe = self.cfg.codec == Codec::Av1 && self.cfg.slices > 1;
+        let (num_tiles, tile_bits) = if av1_subframe {
+            let axis_log2 = 31 - self.cfg.slices.leading_zeros();
+            ((1u32 << axis_log2).pow(2), 2 * axis_log2)
+        } else {
+            (0, 0)
+        };
+
         let mut consumed = 0usize;
         let mut idle = 0u32;
         let mut is_idr = false;
+        let mut tile_groups = 0u32;
         // Bounded so a misbehaving driver cannot spin forever.
         for _ in 0..1024 {
             // SAFETY: plain data.
@@ -1076,7 +1104,29 @@ impl<'a> Encoder<'a> {
             // SAFETY: live encoder; `bitstream` is a live output buffer.
             if unsafe { lock(encoder, &mut lb) } == NV_ENC_SUCCESS {
                 let total = lb.bitstream_size_in_bytes as usize;
-                if total > consumed {
+                let mut done = false;
+                if av1_subframe {
+                    // SAFETY: the driver mapped `total` valid bytes at
+                    // `bitstream_buffer_ptr`, live until unlock.
+                    let buf = unsafe {
+                        std::slice::from_raw_parts(lb.bitstream_buffer_ptr as *const u8, total)
+                    };
+                    let (emit_to, complete, tg) =
+                        scan_av1_obus(buf, consumed, total, num_tiles, tile_bits);
+                    tile_groups += tg;
+                    if emit_to > consumed {
+                        is_idr = lb.picture_type == NV_ENC_PIC_TYPE_IDR;
+                        on_slice(&buf[consumed..emit_to], is_idr);
+                        consumed = emit_to;
+                        idle = 0;
+                    } else {
+                        idle += 1;
+                    }
+                    // Stop on frame completion, or defensively if far more tile
+                    // groups than a frame's worth have appeared without one (a
+                    // NumTiles mismatch would otherwise let the tail back in).
+                    done = complete || tile_groups > 4 * num_tiles;
+                } else if total > consumed {
                     // SAFETY: the driver mapped `total` valid bytes at
                     // `bitstream_buffer_ptr`, live until unlock.
                     let slice = unsafe {
@@ -1094,6 +1144,9 @@ impl<'a> Encoder<'a> {
                 }
                 // SAFETY: locked just above; unlocked once.
                 unsafe { unlock(encoder, self.bitstream) };
+                if done {
+                    break; // AV1 frame fully drained (last tile seen)
+                }
             } else {
                 idle += 1;
             }
@@ -1246,6 +1299,13 @@ fn preset_config(
             av1.transfer_characteristics = transfer;
             av1.matrix_coefficients = matrix;
             av1.color_range = 0; // studio/limited, matching the shaders
+            // One forward reference per frame — the right shape for a P-only ULL
+            // stream, matching Sunshine's `configure_reference_frames`. The deep
+            // DPB (max_num_ref_frames_in_dpb) is kept for reference-invalidation
+            // fallback, not extra prediction refs. (This is not what fixed the
+            // AV1 over-budget frames — that was the subframe drain over-reading;
+            // see `drain_slices`. Left in as a correct, explicit setting.)
+            av1.num_fwd_refs = NV_ENC_NUM_REF_FRAMES_1;
         }
         Codec::H264 => {
             // SAFETY: the union is NV_ENC_CONFIG_H264 for an H.264 encoder.
@@ -1348,9 +1408,231 @@ fn check(
     }
 }
 
+// --- AV1 OBU parsing for the subframe drain -------------------------------
+//
+// NVENC's AV1 subframe write re-reports stale tile bytes when polled past frame
+// completion, so `bitstream_size_in_bytes` keeps growing and the byte-window
+// drain over-reads ~16x. The bitstream is self-describing, so we bound the read
+// from the OBUs themselves: a frame is complete once a tile-group OBU reports the
+// last tile (`tg_end == NumTiles-1`). These are small pure functions, validated
+// off-box against a captured dump and unit-tested below.
+
+const OBU_TILE_GROUP: u8 = 4;
+const OBU_FRAME: u8 = 6;
+
+/// Read an AV1 LEB128 value from `buf[pos..end]`, returning it and the position
+/// just past it, or `None` if the encoding is not fully present within `end`
+/// (its bytes have not arrived yet, or it is malformed past 8 bytes).
+fn read_leb128(buf: &[u8], mut pos: usize, end: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    for i in 0..8u32 {
+        if pos >= end {
+            return None;
+        }
+        let b = buf[pos];
+        pos += 1;
+        value |= ((b & 0x7f) as u64) << (i * 7);
+        if b & 0x80 == 0 {
+            return Some((value, pos));
+        }
+    }
+    None
+}
+
+/// Decode one OBU header at `buf[pos]`, using only the `[..end]` bytes available
+/// so far. Returns `(obu_type, payload_start, obu_end, has_size)`, or `None` if
+/// the header, its size field, or its full payload is not yet present.
+fn obu_header(buf: &[u8], pos: usize, end: usize) -> Option<(u8, usize, usize, bool)> {
+    if pos >= end {
+        return None;
+    }
+    let b0 = buf[pos];
+    // bit 7 forbidden (0), bits 6..3 type, bit 2 extension, bit 1 has_size, bit 0 reserved.
+    let obu_type = (b0 >> 3) & 0x0f;
+    let ext = (b0 >> 2) & 1 == 1;
+    let has_size = (b0 >> 1) & 1 == 1;
+    let mut p = pos + 1;
+    if ext {
+        if p >= end {
+            return None; // the extension header byte has not arrived
+        }
+        p += 1;
+    }
+    if !has_size {
+        // No size field: the OBU runs to the end of the frame. Amid the driver's
+        // trailing garbage we cannot bound it, so the scan stops conservatively.
+        return Some((obu_type, p, end, false));
+    }
+    let (size, after) = read_leb128(buf, p, end)?;
+    let obu_end = after.checked_add(size as usize)?;
+    if obu_end > end {
+        return None; // the payload has not fully arrived
+    }
+    Some((obu_type, after, obu_end, true))
+}
+
+/// Read `tg_end` (the index of the last tile in this tile group) from a
+/// tile-group OBU payload. `num_tiles > 1` here (subframe mode), so
+/// `tile_start_and_end_present_flag` is present; when it is 0 the group covers
+/// every tile. Reads MSB-first over the first one or two payload bytes. Returns
+/// `num_tiles` (never a valid last-tile index) if the payload is too short to
+/// hold the fields, so a malformed group never falsely completes the frame.
+fn tile_group_tg_end(
+    buf: &[u8],
+    payload_start: usize,
+    obu_end: usize,
+    num_tiles: u32,
+    tile_bits: u32,
+) -> u32 {
+    let needed_bits = 1 + 2 * tile_bits;
+    let needed_bytes = needed_bits.div_ceil(8) as usize;
+    if payload_start + needed_bytes > obu_end {
+        return num_tiles;
+    }
+    let bit =
+        |n: u32| -> u32 { ((buf[payload_start + (n / 8) as usize] >> (7 - (n % 8))) & 1) as u32 };
+    if bit(0) == 0 {
+        return num_tiles - 1; // tile_start_and_end_present_flag == 0 → all tiles
+    }
+    // Skip tg_start (tile_bits), then read tg_end (tile_bits), MSB-first.
+    let base = 1 + tile_bits;
+    let mut tg_end = 0u32;
+    for k in 0..tile_bits {
+        tg_end = (tg_end << 1) | bit(base + k);
+    }
+    tg_end
+}
+
+/// Scan the complete OBUs in `buf[from..avail]`. Returns `(emit_to,
+/// frame_complete, tile_groups_scanned)`: `emit_to` is the end of the last
+/// complete OBU (always an OBU boundary) and never advances past the OBU that
+/// finishes the frame, so the trailing stale re-report is never included.
+/// `frame_complete` is set when a tile group reaches the last tile (or an
+/// `OBU_FRAME`, which is self-contained, is seen).
+fn scan_av1_obus(
+    buf: &[u8],
+    from: usize,
+    avail: usize,
+    num_tiles: u32,
+    tile_bits: u32,
+) -> (usize, bool, u32) {
+    let mut pos = from;
+    let mut tile_groups = 0u32;
+    loop {
+        let Some((obu_type, payload_start, obu_end, has_size)) = obu_header(buf, pos, avail) else {
+            return (pos, false, tile_groups);
+        };
+        if !has_size {
+            return (pos, false, tile_groups); // unbounded OBU amid garbage — stop
+        }
+        if obu_type == OBU_FRAME {
+            return (obu_end, true, tile_groups);
+        }
+        if obu_type == OBU_TILE_GROUP {
+            tile_groups += 1;
+            let tg_end = tile_group_tg_end(buf, payload_start, obu_end, num_tiles, tile_bits);
+            if tg_end + 1 >= num_tiles {
+                return (obu_end, true, tile_groups);
+            }
+        }
+        pos = obu_end;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- AV1 OBU drain parsing ---------------------------------------------
+
+    /// Build one OBU: header byte (type, has_size=1) + LEB128 size + payload.
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![(obu_type << 3) | 0b10]; // has_size bit
+        let mut size = payload.len() as u64;
+        loop {
+            let mut byte = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                byte |= 0x80;
+            }
+            v.push(byte);
+            if size == 0 {
+                break;
+            }
+        }
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A tile-group payload for one tile: flag=1, tg_start=tg_end=idx (2 bits
+    /// each), padded, then filler — mirrors the real dump's 0x80/a8/d0/f8 bytes.
+    fn tile_group(idx: u32) -> Vec<u8> {
+        let first = 0x80 | ((idx as u8) << 5) | ((idx as u8) << 3);
+        let mut p = vec![first];
+        p.extend_from_slice(&[0u8; 7]); // filler tile bytes
+        obu(OBU_TILE_GROUP, &p)
+    }
+
+    #[test]
+    fn leb128_reads_single_and_multi_byte() {
+        assert_eq!(read_leb128(&[0x00], 0, 1), Some((0, 1)));
+        assert_eq!(read_leb128(&[0x7f], 0, 1), Some((127, 1)));
+        assert_eq!(read_leb128(&[0xc8, 0x01], 0, 2), Some((200, 2)));
+        // Truncated (continuation bit set but no next byte) → not yet available.
+        assert_eq!(read_leb128(&[0x80], 0, 1), None);
+    }
+
+    #[test]
+    fn tg_end_decodes_the_real_dump_bytes() {
+        // The four tile groups from the captured stream decode to tiles 0..3.
+        for (byte, want) in [(0x80u8, 0u32), (0xa8, 1), (0xd0, 2), (0xf8, 3)] {
+            let buf = [byte, 0, 0, 0];
+            assert_eq!(tile_group_tg_end(&buf, 0, buf.len(), 4, 2), want);
+        }
+    }
+
+    #[test]
+    fn scan_stops_at_the_last_tile_and_ignores_trailing_garbage() {
+        let mut frame = Vec::new();
+        frame.extend(obu(2, &[])); // temporal delimiter
+        frame.extend(obu(1, &[1, 2, 3, 4])); // sequence header
+        frame.extend(obu(3, &[9, 9, 9, 9])); // frame header
+        for idx in 0..4 {
+            frame.extend(tile_group(idx));
+        }
+        let real_end = frame.len();
+        // The driver's stale re-report: the same four tiles again.
+        for idx in 0..4 {
+            frame.extend(tile_group(idx));
+        }
+
+        let (emit_to, complete, groups) = scan_av1_obus(&frame, 0, frame.len(), 4, 2);
+        assert!(complete, "frame should complete at the last tile");
+        assert_eq!(
+            emit_to, real_end,
+            "must stop at the real frame end, not the garbage"
+        );
+        assert_eq!(groups, 4, "exactly the four real tile groups are scanned");
+    }
+
+    #[test]
+    fn scan_waits_for_a_partial_final_obu() {
+        let mut frame = Vec::new();
+        frame.extend(obu(2, &[]));
+        frame.extend(obu(3, &[9, 9, 9, 9]));
+        frame.extend(tile_group(0));
+        frame.extend(tile_group(1));
+        let after_tg1 = frame.len();
+        frame.extend(tile_group(2)); // this last group only partially "arrived"
+
+        // Cut availability one byte into the third tile group's payload.
+        let (emit_to, complete, _) = scan_av1_obus(&frame, 0, after_tg1 + 3, 4, 2);
+        assert!(!complete, "no tile group reached the last tile yet");
+        assert_eq!(
+            emit_to, after_tg1,
+            "emit only through the last complete OBU"
+        );
+    }
 
     // The diagnostics path must never itself panic when NVENC's error-string
     // slot or the encoder handle is unavailable: `check` then falls back to the
@@ -1398,6 +1680,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(HevcConfigHead, output_bit_depth), 200);
         assert_eq!(std::mem::offset_of!(HevcConfigHead, input_bit_depth), 204);
         assert_eq!(std::mem::offset_of!(Av1ConfigHead, num_tile_rows), 40);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, num_fwd_refs), 104);
+        assert_eq!(std::mem::offset_of!(Av1ConfigHead, num_bwd_refs), 108);
         assert_eq!(std::mem::offset_of!(Av1ConfigHead, output_bit_depth), 112);
         assert_eq!(std::mem::offset_of!(Av1ConfigHead, input_bit_depth), 116);
         // Color-description fields must land where NVENC reads them (13.1.15).
