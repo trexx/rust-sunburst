@@ -260,6 +260,12 @@ impl Capture for NvFbcCapture {
         Some(self.context() as u64)
     }
 
+    /// The blocking grab ignores the timeout, so the capture loop could never
+    /// wake to flush a held frame: holding stays off for NvFBC.
+    fn honors_timeout(&self) -> bool {
+        false
+    }
+
     fn acquire(&mut self, _timeout: Duration) -> Result<Option<Frame>, CaptureError> {
         // NvFBC blocks until the next frame, so the timeout is advisory: a blocking
         // grab always returns a frame (or an error), never `Ok(None)`.

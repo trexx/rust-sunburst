@@ -20,11 +20,13 @@
 use windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS,
-    D3D11_CPU_ACCESS_FLAG, D3D11_RESOURCE_MISC_FLAG, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_UAV,
-    D3D11_TEXTURE2D_DESC, D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_UNORDERED_ACCESS_VIEW_DESC,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BIND_UNORDERED_ACCESS, D3D11_CPU_ACCESS_FLAG, D3D11_QUERY_DESC, D3D11_QUERY_EVENT,
+    D3D11_RESOURCE_MISC_FLAG, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_UAV, D3D11_TEXTURE2D_DESC,
+    D3D11_UAV_DIMENSION_TEXTURE2D, D3D11_UNORDERED_ACCESS_VIEW_DESC,
     D3D11_UNORDERED_ACCESS_VIEW_DESC_0, D3D11_USAGE_DEFAULT, ID3D11ComputeShader, ID3D11Device,
-    ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
+    ID3D11DeviceContext, ID3D11Query, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
@@ -222,6 +224,8 @@ pub struct Converter {
     shader: ID3D11ComputeShader,
     output: ConvertOutput,
     target: Option<Target>,
+    /// An event query for [`Converter::wait_idle`], made once up front.
+    idle: ID3D11Query,
 }
 
 impl Converter {
@@ -256,12 +260,22 @@ impl Converter {
             .map_err(err("CreateComputeShader"))?;
         let shader = shader.ok_or_else(|| "no compute shader".to_string())?;
 
+        let mut idle = None;
+        let desc = D3D11_QUERY_DESC {
+            Query: D3D11_QUERY_EVENT,
+            MiscFlags: 0,
+        };
+        // SAFETY: a valid event-query description; out-param is written.
+        unsafe { device.CreateQuery(&desc, Some(&mut idle)) }.map_err(err("CreateQuery"))?;
+        let idle = idle.ok_or_else(|| "no event query".to_string())?;
+
         Ok(Converter {
             device,
             context,
             shader,
             output,
             target: None,
+            idle,
         })
     }
 
@@ -299,12 +313,58 @@ impl Converter {
             let groups_x = width.div_ceil(16); // 8 threads × 2 px per thread
             let groups_y = height.div_ceil(16);
             self.context.Dispatch(groups_x, groups_y, 1);
-            // Unbind the UAVs so the texture can be read by NVENC next.
+            // Unbind the UAVs so the texture can be read by NVENC next, and the
+            // SRV so the context stops referencing the capture surface — which
+            // the backend recycles at its next acquire.
             self.context
                 .CSSetUnorderedAccessViews(0, 2, Some([None, None].as_ptr()), None);
+            self.context.CSSetShaderResources(0, Some(&[None]));
         }
 
         Ok(&self.target.as_ref().unwrap().texture)
+    }
+
+    /// Block until every convert submitted so far has finished on the GPU.
+    ///
+    /// For a frame the capture governor *holds* rather than encodes at once.
+    /// An encoded frame needs no wait — NVENC reads the output, so the convert
+    /// has finished before the bitstream exists — but a held frame goes straight
+    /// back to `acquire`, which releases the capture surface (DDA's
+    /// `ReleaseFrame`, WGC's pool slot) while the dispatch reading it may still
+    /// be queued. Off the latency path: a held frame is early by definition.
+    pub fn wait_idle(&self) -> Result<(), String> {
+        // SAFETY: a live query on this context; `End` marks everything issued so
+        // far, and `Flush` makes sure it is actually submitted.
+        unsafe {
+            self.context.End(&self.idle);
+            self.context.Flush();
+        }
+        // Bounded, so a hung GPU surfaces as an error rather than a wedged
+        // capture thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            // An event query's payload is a BOOL (TRUE once complete). windows-rs
+            // maps "not ready yet" (S_FALSE) to `Ok(())`, so the payload is the
+            // only real signal.
+            let mut done: i32 = 0;
+            // SAFETY: `done` is a BOOL-sized buffer that outlives the call.
+            unsafe {
+                self.context.GetData(
+                    &self.idle,
+                    Some((&mut done as *mut i32).cast()),
+                    size_of::<i32>() as u32,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                )
+            }
+            .map_err(err("GetData"))?;
+            if done != 0 {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("convert did not complete within 500 ms".into());
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// (Re)create the P010 target when the resolution changes.

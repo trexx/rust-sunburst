@@ -18,7 +18,7 @@
 //! [`CaptureError::AccessLost`] and the owner rebuilds. The secure desktop / DRM
 //! surfaces as [`CaptureError::Unavailable`].
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0};
@@ -50,6 +50,10 @@ pub struct DdaCapture {
     format: TextureFormat,
     /// Whether a frame is currently checked out and owes a `ReleaseFrame`.
     holding: bool,
+    /// Whether this duplication has handed out a frame yet. Until it has, even
+    /// an update that looks pointer-only is delivered, so a fresh capture on a
+    /// still desktop is never left without its first image.
+    delivered: bool,
 }
 
 /// HDR state + mastering metadata from a DXGI output's modern (`IDXGIOutput6`)
@@ -146,6 +150,7 @@ impl DdaCapture {
                 },
                 format,
                 holding: false,
+                delivered: false,
             })
         }
     }
@@ -167,34 +172,60 @@ impl Capture for DdaCapture {
         // The prior frame's surface is invalid once we ask for the next.
         self.release();
 
-        let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut resource: Option<IDXGIResource> = None;
-        // SAFETY: both out-params are valid; a live duplication.
-        let r = unsafe { self.dup.AcquireNextFrame(ms, &mut info, &mut resource) };
-        match r {
-            Ok(()) => {
-                let resource = resource
-                    .ok_or_else(|| CaptureError::Backend("acquire gave no surface".into()))?;
-                let texture: ID3D11Texture2D = resource.cast().map_err(backend)?;
-                self.holding = true;
-                Ok(Some(Frame::Texture(TextureFrame {
-                    texture,
-                    format: self.format,
-                    meta: FrameMeta {
-                        width: self.caps.width,
-                        height: self.caps.height,
-                        hdr: self.caps.hdr,
-                        // QPC ticks at present, for glass-to-glass accounting.
-                        present_qpc: info.LastPresentTime,
-                    },
-                })))
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Round up: truncating would wake early and spin on a sub-millisecond
+            // remainder.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ms = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(u32::MAX as u128) as u32;
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            // SAFETY: both out-params are valid; a live duplication.
+            let r = unsafe { self.dup.AcquireNextFrame(ms, &mut info, &mut resource) };
+            match r {
+                Ok(()) => {
+                    self.holding = true;
+                    // A pointer-only update: DXGI wakes us for a mouse move with
+                    // `LastPresentTime == 0` and nothing accumulated — the desktop
+                    // image is unchanged. The cursor is drawn client-side and DDA
+                    // never composites it, so this is not a frame: encoding it
+                    // wastes an encode slot and puts `present_qpc = 0` on the wire.
+                    if self.delivered && info.LastPresentTime == 0 && info.AccumulatedFrames == 0 {
+                        self.release();
+                        if Instant::now() >= deadline {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    let resource = resource
+                        .ok_or_else(|| CaptureError::Backend("acquire gave no surface".into()))?;
+                    let texture: ID3D11Texture2D = resource.cast().map_err(backend)?;
+                    self.delivered = true;
+                    return Ok(Some(Frame::Texture(TextureFrame {
+                        texture,
+                        format: self.format,
+                        meta: FrameMeta {
+                            width: self.caps.width,
+                            height: self.caps.height,
+                            hdr: self.caps.hdr,
+                            // QPC ticks at present, for glass-to-glass accounting.
+                            present_qpc: info.LastPresentTime,
+                        },
+                    })));
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    return Err(CaptureError::AccessLost);
+                }
+                // The secure desktop (UAC / lock screen) or DRM-protected content.
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_DENIED => {
+                    return Err(CaptureError::Unavailable);
+                }
+                Err(e) => return Err(CaptureError::Backend(format!("AcquireNextFrame: {e}"))),
             }
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => Ok(None),
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => Err(CaptureError::AccessLost),
-            // The secure desktop (UAC / lock screen) or DRM-protected content.
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_DENIED => Err(CaptureError::Unavailable),
-            Err(e) => Err(CaptureError::Backend(format!("AcquireNextFrame: {e}"))),
         }
     }
 

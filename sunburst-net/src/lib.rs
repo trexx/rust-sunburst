@@ -15,6 +15,7 @@
 
 pub mod audio;
 pub mod endpoint;
+pub mod governor;
 pub mod handler;
 pub mod owd;
 pub mod rate;
@@ -30,6 +31,7 @@ pub use audio::{
     parse_audio_packet,
 };
 pub use endpoint::{ClientEndpoint, Endpoint, Inbound, MAX_CONTROL_PAYLOAD};
+pub use governor::{Admit, FrameGovernor, client_interval_ns, encoder_fps};
 pub use handler::{
     CaptureBackend, ControlHandler, InputSettings, InputSink, NoInput, NoStream, Outbound,
     Recording, SessionSettings, StreamControl,

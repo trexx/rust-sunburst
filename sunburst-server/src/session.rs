@@ -27,7 +27,7 @@ use sunburst_core::proto::{
 use sunburst_encode::encoder::Codec;
 use sunburst_net::{
     BitrateAsk, CaptureBackend as SessionBackend, Outbound, RateController, SessionSettings,
-    StreamControl, session_bitrate,
+    StreamControl, client_interval_ns, encoder_fps, session_bitrate,
 };
 use sunburst_web::host::SessionSummary;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
@@ -221,11 +221,11 @@ impl StreamControl for SessionManager {
                 Codec::Av1 => 2,
             }
         };
-        // Frame rate: the client's refresh, capped if the config asks.
-        let mut fps = (hello.refresh_mhz / 1000).max(1);
-        if settings.fps_cap > 0 {
-            fps = fps.min(settings.fps_cap);
-        }
+        // Frame rate: the client's refresh, capped if the config asks. Whole
+        // frames for the encoder (rounded, so a 59.94 Hz TV is 60), but the
+        // capture governor keeps the exact interval.
+        let fps = encoder_fps(hello.refresh_mhz, settings.fps_cap);
+        let interval_ns = client_interval_ns(hello.refresh_mhz, settings.fps_cap);
         // H.264 is SDR (tonemapped): never enable HDR on the desktop for it.
         let want_hdr = settings.hdr && codec != StreamCodec::H264;
 
@@ -269,6 +269,7 @@ impl StreamControl for SessionManager {
             width: hello.width,
             height: hello.height,
             fps,
+            interval_ns,
             bitrate_kbps,
             slices,
             hdr: want_hdr,

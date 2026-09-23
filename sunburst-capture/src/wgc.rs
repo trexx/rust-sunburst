@@ -153,6 +153,13 @@ impl WgcCapture {
             pool.FrameArrived(&handler).map_err(backend)?;
 
             let session = pool.CreateCaptureSession(&item).map_err(backend)?;
+            // The client draws the pointer itself from separately-delivered shape
+            // data (`sunburst-server`'s cursor poller). Left enabled, WGC bakes the
+            // cursor into every frame — two cursors on the TV — and a mouse move
+            // alone makes DWM compose a frame, so an idle desktop keeps encoding.
+            // Needs build 19041 (IGraphicsCaptureSession2); older builds refuse,
+            // and WGC is only the fallback there.
+            let _ = session.SetIsCursorCaptureEnabled(false);
             session.StartCapture().map_err(backend)?;
 
             Ok(WgcCapture {
@@ -186,7 +193,15 @@ impl Capture for WgcCapture {
         let deadline = Instant::now() + timeout;
         loop {
             match self.pool.TryGetNextFrame() {
-                Ok(frame) => {
+                Ok(mut frame) => {
+                    // The pool hands frames out oldest first. After a long encode
+                    // it can hold a newer one than this; take the newest, and let
+                    // the older go back to the pool, so what gets encoded is the
+                    // latest desktop rather than one a frame behind.
+                    while let Ok(newer) = self.pool.TryGetNextFrame() {
+                        let _ = frame.Close();
+                        frame = newer;
+                    }
                     let surface = frame.Surface().map_err(backend)?;
                     let access: IDirect3DDxgiInterfaceAccess = surface.cast().map_err(backend)?;
                     // SAFETY: the surface wraps a live D3D11 texture; GetInterface
@@ -213,7 +228,12 @@ impl Capture for WgcCapture {
                     if remaining.is_zero() {
                         return Ok(None);
                     }
-                    let ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+                    // Round up: truncating would wake early and spin on a
+                    // sub-millisecond remainder.
+                    let ms = remaining
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .min(u32::MAX as u128) as u32;
                     // SAFETY: `frame_ready` is our live auto-reset event.
                     let waited = unsafe { WaitForSingleObject(self.frame_ready, ms) };
                     if waited != WAIT_OBJECT_0 {

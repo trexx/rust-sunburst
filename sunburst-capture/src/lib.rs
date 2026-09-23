@@ -239,6 +239,14 @@ pub trait Capture {
     fn cuda_context(&self) -> Option<u64> {
         None
     }
+
+    /// Whether `acquire` returns once its `timeout` passes. The capture loop
+    /// relies on that to wake and flush a held frame when motion stops; a
+    /// backend whose wait ignores the timeout (NvFBC's blocking grab) has
+    /// holding turned off, and skips early frames as it always did.
+    fn honors_timeout(&self) -> bool {
+        true
+    }
 }
 
 /// Choose the default backend for the host.

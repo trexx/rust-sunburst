@@ -43,8 +43,8 @@ use sunburst_encode::nvenc::Nvenc;
 use sunburst_net::send::Sender;
 use sunburst_net::send::windows::WsaSender;
 use sunburst_net::{
-    Av1RefState, Batch, Consumer, H264RefState, HevcRefState, Pacer, Packetizer, Producer,
-    Recovery, RefState, RetransmitCache, packet_ring, video_pace_bps,
+    Admit, Av1RefState, Batch, Consumer, FrameGovernor, H264RefState, HevcRefState, Pacer,
+    Packetizer, Producer, Recovery, RefState, RetransmitCache, packet_ring, video_pace_bps,
 };
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::core::Interface;
@@ -65,7 +65,11 @@ pub struct PipelineParams {
     pub codec: Codec,
     pub width: u32,
     pub height: u32,
+    /// Whole frames per second, for the encoder's rate header and VBV sizing.
     pub fps: u32,
+    /// The client's exact frame interval, for the capture governor. Not
+    /// `1e9 / fps`: a 59.94 Hz client must not be governed at 60 or 59.
+    pub interval_ns: u64,
     pub bitrate_kbps: u32,
     pub slices: u32,
     pub hdr: bool,
@@ -267,6 +271,128 @@ impl<'a> Spine<'a> {
     }
 }
 
+/// How long `acquire` may block when no frame is held: long enough to be idle,
+/// short enough that a stop request or a keyframe owed to a client on a still
+/// screen is noticed promptly.
+const IDLE_WAIT: Duration = Duration::from_millis(100);
+
+/// A converted frame: the converter's output surface (valid until the next
+/// convert or spine rebuild) and the present timestamp of its content.
+#[derive(Clone, Copy)]
+struct Surface {
+    input: *mut c_void,
+    qpc: u32,
+}
+
+/// The encode half's state: everything that advances once per encoded frame.
+///
+/// One encode path for every reason a frame is encoded — admitted on arrival,
+/// flushed after the governor held it, or re-encoded on a still screen because
+/// the client is owed a keyframe — so control signals (IDR requests, reference
+/// invalidation, bitrate changes) are applied identically to all of them.
+struct Encoding {
+    packetizer: Packetizer,
+    producer: Producer,
+    refs: Box<dyn RefState>,
+    frame_id: Seq16,
+    frame_ts: u64,
+    need_keyframe: bool,
+    last_kbps: u32,
+}
+
+impl Encoding {
+    /// Whether the client is owed a frame even if the screen never changes: a
+    /// keyframe request, recovery from an abandoned frame, or a fresh encoder.
+    fn owed(&self, shared: &StreamShared) -> bool {
+        self.need_keyframe
+            || shared.request_idr.load(Ordering::Relaxed)
+            || shared.abandon.load(Ordering::Relaxed) != NO_ABANDON
+    }
+
+    /// Encode `surface`, packetize it, and hand the packets to the send thread.
+    fn encode(
+        &mut self,
+        enc: &mut Encoder<'_>,
+        surface: Surface,
+        params: &PipelineParams,
+        shared: &StreamShared,
+        send_thread: &Thread,
+    ) -> Result<(), String> {
+        let fid = self.frame_id;
+        let qpc = surface.qpc;
+
+        // Apply control-thread signals before encoding this frame.
+        let mut force_idr = self.need_keyframe || shared.request_idr.swap(false, Ordering::AcqRel);
+        let abandoned = shared.abandon.swap(NO_ABANDON, Ordering::AcqRel);
+        if abandoned != NO_ABANDON && params.ref_invalidation {
+            match self.refs.on_abandoned(Seq16(abandoned as u16)) {
+                Recovery::Invalidate { from, to } => {
+                    let mut id = from;
+                    loop {
+                        if let Some(ts) = self.refs.timestamp_of(id) {
+                            enc.invalidate_ref_frames(ts)?;
+                        }
+                        if id == to {
+                            break;
+                        }
+                        id = id.next();
+                    }
+                }
+                Recovery::ForceIdr => force_idr = true,
+                Recovery::Nothing => {}
+            }
+        } else if abandoned != NO_ABANDON {
+            // The decoder cannot use reference invalidation: a keyframe instead.
+            force_idr = true;
+        }
+        let target = shared.target_kbps.load(Ordering::Relaxed);
+        if target != self.last_kbps && target != 0 {
+            enc.reconfigure_bitrate(target)?;
+            self.last_kbps = target;
+        }
+
+        instr::record(Stage::EncodeSubmit, fid.0 as u32);
+        self.need_keyframe = false;
+        let req = PicRequest {
+            timestamp: self.frame_ts,
+            force_idr,
+        };
+        // The wire keyframe flag comes from NVENC's actual encoded picture type,
+        // not the request, so an auto-inserted periodic IDR (finite idr_period) is
+        // flagged too. begin_frame is deferred to the first emitted unit, when the
+        // type is known.
+        let packetizer = &mut self.packetizer;
+        let producer = &self.producer;
+        let mut begun = false;
+        let is_idr = enc.encode_slices(surface.input, req, |unit, unit_is_idr| {
+            instr::record(Stage::EncodeUnitOut, fid.0 as u32);
+            if !begun {
+                packetizer.begin_frame(fid, qpc, unit_is_idr);
+                begun = true;
+            }
+            packetizer.push_unit(unit, |pkt| {
+                producer.push(pkt);
+            });
+            instr::record(Stage::Packetize, fid.0 as u32);
+            send_thread.unpark();
+        })?;
+        if !begun {
+            // No units emitted (abnormal); open an empty frame so finish_frame has
+            // valid state.
+            packetizer.begin_frame(fid, qpc, is_idr);
+        }
+        packetizer.finish_frame(|pkt| {
+            producer.push(pkt);
+        });
+        send_thread.unpark();
+
+        self.refs.on_encoded(fid, self.frame_ts, is_idr);
+        self.frame_id = fid.next();
+        self.frame_ts += 1;
+        Ok(())
+    }
+}
+
 /// The serial GPU half. Returns `Err` only on setup or a fatal encode failure;
 /// `AccessLost` is handled in-loop by rebuilding.
 fn gpu_loop(
@@ -289,28 +415,71 @@ fn gpu_loop(
     .map_err(|e| e.to_string())?;
     let nvenc = Nvenc::load()?;
     let mut spine: Option<Spine> = None;
-    let mut packetizer = Packetizer::new();
-    let mut refs: Box<dyn RefState> = match params.codec {
-        Codec::Hevc => Box::new(HevcRefState::new(params.dpb_depth as u16)),
-        Codec::H264 => Box::new(H264RefState::new(params.dpb_depth as u16)),
-        Codec::Av1 => Box::new(Av1RefState::new()),
+    let mut st = Encoding {
+        packetizer: Packetizer::new(),
+        producer,
+        refs: match params.codec {
+            Codec::Hevc => Box::new(HevcRefState::new(params.dpb_depth as u16)),
+            Codec::H264 => Box::new(H264RefState::new(params.dpb_depth as u16)),
+            Codec::Av1 => Box::new(Av1RefState::new()),
+        },
+        frame_id: Seq16(0),
+        frame_ts: 0,
+        need_keyframe: true,
+        last_kbps: params.target_kbps_seed(),
     };
-    let mut frame_id = Seq16(0);
-    let mut frame_ts: u64 = 0;
-    let mut need_keyframe = true;
     let mut current_color: Option<ConvertOutput> = None;
-    let mut last_kbps = params.target_kbps_seed();
 
-    // The frame-rate governor: one encode per client frame interval, taking the
-    // freshest capture at each slot. Without it a 144 Hz desktop feeds NVENC far
-    // past what a 60 Hz client will show.
-    let interval = Duration::from_nanos(1_000_000_000 / params.fps.max(1) as u64);
-    let mut next_slot = Instant::now();
+    // The frame-rate governor: at most one encode per client frame interval
+    // (a 144 Hz desktop would otherwise feed NVENC far past what a 60 Hz TV
+    // shows), holding an early frame instead of discarding it so the last frame
+    // of a motion is never lost. See `sunburst_net::governor`.
+    let origin = Instant::now();
+    let now_ns = || origin.elapsed().as_nanos() as u64;
+    let mut governor = FrameGovernor::new(params.interval_ns, capture.honors_timeout());
+    // The frame the governor is holding, if any.
+    let mut held: Option<Surface> = None;
+    // The most recent converted frame — still intact in the converter's output
+    // until the next convert — for a keyframe owed on a still screen.
+    let mut last: Option<Surface> = None;
 
     while !stop.load(Ordering::Relaxed) {
-        let frame = match capture.acquire(Duration::from_millis(100)) {
+        // Motion stopped with a frame still held: encode it now.
+        if let Some(h) = held
+            && governor.flush_deadline().is_some_and(|dl| now_ns() >= dl)
+        {
+            governor.on_flush(now_ns());
+            held = None;
+            let enc = spine
+                .as_mut()
+                .ok_or("held a frame without a spine")?
+                .encoder();
+            st.encode(enc, h, params, shared, send_thread)?;
+            continue;
+        }
+        let timeout = match (held, governor.flush_deadline()) {
+            // Wake at the flush deadline (the backends round up to whole ms).
+            (Some(_), Some(dl)) => {
+                Duration::from_nanos(dl.saturating_sub(now_ns())).max(Duration::from_millis(1))
+            }
+            _ => IDLE_WAIT,
+        };
+
+        let frame = match capture.acquire(timeout) {
             Ok(Some(f)) => f,
-            Ok(None) => continue,
+            Ok(None) => {
+                // A still screen: nothing new to encode. But a client owed a
+                // keyframe (its request, recovery from a lost frame) must not
+                // wait for the screen to change — re-encode the last frame.
+                if held.is_none()
+                    && let Some(surface) = last
+                    && st.owed(shared)
+                    && let Some(spine) = spine.as_mut()
+                {
+                    st.encode(spine.encoder(), surface, params, shared, send_thread)?;
+                }
+                continue;
+            }
             Err(CaptureError::AccessLost) => {
                 capture = select::build(
                     params.nvfbc,
@@ -319,28 +488,35 @@ fn gpu_loop(
                     params.output,
                 )
                 .map_err(|e| e.to_string())?;
+                // The spine (and every surface it produced) goes with it.
                 spine = None;
-                need_keyframe = true;
+                held = None;
+                last = None;
+                st.need_keyframe = true;
+                governor = FrameGovernor::new(params.interval_ns, capture.honors_timeout());
                 continue;
             }
             Err(CaptureError::Unavailable) => {
                 shared.secure.store(true, Ordering::Relaxed);
+                // Never a frozen frame (CLAUDE.md): nothing held or kept over
+                // from before the secure desktop is sent after it.
+                held = None;
+                last = None;
+                governor.reset();
                 std::thread::sleep(Duration::from_millis(50));
-                need_keyframe = true;
+                st.need_keyframe = true;
                 continue;
             }
             Err(CaptureError::Backend(m)) => return Err(m),
         };
         shared.secure.store(false, Ordering::Relaxed);
 
-        // Governor: skip frames that arrive before the slot, keeping the latest.
-        let now = Instant::now();
-        if now < next_slot {
+        let admit = governor.on_frame(now_ns());
+        if admit == Admit::Skip {
             continue;
         }
-        next_slot = (next_slot + interval).max(now);
 
-        let fid = frame_id;
+        let fid = st.frame_id;
         instr::record(Stage::CaptureAcquire, fid.0 as u32);
         let qpc = frame.meta().present_qpc as u32;
 
@@ -365,9 +541,9 @@ fn gpu_loop(
             // The encoder now runs at `live_kbps`; without this, an unchanged
             // target would never be re-applied and `reconfigure_bitrate`'s
             // equal-value early return would hide the mismatch.
-            last_kbps = live_kbps;
+            st.last_kbps = live_kbps;
             // A freshly (re)built encoder must open on an IDR.
-            need_keyframe = true;
+            st.need_keyframe = true;
             let enc = spine.as_mut().expect("just built").encoder();
             let sequence = match params.codec {
                 // HEVC and H.264 send their Annex-B parameter sets (VPS/SPS/PPS,
@@ -380,75 +556,26 @@ fn gpu_loop(
                 sequence,
             });
         }
+        let surface = Surface { input, qpc };
+        last = Some(surface);
 
-        let enc = spine.as_mut().expect("built above").encoder();
-
-        // Apply control-thread signals before encoding this frame.
-        let mut force_idr = need_keyframe || shared.request_idr.swap(false, Ordering::AcqRel);
-        let abandoned = shared.abandon.swap(NO_ABANDON, Ordering::AcqRel);
-        if abandoned != NO_ABANDON && params.ref_invalidation {
-            match refs.on_abandoned(Seq16(abandoned as u16)) {
-                Recovery::Invalidate { from, to } => {
-                    let mut id = from;
-                    loop {
-                        if let Some(ts) = refs.timestamp_of(id) {
-                            enc.invalidate_ref_frames(ts)?;
-                        }
-                        if id == to {
-                            break;
-                        }
-                        id = id.next();
-                    }
+        match admit {
+            Admit::Encode => {
+                held = None;
+                let enc = spine.as_mut().expect("built above").encoder();
+                st.encode(enc, surface, params, shared, send_thread)?;
+            }
+            Admit::Hold => {
+                // The next `acquire` releases the capture surface this convert
+                // reads; make sure the GPU is done with it first. (An encoded
+                // frame needs no wait: NVENC consumes the convert's output.)
+                if let Some(Spine::D3d11 { converter, .. }) = &spine {
+                    converter.wait_idle()?;
                 }
-                Recovery::ForceIdr => force_idr = true,
-                Recovery::Nothing => {}
+                held = Some(surface);
             }
-        } else if abandoned != NO_ABANDON {
-            // The decoder cannot use reference invalidation: a keyframe instead.
-            force_idr = true;
+            Admit::Skip => unreachable!("skipped above"),
         }
-        let target = shared.target_kbps.load(Ordering::Relaxed);
-        if target != last_kbps && target != 0 {
-            enc.reconfigure_bitrate(target)?;
-            last_kbps = target;
-        }
-
-        instr::record(Stage::EncodeSubmit, fid.0 as u32);
-        need_keyframe = false;
-        let req = PicRequest {
-            timestamp: frame_ts,
-            force_idr,
-        };
-        // The wire keyframe flag comes from NVENC's actual encoded picture type,
-        // not the request, so an auto-inserted periodic IDR (finite idr_period) is
-        // flagged too. begin_frame is deferred to the first emitted unit, when the
-        // type is known.
-        let mut begun = false;
-        let is_idr = enc.encode_slices(input, req, |unit, unit_is_idr| {
-            instr::record(Stage::EncodeUnitOut, fid.0 as u32);
-            if !begun {
-                packetizer.begin_frame(fid, qpc, unit_is_idr);
-                begun = true;
-            }
-            packetizer.push_unit(unit, |pkt| {
-                producer.push(pkt);
-            });
-            instr::record(Stage::Packetize, fid.0 as u32);
-            send_thread.unpark();
-        })?;
-        if !begun {
-            // No units emitted (abnormal); open an empty frame so finish_frame has
-            // valid state.
-            packetizer.begin_frame(fid, qpc, is_idr);
-        }
-        packetizer.finish_frame(|pkt| {
-            producer.push(pkt);
-        });
-        send_thread.unpark();
-
-        refs.on_encoded(fid, frame_ts, is_idr);
-        frame_id = frame_id.next();
-        frame_ts += 1;
     }
     Ok(())
 }
