@@ -122,15 +122,19 @@ impl Collector {
         }
     }
 
-    /// Drain every registered ring. Allocation-free.
+    /// Drain every registered ring in timestamp order. Allocation-free.
     pub fn poll(&mut self) {
         // Borrow the fields separately so the closure does not hold `&mut self`
-        // while `ingest` needs the same fields. `drain_all` hands samples over
-        // one at a time, so nothing is buffered and nothing is allocated.
+        // while `ingest` needs the same fields. The merge hands samples over one
+        // at a time, so nothing is buffered and nothing is allocated.
         let frames = &mut *self.frames;
         let hist = &mut self.hist[..];
         let current = self.current;
-        ring::drain_all(|s| Self::ingest(frames, hist, current, s));
+        // Bound the merge at "now": a sample stamped after this point may still
+        // be mid-publication on another thread, and taking it would let it jump
+        // ahead of an earlier one.
+        let until = clock::now();
+        ring::drain_merged(until, |s| Self::ingest(frames, hist, current, s));
     }
 
     /// Place one sample and emit any duration it completes.
@@ -169,16 +173,28 @@ impl Collector {
         slot.present |= 1 << idx;
 
         // A duration is emitted when the *second* of a pair arrives, whichever
-        // that turns out to be. Rings are drained in registration order, not
-        // time order, so a successor can genuinely be ingested first.
-        if !stage.starts_chain() && slot.has(idx - 1) {
-            let d = s.ticks.saturating_sub(slot.ticks[idx - 1]);
+        // that turns out to be. Rings are merged in time order, but a sample can
+        // still straddle a poll (stamped before one, published after), so a
+        // successor can occasionally be ingested first.
+        //
+        // A negative pair is dropped, never recorded as zero. It is not a
+        // measurement: it is the next unit of a subframe frame meeting the
+        // previous unit's later stage (`EncodeUnitOut` #2 after `Packetize` #1),
+        // or two threads' clocks disagreeing by a hair. Recording those as 0 ns
+        // filled the packetize and send rows with fake zeros and pulled their
+        // p50 toward nothing.
+        if !stage.starts_chain()
+            && slot.has(idx - 1)
+            && let Some(d) = s.ticks.checked_sub(slot.ticks[idx - 1])
+        {
             Self::emit(hist, current, stage, d);
         }
         if idx + 1 < STAGE_COUNT {
             let next = Stage::ALL[idx + 1];
-            if !next.starts_chain() && slot.has(idx + 1) {
-                let d = slot.ticks[idx + 1].saturating_sub(s.ticks);
+            if !next.starts_chain()
+                && slot.has(idx + 1)
+                && let Some(d) = slot.ticks[idx + 1].checked_sub(s.ticks)
+            {
                 Self::emit(hist, current, next, d);
             }
         }
@@ -229,6 +245,12 @@ impl Collector {
                 dropped_by_thread.push((name, dropped));
             }
         });
+        // Threads that have exited and had their rings reclaimed still count:
+        // a session that overran its ring should not look clean afterwards.
+        let retired = ring::retired_dropped();
+        if retired > 0 {
+            dropped_by_thread.push(("retired", retired));
+        }
 
         Report {
             stages,
@@ -385,7 +407,8 @@ mod tests {
 
     #[test]
     fn pairs_regardless_of_arrival_order() {
-        // Rings are drained in registration order, so a successor really can be
+        // A sample stamped before one poll but published after it is ingested
+        // after later samples from other threads, so a successor really can be
         // ingested before its predecessor.
         let mut c = Collector::new();
         feed(&mut c, Stage::ColorConvert, 1, ns(1_000_000));
@@ -565,22 +588,42 @@ mod tests {
     }
 
     #[test]
-    fn clock_going_backwards_saturates_rather_than_wrapping() {
+    fn clock_going_backwards_drops_the_pair_rather_than_wrapping() {
         // Two threads reading QPC can observe a tiny inversion. Wrapping would
-        // turn that into a ~584-year duration in the p99 column.
+        // turn that into a ~584-year duration in the p99 column, and clamping to
+        // zero would plant a fake 0 ns sample — neither is a measurement.
         let mut c = Collector::new();
         feed(&mut c, Stage::CaptureAcquire, 1, ns(1_000_000));
         feed(&mut c, Stage::ColorConvert, 1, ns(999_000));
 
-        let convert = c
-            .report()
-            .stage(Stage::ColorConvert)
-            .cloned()
-            .expect("missing");
         assert!(
-            convert.max_ns < 1_000,
-            "inverted timestamps produced {}ns",
-            convert.max_ns
+            c.report().stage(Stage::ColorConvert).is_none(),
+            "an inverted pair must be dropped, not recorded"
         );
+    }
+
+    #[test]
+    fn subframe_units_do_not_plant_zero_samples() {
+        // The shape the pipeline really produces: each slice/tile is emitted and
+        // packetized before the next one completes. Unit #2's EncodeUnitOut meets
+        // unit #1's Packetize, which is *later* in stage order but *earlier* in
+        // time. That used to be recorded as a 0 ns packetize sample, three per
+        // four-unit frame, which halved the packetize row's p50.
+        let mut c = Collector::new();
+        feed(&mut c, Stage::EncodeSubmit, 1, ns(0));
+        for unit in 1..=4u64 {
+            feed(&mut c, Stage::EncodeUnitOut, 1, ns(unit * 2_000_000));
+            feed(&mut c, Stage::Packetize, 1, ns(unit * 2_000_000 + 100_000));
+        }
+
+        let r = c.report();
+        let pk = r.stage(Stage::Packetize).expect("packetize missing");
+        assert_eq!(pk.count, 4, "one packetize duration per unit, no extras");
+        assert!(
+            pk.p50_ns.abs_diff(dur_ns(100_000)) < dur_ns(20_000),
+            "every packetize sample is a real ~100us, got p50 {}ns",
+            pk.p50_ns
+        );
+        assert_eq!(r.stage(Stage::EncodeUnitOut).expect("units").count, 4);
     }
 }

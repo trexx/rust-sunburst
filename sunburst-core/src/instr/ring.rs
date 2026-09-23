@@ -9,14 +9,20 @@
 //! only lines this thread already owns, except for the one `tail` read that
 //! bounds the ring, and the drain thread writes `tail` about once a second.
 //!
-//! Rings are registered into a fixed global table and **never freed**, even
-//! after their thread exits, so the drain thread can collect whatever was left
-//! behind. That is fine for the long-lived stage threads this project runs and
-//! would be a leak under a thread-per-frame design, which nothing here does.
+//! Rings live in a fixed global table of [`MAX_THREADS`] slots. A thread's ring
+//! is **retired when the thread exits** (a thread-local guard marks it) and the
+//! drain reclaims it — collecting whatever the thread left behind first — so the
+//! slot is free for the next thread. Every session spawns fresh stage threads,
+//! so without reclamation the table filled after a handful of sessions and
+//! instrumentation silently went dark.
+//!
+//! A thread that finds the table full is marked failed and never tries again:
+//! retrying on every [`record`] would allocate (and free) a ring per sample,
+//! which is the exact hot-path cost this module exists to avoid.
 
 use core::cell::{Cell, UnsafeCell};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use super::clock;
 use super::stage::Stage;
@@ -86,6 +92,10 @@ pub struct Ring {
     buf: Box<[UnsafeCell<Sample>]>,
     mask: u32,
     name: &'static str,
+    /// Set (Release) by the owning thread as it exits, after its last push. A
+    /// consumer that observes it (Acquire) may drain the ring one final time and
+    /// free it.
+    retired: AtomicBool,
 }
 
 // SAFETY: the head/tail protocol below is single-producer, single-consumer. The
@@ -114,6 +124,7 @@ impl Ring {
             buf,
             mask: (RING_CAPACITY - 1) as u32,
             name,
+            retired: AtomicBool::new(false),
         }
     }
 
@@ -157,6 +168,18 @@ impl Ring {
         Some(s)
     }
 
+    /// Consumer side: the oldest unread sample, without consuming it.
+    fn peek(&self) -> Option<Sample> {
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        let head = self.head.0.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+        let idx = (tail & self.mask) as usize;
+        // SAFETY: as in `pop` — the slot is below the published `head`.
+        Some(unsafe { self.buf.get_unchecked(idx).get().read() })
+    }
+
     /// Total samples this ring has discarded for want of space.
     pub fn dropped(&self) -> u32 {
         self.dropped.0.load(Ordering::Relaxed)
@@ -171,14 +194,62 @@ static REGISTRY: [AtomicPtr<Ring>; MAX_THREADS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; MAX_THREADS];
 
 /// Threads that wanted a ring after the registry filled up. Reported alongside
-/// dropped samples, for the same reason.
+/// dropped samples, for the same reason. Counted once per thread.
 static UNREGISTERED: AtomicU32 = AtomicU32::new(0);
+
+/// Samples dropped by rings that have since been reclaimed, so a thread's
+/// overruns stay visible in the report after the thread has gone.
+static RETIRED_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Excludes consumers from each other. Reclaiming frees a ring, so a second
+/// consumer walking the registry at the same moment would read freed memory.
+/// Only the drain side takes it — the frame path never does.
+static CONSUMER: AtomicBool = AtomicBool::new(false);
+
+/// This thread's relationship with the registry.
+const STATE_NEW: u8 = 0;
+const STATE_REGISTERED: u8 = 1;
+/// The registry was full. Terminal: see the module docs.
+const STATE_FAILED: u8 = 2;
+/// The thread is exiting; its ring (if any) is retired.
+const STATE_EXITED: u8 = 3;
+
+/// Retires this thread's ring when the thread exits.
+struct RetireGuard;
+
+impl Drop for RetireGuard {
+    fn drop(&mut self) {
+        // `LOCAL` and `STATE` are const and have no destructor, so they stay
+        // accessible while other thread-locals are being torn down. Null the
+        // pointer first, so a `record` from a later destructor is a no-op
+        // rather than a push into a ring the drain may already be freeing.
+        let _ = STATE.try_with(|s| s.set(STATE_EXITED));
+        let _ = LOCAL.try_with(|local| {
+            let p = local.replace(ptr::null());
+            if !p.is_null() {
+                // SAFETY: a registered ring is only freed after it is retired,
+                // and it is being retired right here, by its only producer.
+                unsafe { (*p).retired.store(true, Ordering::Release) };
+            }
+        });
+    }
+}
 
 thread_local! {
     static LOCAL: Cell<*const Ring> = const { Cell::new(ptr::null()) };
+    static STATE: Cell<u8> = const { Cell::new(STATE_NEW) };
+    static GUARD: RetireGuard = const { RetireGuard };
 }
 
+/// Claim a registry slot for a fresh ring, or `null` if the table is full.
 fn register(name: &'static str) -> *const Ring {
+    // Check for room first, so a full table costs no allocation at all.
+    if REGISTRY
+        .iter()
+        .all(|slot| !slot.load(Ordering::Acquire).is_null())
+    {
+        return ptr::null();
+    }
     let ptr = Box::into_raw(Box::new(Ring::new(name)));
     for slot in &REGISTRY {
         if slot
@@ -188,11 +259,35 @@ fn register(name: &'static str) -> *const Ring {
             return ptr;
         }
     }
-    UNREGISTERED.fetch_add(1, Ordering::Relaxed);
+    // Lost a race for the last slot.
     // SAFETY: `ptr` came from `Box::into_raw` and no registry slot took
     // ownership of it, so this thread is still the only owner.
     drop(unsafe { Box::from_raw(ptr) });
     ptr::null()
+}
+
+/// Register this thread (once), returning its ring or `null`. Called only when
+/// `LOCAL` is null, so this is off the fast path.
+fn register_local(local: &Cell<*const Ring>, name: &'static str) -> *const Ring {
+    if STATE.with(Cell::get) != STATE_NEW {
+        // Failed or exiting: never retry, never allocate.
+        return ptr::null();
+    }
+    // Arm the retire guard before taking a slot. If this thread is already
+    // tearing down its thread-locals, the guard is gone and so is the thread.
+    if GUARD.try_with(|_| ()).is_err() {
+        STATE.with(|s| s.set(STATE_EXITED));
+        return ptr::null();
+    }
+    let p = register(name);
+    if p.is_null() {
+        STATE.with(|s| s.set(STATE_FAILED));
+        UNREGISTERED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        STATE.with(|s| s.set(STATE_REGISTERED));
+        local.set(p);
+    }
+    p
 }
 
 /// Give this thread's ring a name for the readout.
@@ -203,7 +298,7 @@ fn register(name: &'static str) -> *const Ring {
 pub fn register_thread(name: &'static str) {
     LOCAL.with(|local| {
         if local.get().is_null() {
-            local.set(register(name));
+            register_local(local, name);
         }
     });
 }
@@ -218,36 +313,111 @@ pub fn record(stage: Stage, frame_id: u32) {
     LOCAL.with(|local| {
         let mut p = local.get();
         if p.is_null() {
-            // First call on this thread. Allocates once, during warmup, and
-            // never again.
-            p = register("unnamed");
-            local.set(p);
+            // First call on this thread: allocates once, during warmup. A thread
+            // that could not register returns here without allocating.
+            p = register_local(local, "unnamed");
             if p.is_null() {
                 return;
             }
         }
-        // SAFETY: registry entries are leaked for the lifetime of the process,
-        // so a non-null ring pointer stays valid once observed.
+        // SAFETY: a ring is freed only after its owner retired it, and `LOCAL`
+        // is nulled before retirement, so a non-null `LOCAL` is still live.
         unsafe { (*p).push(Sample::new(stage, frame_id, ticks)) };
     });
 }
 
-/// Drain every registered ring, passing each sample to `f`.
+/// Holds the consumer lock for its lifetime.
+struct ConsumerGuard;
+
+impl ConsumerGuard {
+    fn acquire() -> ConsumerGuard {
+        while CONSUMER
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        ConsumerGuard
+    }
+}
+
+impl Drop for ConsumerGuard {
+    fn drop(&mut self) {
+        CONSUMER.store(false, Ordering::Release);
+    }
+}
+
+/// Pop samples from `rings` in timestamp order, up to and including `until`.
 ///
-/// Called by the drain thread. Visits rings in registration order, which does
-/// not interleave samples by time — the frame table in [`super::drain`] sorts
-/// that out by keying on `frame_id`.
-pub fn drain_all(mut f: impl FnMut(Sample)) {
-    for slot in &REGISTRY {
+/// Each ring is already in time order (one producer thread, monotonic clock),
+/// so a repeated minimum over the ring heads is a k-way merge — no buffer, no
+/// sort, no allocation. Samples newer than `until` stay for the next call, so a
+/// sample stamped during this merge cannot jump ahead of one from another
+/// thread that is still being published.
+fn merge_rings(rings: &[Option<&Ring>], until: u64, f: &mut impl FnMut(Sample)) {
+    loop {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, ring) in rings.iter().enumerate() {
+            let Some(ring) = ring else { continue };
+            if let Some(s) = ring.peek()
+                && s.ticks <= until
+                && best.is_none_or(|(_, t)| s.ticks < t)
+            {
+                best = Some((i, s.ticks));
+            }
+        }
+        let Some((i, _)) = best else { break };
+        if let Some(s) = rings[i].and_then(Ring::pop) {
+            f(s);
+        }
+    }
+}
+
+/// Drain every registered ring in timestamp order, passing each sample stamped
+/// at or before `until` to `f`, then reclaim the rings of exited threads.
+///
+/// Time order matters: pairing a stage with the one before it is only
+/// meaningful if the earlier sample is seen first, and the stages of one frame
+/// are recorded on different threads (encode vs send).
+pub fn drain_merged(until: u64, mut f: impl FnMut(Sample)) {
+    let _consumer = ConsumerGuard::acquire();
+
+    let mut rings: [Option<&Ring>; MAX_THREADS] = [None; MAX_THREADS];
+    let mut retired = [false; MAX_THREADS];
+    for (i, slot) in REGISTRY.iter().enumerate() {
         let p = slot.load(Ordering::Acquire);
-        if p.is_null() {
+        if !p.is_null() {
+            // SAFETY: only a consumer frees a ring, and we hold the consumer
+            // lock, so the pointer stays valid for this call.
+            let ring = unsafe { &*p };
+            // Read the flag before draining: a ring retired *now* has had its
+            // last push, so the final drain below sees everything.
+            retired[i] = ring.retired.load(Ordering::Acquire);
+            rings[i] = Some(ring);
+        }
+    }
+
+    merge_rings(&rings, until, &mut f);
+
+    for (i, slot) in REGISTRY.iter().enumerate() {
+        let Some(ring) = rings[i] else { continue };
+        if !retired[i] {
             continue;
         }
-        // SAFETY: registry entries are leaked and never cleared, so a non-null
-        // pointer remains valid.
-        let ring = unsafe { &*p };
+        // The owner is gone: take what it left, newer than `until` or not.
         while let Some(s) = ring.pop() {
             f(s);
+        }
+        let p = ring as *const Ring as *mut Ring;
+        if slot
+            .compare_exchange(p, ptr::null_mut(), Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            RETIRED_DROPPED.fetch_add(ring.dropped(), Ordering::Relaxed);
+            // SAFETY: the slot no longer points at the ring, no producer
+            // touches a retired ring, and the consumer lock excludes every other
+            // reader — so this is the last reference.
+            drop(unsafe { Box::from_raw(p) });
         }
     }
 }
@@ -258,12 +428,13 @@ pub fn drain_all(mut f: impl FnMut(Sample)) {
 /// start disappearing, the useful question is *which* stage thread is
 /// overrunning its ring, and a lone number cannot answer it.
 pub fn for_each_ring(mut f: impl FnMut(&'static str, u32)) {
+    let _consumer = ConsumerGuard::acquire();
     for slot in &REGISTRY {
         let p = slot.load(Ordering::Acquire);
         if p.is_null() {
             continue;
         }
-        // SAFETY: as in `drain_all`.
+        // SAFETY: the consumer lock keeps reclamation out while we read.
         let ring = unsafe { &*p };
         f(ring.name(), ring.dropped());
     }
@@ -272,6 +443,11 @@ pub fn for_each_ring(mut f: impl FnMut(&'static str, u32)) {
 /// Threads that asked for a ring after the registry was full.
 pub fn unregistered_threads() -> u32 {
     UNREGISTERED.load(Ordering::Relaxed)
+}
+
+/// Samples dropped by rings that have since been reclaimed.
+pub fn retired_dropped() -> u32 {
+    RETIRED_DROPPED.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -380,6 +556,37 @@ mod tests {
     }
 
     #[test]
+    fn merge_pops_across_rings_in_time_order_and_leaves_the_future() {
+        let a = Ring::new("a");
+        let b = Ring::new("b");
+        for t in [1u64, 4, 6] {
+            a.push(Sample::new(Stage::Packetize, 1, t));
+        }
+        for t in [2u64, 3, 7] {
+            b.push(Sample::new(Stage::Send, 1, t));
+        }
+        let mut order = Vec::new();
+        merge_rings(&[Some(&a), None, Some(&b)], 6, &mut |s| order.push(s.ticks));
+        assert_eq!(
+            order,
+            [1, 2, 3, 4, 6],
+            "k-way merge by tick, bounded by `until`"
+        );
+        // The sample newer than `until` waits for the next pass.
+        assert_eq!(b.pop().map(|s| s.ticks), Some(7));
+        assert!(a.pop().is_none());
+    }
+
+    #[test]
+    fn peek_does_not_consume() {
+        let r = Ring::new("test");
+        r.push(Sample::new(Stage::Send, 9, 5));
+        assert_eq!(r.peek().map(|s| s.frame_id), Some(9));
+        assert_eq!(r.pop().map(|s| s.frame_id), Some(9));
+        assert!(r.peek().is_none());
+    }
+
+    #[test]
     fn record_registers_lazily_and_is_drainable() {
         // Runs on its own thread so it cannot disturb other tests' rings.
         std::thread::spawn(|| {
@@ -388,7 +595,7 @@ mod tests {
             record(Stage::ColorConvert, 7);
 
             let mut got = Vec::new();
-            drain_all(|s| got.push(s));
+            drain_merged(u64::MAX, |s| got.push(s));
             let ours: Vec<_> = got.iter().filter(|s| s.frame_id == 7).collect();
             assert_eq!(ours.len(), 2, "both samples should survive the drain");
             assert!(ours[0].ticks <= ours[1].ticks, "clock went backwards");
