@@ -19,9 +19,38 @@ use sunburst_core::proto::{
 };
 use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
+    client_interval_ns,
 };
 
 use crate::ivf::IvfWriter;
+
+/// One line on how evenly the delivered frames sample motion: the content
+/// (present-time) step between consecutive frames, and how many steps are off
+/// the client's own interval by more than 30 %. With content faster than the
+/// client, every step should sit near the interval — a 120 Hz desktop into a
+/// 60 Hz client alternating 25 / 8 ms is visible judder. (Slower content steps
+/// by its own interval, which reads as "off" here; judge those by the median.)
+fn describe_steps(steps_ms: &[f64], interval_ms: f64) -> Option<String> {
+    if steps_ms.len() < 10 {
+        return None;
+    }
+    let mut s = steps_ms.to_vec();
+    s.sort_by(f64::total_cmp);
+    let pct = |p: f64| s[((s.len() - 1) as f64 * p) as usize];
+    let off = steps_ms
+        .iter()
+        .filter(|&&d| (d - interval_ms).abs() > 0.3 * interval_ms)
+        .count();
+    Some(format!(
+        "content steps: p5 {:.1} / p50 {:.1} / p95 {:.1} ms; {off} of {} ({:.1}%) off the {:.1} ms client step by >30%",
+        pct(0.05),
+        pct(0.50),
+        pct(0.95),
+        s.len(),
+        100.0 * off as f64 / s.len() as f64,
+        interval_ms,
+    ))
+}
 
 /// One line on the `av1C` record the server sent, and whether it agrees with the
 /// sequence-header OBU it wraps. A record that disagrees is CLAUDE.md's silent
@@ -160,11 +189,19 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
     let mut collector = Collector::new();
     let mut reassembler = Reassembler::new();
     let mut jitter = JitterBuffer::new();
-    let frame_interval_ns = 1_000_000_000u64 / (config.fps_mhz.max(1000) as u64 / 1000);
+    // Exact: truncating 59.94 Hz to whole frames would govern the jitter buffer
+    // (and the content-step check below) at 59.
+    let frame_interval_ns = client_interval_ns(config.fps_mhz, 0);
     jitter.set_frame_interval_ns(frame_interval_ns);
     jitter.set_min_depth_ns(2_000_000); // hold ~2 ms so a retransmit can land
     let mut owd = OwdGradient::new(100_000_000);
     let mut ticks = TickUnwrap::new(config.qpc_freq_hz);
+    // Content steps: the present-time advance between consecutive delivered
+    // frames. How evenly the server sampled motion — judder no client can
+    // smooth — is visible here directly.
+    let mut content_ticks = TickUnwrap::new(config.qpc_freq_hz);
+    let mut last_content: Option<i64> = None;
+    let mut steps_ms: Vec<f64> = Vec::new();
 
     let mut rng = Lcg(0x1234_5678_9abc_def0);
     let mut out_buf = vec![0u8; 8 * 1024 * 1024];
@@ -262,6 +299,15 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
             if rel.frame.keyframe {
                 keyframes += 1;
             }
+            let content = content_ticks.to_ns(rel.frame.qpc_timestamp);
+            if let Some(prev) = last_content {
+                let step = content - prev;
+                // A still desktop (or a stall) is not a motion step.
+                if step > 0 && step < 100_000_000 {
+                    steps_ms.push(step as f64 / 1e6);
+                }
+            }
+            last_content = Some(content);
             if let Some(n) = reassembler.copy_into(&rel.frame, &mut out_buf) {
                 instr::record(Stage::JitterOut, rel.frame.frame_id.0 as u32);
                 match &mut sink {
@@ -319,6 +365,9 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
     if let Some(f) = frames {
         println!("wrote {f} IVF frames");
     }
+    if let Some(line) = describe_steps(&steps_ms, frame_interval_ns as f64 / 1e6) {
+        println!("{line}");
+    }
     if opts.stats {
         let report = collector.report();
         for stage in [Stage::Recv, Stage::JitterOut] {
@@ -355,6 +404,39 @@ fn send_nack_for(
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::describe_steps;
+
+    #[test]
+    fn even_steps_are_clean_and_25_8_judder_is_counted() {
+        let even = vec![16.67; 100];
+        assert!(
+            describe_steps(&even, 16.67)
+                .unwrap()
+                .contains("0 of 100 (0.0%)")
+        );
+        // What the old governor did at 120 Hz -> 60: pairs of 25 / 8 ms steps.
+        let judder: Vec<f64> = (0..100)
+            .map(|i| {
+                if i % 6 == 0 {
+                    25.0
+                } else if i % 6 == 1 {
+                    8.3
+                } else {
+                    16.67
+                }
+            })
+            .collect();
+        let line = describe_steps(&judder, 16.67).unwrap();
+        assert!(line.contains("34 of 100"), "{line}");
+        assert!(
+            describe_steps(&even[..5], 16.67).is_none(),
+            "too few to say"
+        );
     }
 }
 

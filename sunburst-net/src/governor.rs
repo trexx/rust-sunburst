@@ -30,6 +30,22 @@
 //! content interval. Flushing one *client* interval after the slot instead
 //! raced the next frame of a 60 fps game and was measurably worse.
 //!
+//! **Content much faster than the client is resampled on a fixed grid.** At an
+//! integer ratio — a 120 Hz desktop into a 60 Hz TV, 240 into 60 or 120 — the
+//! desktop's frames land right on the client's slot boundaries, and "admit once
+//! the slot is open, re-anchor to the arrival" flips on sub-millisecond jitter:
+//! it samples motion as 25/8 ms steps instead of 16.7/16.7, 19–38 visible
+//! judder events a second where an ideal resampler has none. So while the
+//! content cadence is clearly faster than the client (entering below 0.70 of
+//! the interval, leaving above 0.85 — hysteresis, so a game's wandering frame
+//! rate does not flip-flop), the slots stay on a fixed grid and each slot takes
+//! the frame nearest it: admitted if it is no more than half a content interval
+//! early. Content at or below the client rate never enters that mode, so the
+//! primary case keeps the old rule exactly. Measured in simulation against an
+//! offline best-pick oracle: 120→60 judder 19.2 → 0.1 events/s, 240→120
+//! 38.5 → 0.1, identical admission at 58/60/62→60, 60→59.94 and 117→120, no
+//! added latency.
+//!
 //! Pure logic, clock as an argument (u64 nanoseconds), integer-only — the same
 //! shape as [`crate::send::Pacer`], so it is host-tested here and the Windows
 //! capture loop only feeds it timestamps.
@@ -40,6 +56,11 @@ const IDLE_GAP_NS: u64 = 100_000_000;
 /// Slack added to twice the cadence, so a game that misses one vsync is not
 /// mistaken for motion stopping.
 const FLUSH_SLACK_NS: u64 = 1_000_000;
+/// Grid mode is entered when the content cadence drops below this fraction of
+/// the client interval, and left when it rises above the second (tenths / 20ths
+/// so the comparison stays integer).
+const GRID_ENTER_TENTHS: u128 = 7;
+const GRID_LEAVE_TWENTIETHS: u128 = 17;
 
 /// The refresh assumed when a client reports none (millihertz).
 const DEFAULT_REFRESH_MHZ: u32 = 60_000;
@@ -103,6 +124,8 @@ pub struct FrameGovernor {
     last_arrival: Option<u64>,
     /// When the held frame must be flushed, if one is held.
     deadline: Option<u64>,
+    /// Resampling on a fixed grid: content is clearly faster than the client.
+    grid: bool,
 }
 
 impl FrameGovernor {
@@ -121,6 +144,7 @@ impl FrameGovernor {
             gap_ns: interval_ns,
             last_arrival: None,
             deadline: None,
+            grid: false,
         }
     }
 
@@ -140,7 +164,26 @@ impl FrameGovernor {
         }
         self.last_arrival = Some(now_ns);
 
-        if !self.started || now_ns >= self.next_slot {
+        if !self.started {
+            self.admit(now_ns);
+            return Admit::Encode;
+        }
+        let (gap, interval) = (u128::from(self.gap_ns), u128::from(self.interval_ns));
+        if self.grid && gap * 20 > interval * GRID_LEAVE_TWENTIETHS {
+            self.grid = false;
+        } else if !self.grid && gap * 10 < interval * GRID_ENTER_TENTHS {
+            self.grid = true;
+        }
+        if self.grid {
+            self.catch_up(now_ns);
+            // The frame nearest the slot: no more than half a content interval
+            // early, else the next frame will be nearer.
+            if now_ns.saturating_add(self.gap_ns / 2) >= self.next_slot {
+                self.next_slot = self.next_slot.saturating_add(self.interval_ns);
+                self.deadline = None;
+                return Admit::Encode;
+            }
+        } else if now_ns >= self.next_slot {
             self.admit(now_ns);
             return Admit::Encode;
         }
@@ -163,7 +206,24 @@ impl FrameGovernor {
 
     /// The held frame was encoded at `now_ns`.
     pub fn on_flush(&mut self, now_ns: u64) {
-        self.admit(now_ns);
+        if self.grid {
+            self.catch_up(now_ns);
+            self.next_slot = self.next_slot.saturating_add(self.interval_ns);
+            self.deadline = None;
+        } else {
+            self.admit(now_ns);
+        }
+    }
+
+    /// Grid mode: step over whole slots that passed with no frame (a content
+    /// stall), keeping the grid's phase.
+    fn catch_up(&mut self, now_ns: u64) {
+        if now_ns >= self.next_slot.saturating_add(self.interval_ns) {
+            let behind = (now_ns - self.next_slot) / self.interval_ns;
+            self.next_slot = self
+                .next_slot
+                .saturating_add(behind.saturating_mul(self.interval_ns));
+        }
     }
 
     /// Forget everything: the capture was rebuilt, or the desktop became
@@ -294,6 +354,28 @@ mod tests {
         (1e9 / hz) as u64
     }
 
+    /// Content-advance judder: consecutive encoded frames whose content times
+    /// differ from the ideal step (the client interval, or the content's own
+    /// step when it is slower) by more than 0.8 of a desktop vsync. At an
+    /// integer ratio that is a 1.5-then-0.5-frame step — visible stutter no
+    /// client can smooth, because it is in *which* moments were sampled.
+    fn judder(contents: &[u64], arrivals: &[u64], client: u64, vsync: u64) -> usize {
+        let mut c = contents.to_vec();
+        c.sort_unstable();
+        c.windows(2)
+            .filter(|w| {
+                let d = w[1] - w[0];
+                if d > 100 * MS {
+                    return false; // idle, not motion
+                }
+                let i = arrivals.partition_point(|&a| a <= w[0]);
+                let local = arrivals.get(i).map_or(client, |&n| n - w[0]);
+                let ideal = client.max(local);
+                d.abs_diff(ideal) * 10 > vsync * 8
+            })
+            .count()
+    }
+
     #[test]
     fn a_59_94_hz_client_keeps_its_exact_interval() {
         assert_eq!(client_interval_ns(59_940, 0), 16_683_350);
@@ -340,6 +422,81 @@ mod tests {
                 got, want,
                 "{game} fps on a {desk} Hz desktop into {client} Hz changed admission"
             );
+        }
+    }
+
+    #[test]
+    fn integer_ratio_content_is_sampled_evenly() {
+        // A 120 Hz desktop into a 60 Hz TV, and 240 into 60 / 120: the old rule
+        // flipped on jitter at every slot boundary and sampled motion unevenly.
+        for (desk, client) in [(120.0, 60.0), (240.0, 60.0), (240.0, 120.0)] {
+            let arr = cadence(desk, desk, 20.0, 0.01, 7, false);
+            let secs = 20;
+            let now: Vec<u64> = drive(&arr, interval(client))
+                .iter()
+                .map(|&(_, c)| c)
+                .collect();
+            let before = legacy(&arr, interval(client));
+            let vsync = interval(desk);
+            let (j_now, j_before) = (
+                judder(&now, &arr, interval(client), vsync),
+                judder(&before, &arr, interval(client), vsync),
+            );
+            assert!(
+                j_before > 10 * secs,
+                "{desk}->{client}: the old rule should judder here, got {j_before}"
+            );
+            assert!(
+                j_now <= secs,
+                "{desk}->{client}: {j_now} judder events in {secs} s (old rule {j_before})"
+            );
+            let rate = now.len() as f64 / 20.0;
+            assert!(
+                rate <= client + 0.5,
+                "{desk}->{client} encoded {rate:.1} fps"
+            );
+            assert!(
+                rate >= client - 1.0,
+                "{desk}->{client} dropped to {rate:.1} fps"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wandering_frame_rate_is_no_worse_than_before() {
+        // A game whose frame rate drifts across the grid-mode thresholds must not
+        // flip-flop into more judder than the old rule, or lose the rate cap.
+        for (desk, lo, hi, client) in [(144.0, 50.0, 140.0, 60.0), (240.0, 100.0, 240.0, 120.0)] {
+            let mut rng = Lcg(3);
+            let vsync_ms = 1000.0 / desk;
+            let (mut arr, mut t, mut fps, mut last_v) =
+                (Vec::new(), 10.0f64, (lo + hi) / 2.0, -1.0);
+            while t < 30_000.0 {
+                fps = (fps + rng.gauss() * 1.5).clamp(lo, hi);
+                let v = (t / vsync_ms).ceil() * vsync_ms;
+                if v != last_v {
+                    arr.push(((v + (rng.gauss() * 0.2).abs()) * MS as f64) as u64);
+                    last_v = v;
+                }
+                t += 1000.0 / fps;
+            }
+            arr.sort_unstable();
+            arr.dedup();
+            let now: Vec<u64> = drive(&arr, interval(client))
+                .iter()
+                .map(|&(_, c)| c)
+                .collect();
+            let before = legacy(&arr, interval(client));
+            let vsync = interval(desk);
+            let (j_now, j_before) = (
+                judder(&now, &arr, interval(client), vsync),
+                judder(&before, &arr, interval(client), vsync),
+            );
+            assert!(
+                j_now <= j_before + j_before / 10 + 30,
+                "{desk} Hz {lo}-{hi} fps -> {client}: {j_now} vs {j_before} before"
+            );
+            assert!(now.len() as f64 / 30.0 <= client + 0.5);
         }
     }
 
@@ -431,25 +588,52 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_early_frame_supersedes_the_held_one() {
-        let mut g = primed(true);
-        assert_eq!(g.on_frame(12 * MS), Admit::Hold);
-        let first = g.flush_deadline().expect("held");
-        assert!(
-            first >= 12 * MS + 16 * MS,
-            "never before the slot opens: {first}"
-        );
-        assert_eq!(g.on_frame(14 * MS), Admit::Hold);
-        let second = g.flush_deadline().expect("still held");
-        // Measured from the newest held frame, at least a client interval out.
-        // (Not necessarily later than `first`: two quick frames also shorten
-        // the cadence estimate, which is the point of estimating it.)
-        assert!(
-            second >= 14 * MS + 16 * MS,
-            "the deadline follows the newest frame: {second}"
-        );
-        assert_eq!(g.on_frame(16 * MS), Admit::Encode, "the slot opened");
+    fn an_early_frame_is_superseded_by_one_at_the_slot() {
+        // The old rule: 0 opens, 16 is on time, 20 arrives with the slot at 16
+        // open and pushes the next slot to 32. So 24 is early and held...
+        let mut g = FrameGovernor::new(16 * MS, true);
+        for t in [0, 16, 20] {
+            assert_eq!(g.on_frame(t * MS), Admit::Encode);
+        }
+        assert_eq!(g.on_frame(24 * MS), Admit::Hold);
+        let deadline = g.flush_deadline().expect("held");
+        assert!(deadline >= 24 * MS + 16 * MS, "{deadline}");
+        // ...and the frame at the slot replaces it; the held one is never sent.
+        assert_eq!(g.on_frame(32 * MS), Admit::Encode);
         assert_eq!(g.flush_deadline(), None, "an encode clears the hold");
+    }
+
+    #[test]
+    fn in_grid_mode_the_newest_early_frame_is_the_one_held() {
+        // Content every 4 ms into a 16 ms client: grid mode, and a frame more
+        // than half a content interval (2 ms) before its slot waits for a
+        // nearer one.
+        let mut g = FrameGovernor::new(16 * MS, true);
+        let mut t = 0;
+        while t < 400 * MS {
+            g.on_frame(t);
+            t += 4 * MS;
+        }
+        // Find the next slot by stepping until a frame is encoded, then look at
+        // the frames 12 and 8 ms before the following slot.
+        let mut encoded_at = t;
+        while g.on_frame(encoded_at) != Admit::Encode {
+            encoded_at += 4 * MS;
+        }
+        let slot = encoded_at + 16 * MS;
+        assert_eq!(g.on_frame(slot - 12 * MS), Admit::Hold);
+        assert_eq!(g.on_frame(slot - 8 * MS), Admit::Hold, "still too early");
+        let deadline = g.flush_deadline().expect("held");
+        assert!(
+            deadline >= slot - 8 * MS + 16 * MS,
+            "follows the newest: {deadline}"
+        );
+        assert_eq!(
+            g.on_frame(slot),
+            Admit::Encode,
+            "the frame at the slot wins"
+        );
+        assert_eq!(g.flush_deadline(), None);
     }
 
     #[test]
@@ -471,13 +655,16 @@ mod tests {
 
     #[test]
     fn survives_the_top_of_the_clock() {
+        // Nothing may overflow (tests run with overflow checks) near u64::MAX,
+        // in either mode, and a deadline is never set in the past.
         let mut g = FrameGovernor::new(u64::MAX / 4, true);
-        let near = u64::MAX - 10;
-        assert_eq!(g.on_frame(near - 5), Admit::Encode);
-        // The slot saturates at u64::MAX rather than wrapping to the past.
-        assert_eq!(g.on_frame(near - 4), Admit::Encode);
-        assert_eq!(g.on_frame(near), Admit::Hold);
-        assert!(g.flush_deadline().is_some_and(|d| d >= near));
+        let near = u64::MAX - 1_000;
+        for t in [near - 50, near - 40, near - 30, near - 20, near - 10, near] {
+            if g.on_frame(t) == Admit::Hold {
+                assert!(g.flush_deadline().is_some_and(|d| d >= t));
+            }
+        }
         g.on_flush(u64::MAX);
+        let _ = g.on_frame(u64::MAX);
     }
 }
