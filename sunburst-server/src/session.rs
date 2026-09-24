@@ -283,6 +283,15 @@ impl StreamControl for SessionManager {
         });
         let display_guard = DisplayGuard::apply(want_hdr, resolution);
         let epp_guard = settings.disable_epp.then(EppGuard::disable);
+        // No stream of ours is running (one at a time), so any encoder session
+        // NVML reports belongs to something that will jitter this one's frame
+        // times. Control plane, once per session.
+        if let Some(warning) = crate::nvml::other_encoder_sessions()
+            .as_deref()
+            .and_then(crate::nvml::warning)
+        {
+            eprintln!("session: {warning}");
+        }
         let pointer_gain_milli = pointer_gain_milli(settings.mouse_sensitivity_milli);
         // The client numbers input from 1 in each session.
         self.input.mouse_seq.store(0, Ordering::Release);

@@ -432,7 +432,9 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   on scaled displays.
 - ShadowPlay / Instant Replay / OBS open their own session on our single physical
   NVENC. The driver time-shares it and per-frame encode times get jittery in a way
-  that looks like our bug. Warn at startup if another session is detected.
+  that looks like our bug. The server asks NVML (`sunburst-server/src/nvml.rs`)
+  at startup, before each session, and for the web UI's Status panel, and names
+  the process holding the other session.
 - **A still desktop yields no frames.** DDA and WGC deliver only on change, so an
   idle screen reads as a low frame rate and a stalled stream. Test with motion
   (a 60 fps video, testufo) or the numbers mean nothing. Two wrong conclusions

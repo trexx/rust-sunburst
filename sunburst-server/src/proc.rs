@@ -142,12 +142,11 @@ fn resume(pid: u32) {
     let _ = unsafe { CloseHandle(snap) };
 }
 
-/// Each running process whose image name is `name` (case-insensitive), by pid.
-fn processes_named(name: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
+/// Call `f(pid, image name)` for every running process.
+fn for_each_process(mut f: impl FnMut(u32, String)) {
     // SAFETY: a snapshot of every process; closed below.
     let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return pids;
+        return;
     };
     let mut entry = PROCESSENTRY32W {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -161,15 +160,35 @@ fn processes_named(name: &str) -> Vec<u32> {
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(entry.szExeFile.len());
-        if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(name) {
-            pids.push(entry.th32ProcessID);
-        }
+        f(
+            entry.th32ProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..len]),
+        );
         // SAFETY: as above.
         more = unsafe { Process32NextW(snap, &mut entry) }.is_ok();
     }
     // SAFETY: the snapshot handle, closed once.
     let _ = unsafe { CloseHandle(snap) };
+}
+
+/// Each running process whose image name is `name` (case-insensitive), by pid.
+fn processes_named(name: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for_each_process(|pid, image| {
+        if image.eq_ignore_ascii_case(name) {
+            pids.push(pid);
+        }
+    });
     pids
+}
+
+/// Every running process's image name, by pid.
+pub fn process_names() -> std::collections::HashMap<u32, String> {
+    let mut names = std::collections::HashMap::new();
+    for_each_process(|pid, image| {
+        names.insert(pid, image);
+    });
+    names
 }
 
 /// Whether a process with image name `name` is running.

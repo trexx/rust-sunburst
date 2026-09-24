@@ -167,6 +167,7 @@ impl Host for WindowsHost {
             uptime_secs: self.started.elapsed().as_secs(),
             elevated: is_elevated().unwrap_or(false),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            other_encoders: crate::nvml::other_encoder_sessions(),
         }
     }
 

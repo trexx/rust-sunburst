@@ -52,6 +52,32 @@ export function StatusPanel({
               </span>
             )}
           </dd>
+          <dt>Other encoders</dt>
+          <dd>
+            {status.other_encoders === null ? (
+              <span className="hint">unknown — NVML could not be asked</span>
+            ) : status.other_encoders.length === 0 ? (
+              "none"
+            ) : (
+              <>
+                <strong className="error">
+                  {status.other_encoders
+                    .map(
+                      (e) =>
+                        `${e.process || "unknown"} (pid ${e.pid}, ${e.width}×${e.height})`,
+                    )
+                    .join(", ")}
+                </strong>
+                {/* Said here because the symptom never points at the cause:
+                    jittery encode times read as our bug. */}
+                <span className="hint">
+                  {" "}
+                  — shares the GPU's one encoder, so frame times will jitter. Close
+                  it, or turn off ShadowPlay / Instant Replay.
+                </span>
+              </>
+            )}
+          </dd>
           <dt>Paired clients</dt>
           <dd>{status.paired_clients}</dd>
           <dt>Sessions</dt>

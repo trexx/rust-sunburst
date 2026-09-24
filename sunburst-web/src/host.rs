@@ -44,6 +44,21 @@ pub struct HostStatus {
     /// input mysteriously doing nothing in one game.
     pub elevated: bool,
     pub version: String,
+    /// NVENC sessions other processes have open on the GPU, or `None` if NVML
+    /// could not be asked. ShadowPlay, Instant Replay or OBS time-share our one
+    /// encoder with us, and the per-frame encode jitter that causes looks
+    /// exactly like our bug (CLAUDE.md, *Capture* traps).
+    pub other_encoders: Option<Vec<EncoderSession>>,
+}
+
+/// Another process's encoder session.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncoderSession {
+    pub pid: u32,
+    /// Its executable name, or empty if it could not be read.
+    pub process: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// A currently streaming client.
@@ -186,6 +201,7 @@ impl Host for Fake {
             uptime_secs: 60,
             elevated: false,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            other_encoders: Some(Vec::new()),
         }
     }
 

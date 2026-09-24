@@ -12,6 +12,7 @@ pub mod audio_pipeline;
 pub mod cursor;
 pub mod display;
 pub mod mic_pipeline;
+pub mod nvml;
 pub mod pipeline;
 pub mod proc;
 pub mod realtime;
@@ -95,6 +96,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // going looking for it. This is the control plane, not a frame path, and it
     // happens once at startup.
     println!("  token: {}", state.token());
+    // Before any encoder of ours exists, so every session NVML reports is
+    // someone else's.
+    if let Some(warning) = nvml::other_encoder_sessions()
+        .as_deref()
+        .and_then(nvml::warning)
+    {
+        println!("  {warning}");
+    }
     if web.is_lan_exposed() {
         println!("  reachable from the network — the token is the only gate");
     }

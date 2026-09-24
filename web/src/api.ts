@@ -105,11 +105,20 @@ export const api = {
 
 // ---------------------------------------------------------------- shapes
 
+export interface EncoderSession {
+  pid: number;
+  process: string;
+  width: number;
+  height: number;
+}
+
 export interface Status {
   pid: number;
   uptime_secs: number;
   elevated: boolean;
   version: string;
+  /** Other processes' NVENC sessions; null when NVML could not be asked. */
+  other_encoders: EncoderSession[] | null;
   /** null when the host could not read it — not the same as "off". */
   autostart: boolean | null;
   running_app: RunningApp | null;

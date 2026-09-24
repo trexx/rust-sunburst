@@ -243,7 +243,12 @@ never reachable with one encoder either way.
       warning. **Half-done:** the NVML query works and reports `0 sessions, 0 fps,
       0 us` on an idle box, so the plumbing is proven. It has never been seen
       report a *non-zero* count, which is the half that matters — re-run with OBS
-      open before trusting the warning.
+      open before trusting the warning. The server now asks for itself
+      (`nvmlDeviceGetEncoderSessions`, leaving out its own pid): with OBS
+      recording, start the server and confirm the console warns and names
+      `obs64.exe`, the web UI's Status panel shows it under "Other encoders",
+      and a session start warns again. With nothing else encoding it shows
+      "none", and while our own stream runs it still shows "none".
 
 | Cap | HEVC | AV1 |
 |---|---|---|
