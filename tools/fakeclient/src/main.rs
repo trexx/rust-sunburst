@@ -290,8 +290,8 @@ fn pair(server: SocketAddr, state: &PathBuf, hint_kbps: Option<u32>) -> Result<(
     Ok(())
 }
 
-fn hello(client_nonce: [u8; NONCE_LEN]) -> ClientControl {
-    ClientControl::Hello(Hello {
+fn hello(client_nonce: [u8; NONCE_LEN]) -> Hello {
+    Hello {
         // A hint only. The MAC is what identifies this client.
         client_id: 1,
         name: "fakeclient".into(),
@@ -305,7 +305,7 @@ fn hello(client_nonce: [u8; NONCE_LEN]) -> ClientControl {
         codecs: codecs::HEVC_MAIN10 | codecs::AV1_MAIN10,
         prefer_codec: None,
         max_bitrate_kbps: 0,
-    })
+    }
 }
 
 /// The app id: the first argument after the command that is not an option or
@@ -451,11 +451,37 @@ fn launch(server: SocketAddr, state: &PathBuf, app_id: u32) -> Result<(), String
 
 fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<(), String> {
     let mut stored = load_state(state)?;
-    let mut client = ClientEndpoint::connect(server, Some(SessionKey::from_bytes(stored.secret)))
-        .map_err(|e| e.to_string())?;
+    // The way the TV does it: `Hello` with a nonce, and once the server answers
+    // with `SessionConfig`, input goes out under the derived session key. This
+    // used to send `Hello` without the secret to derive it, so the server switched
+    // keys and refused every event that followed, silently.
+    let mut client =
+        ClientEndpoint::connect_paired(server, stored.secret).map_err(|e| e.to_string())?;
     client
-        .send_control(&hello(generate_nonce()?))
+        .send_hello(hello(generate_nonce()?))
         .map_err(|e| e.to_string())?;
+    // No `SessionConfig` means the server started no session (another stream is
+    // running, say) and kept this client on its pairing key, which it still
+    // accepts for input. Either way, go on.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut keyed = false;
+    while Instant::now() < deadline {
+        if let Some(ServerControl::SessionConfig(_)) =
+            client.recv_control().map_err(|e| e.to_string())?
+        {
+            keyed = true;
+            break;
+        }
+        client.tick().map_err(|e| e.to_string())?;
+    }
+    println!(
+        "{}",
+        if keyed {
+            "session started: input is signed with the session key"
+        } else {
+            "no session offered: input is signed with the pairing key"
+        }
+    );
 
     let events = match script.unwrap_or("gamepad-sweep") {
         "gamepad-sweep" => gamepad_sweep(),
@@ -465,9 +491,10 @@ fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<()
         other => return Err(format!("unknown script {other}")),
     };
 
-    // Continues from where the last run stopped. Restarting at 1 would be
-    // refused by the replay window, and the client cannot see that happen —
-    // input is fire-and-forget — so it would look like it worked.
+    // Continues from where the last run stopped. Under a session key the server's
+    // replay window starts over and 1 would do, but on the pairing key it does
+    // not: the window follows the client across runs, restarting at 1 would be
+    // refused, and input is fire-and-forget, so that would look like it worked.
     for event in &events {
         client
             .send_input(&InputPacket {
