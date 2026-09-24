@@ -356,6 +356,9 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
         Sink::None => None,
     };
 
+    // End the session now rather than leaving the server to time it out, so
+    // the next run is not refused as a second stream.
+    client.bye();
     collector.poll();
     collector.rotate();
     println!(

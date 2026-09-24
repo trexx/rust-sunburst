@@ -319,6 +319,7 @@ fn apps(server: SocketAddr, state: &PathBuf) -> Result<(), String> {
         }
         other => return Err(format!("expected an app list, got {other:?}")),
     }
+    client.bye();
     Ok(())
 }
 
@@ -353,6 +354,7 @@ fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<()
         std::thread::sleep(Duration::from_millis(16));
     }
 
+    client.bye();
     save_state(state, &stored)?;
     println!(
         "sent {} events (input_seq now {})",

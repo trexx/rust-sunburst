@@ -918,3 +918,212 @@ fn a_control_burst_larger_than_the_window_is_queued_and_delivered_in_order() {
         "burst reordered or dropped"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A client that restarts: epochs, the return address, and the replay window.
+// ---------------------------------------------------------------------------
+
+/// A raw socket standing in for the network path between a client and the
+/// server, so a test can hold a captured datagram and resend it from anywhere.
+struct Tap {
+    socket: std::net::UdpSocket,
+}
+
+impl Tap {
+    fn new() -> Tap {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        Tap { socket }
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.socket.local_addr().expect("addr")
+    }
+
+    /// The next datagram sent to this tap.
+    fn capture(&self) -> Vec<u8> {
+        let mut buf = [0u8; 2048];
+        let (len, _) = self.socket.recv_from(&mut buf).expect("a datagram");
+        buf[..len].to_vec()
+    }
+
+    /// Whether anything at all arrives within the read timeout.
+    fn hears_anything(&self) -> bool {
+        let mut buf = [0u8; 2048];
+        self.socket.recv_from(&mut buf).is_ok()
+    }
+}
+
+/// A control datagram signed with `key(1)`, as some incarnation of the client
+/// would send it, captured instead of delivered. Each call is a fresh
+/// incarnation, so a later capture has a later epoch.
+fn captured_control(message: &ClientControl) -> Vec<u8> {
+    let tap = Tap::new();
+    let mut client = ClientEndpoint::connect(tap.addr(), Some(key(1))).expect("connect");
+    client.send_control(message).expect("send");
+    tap.capture()
+}
+
+#[test]
+fn a_client_that_restarts_is_heard_from_its_first_message() {
+    // A TV app that reconnects builds a fresh endpoint: a new port, and a
+    // reliable channel numbering from zero. Before epochs its first message
+    // read as a duplicate of the old incarnation's and was acked, never
+    // delivered — the reconnect's `Hello` vanished.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+
+    let mut first = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    first
+        .send_control(&ClientControl::LaunchApp { app_id: 1 })
+        .expect("send");
+    server.wait_for("the first launch", |r| r.launches == [1]);
+
+    let mut again = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    again
+        .send_control(&ClientControl::LaunchApp { app_id: 2 })
+        .expect("send");
+    server.wait_for("the restarted client's launch", |r| r.launches == [1, 2]);
+    // The old incarnation's stream is stopped, so its `Hello` would not be
+    // refused as a second stream.
+    server.recording(|r| assert_eq!(r.stops, vec![3]));
+
+    // And the server's replies number from zero again, which is what the new
+    // incarnation expects.
+    again.send_control(&ClientControl::ListApps).expect("send");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::AppList(_)) = again.recv_control().expect("recv") {
+            break;
+        }
+        again.tick().expect("tick");
+        assert!(
+            Instant::now() < deadline,
+            "no reply reached the new incarnation"
+        );
+    }
+}
+
+#[test]
+fn a_replayed_old_incarnation_is_refused_and_does_not_take_the_return_path() {
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+
+    // An old incarnation, delivered, and captured on the way.
+    let old = captured_control(&ClientControl::LaunchApp { app_id: 1 });
+    let path = Tap::new();
+    path.socket.send_to(&old, server.addr).expect("send");
+    server.wait_for("the old launch", |r| r.launches == [1]);
+
+    // The client restarts and carries on.
+    let mut current = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    current
+        .send_control(&ClientControl::LaunchApp { app_id: 2 })
+        .expect("send");
+    server.wait_for("the new launch", |r| r.launches == [1, 2]);
+
+    // The capture, resent from a third port.
+    let attacker = Tap::new();
+    attacker.socket.send_to(&old, server.addr).expect("send");
+    assert!(!attacker.hears_anything(), "a stale frame was answered");
+    server.recording(|r| assert_eq!(r.launches, vec![1, 2], "a stale frame was delivered"));
+
+    // The live client still gets its replies: the return path did not move.
+    current
+        .send_control(&ClientControl::ListApps)
+        .expect("send");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::AppList(_)) = current.recv_control().expect("recv") {
+            break;
+        }
+        current.tick().expect("tick");
+        assert!(Instant::now() < deadline, "the return path was taken");
+    }
+}
+
+#[test]
+fn a_current_frame_resent_from_elsewhere_does_not_move_the_return_path() {
+    // Same incarnation, different address: not a restart (a restart is a new
+    // endpoint, hence a new epoch), so a resent capture. Following it would hand
+    // the session's return path to whoever resent it.
+    let server = Server::start(Recording::new().with_key(3, key(1)));
+
+    let frame = captured_control(&ClientControl::LaunchApp { app_id: 1 });
+    let client_path = Tap::new();
+    client_path
+        .socket
+        .send_to(&frame, server.addr)
+        .expect("send");
+    server.wait_for("the launch", |r| r.launches == [1]);
+    // The server acks to the client's address.
+    assert!(client_path.hears_anything(), "no ack reached the client");
+
+    let elsewhere = Tap::new();
+    elsewhere.socket.send_to(&frame, server.addr).expect("send");
+    assert!(
+        !elsewhere.hears_anything(),
+        "the resent frame moved the return path"
+    );
+    server.recording(|r| assert_eq!(r.launches, vec![1]));
+}
+
+#[test]
+fn input_that_restarts_with_a_new_session_is_accepted() {
+    // A client numbers input from 1 in every session. The replay window follows
+    // the client across ports, so without a reset the second session's input
+    // would read as a replay of the first's. It starts over when a session key is
+    // installed: nothing captured earlier carries that key.
+    let server = Server::start(
+        Recording::new()
+            .with_secret(3, PAIR_SECRET)
+            .with_session_config(session_config()),
+    );
+
+    let mut first = switched_client(&server);
+    for input_seq in 1..=5 {
+        first
+            .send_input(&InputPacket {
+                input_seq,
+                event: press(),
+            })
+            .expect("send");
+    }
+    server.wait_for("the first session's input", |r| r.inputs.len() == 5);
+
+    let mut second = switched_client(&server);
+    server.wait_for("the second hello", |r| r.hellos.len() == 2);
+    second
+        .send_input(&InputPacket {
+            input_seq: 1,
+            event: press(),
+        })
+        .expect("send");
+    server.wait_for("the second session's input", |r| r.inputs.len() == 6);
+
+    // The first session's key no longer verifies.
+    first
+        .send_input(&InputPacket {
+            input_seq: 6,
+            event: press(),
+        })
+        .expect("send");
+    std::thread::sleep(Duration::from_millis(200));
+    server.recording(|r| assert_eq!(r.inputs.len(), 6, "the old session's key still works"));
+}
+
+#[test]
+fn bye_is_acknowledged_before_the_peer_is_forgotten() {
+    let server = Server::start(Recording::new().with_key(5, key(1)));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    client
+        .send_control(&ClientControl::LaunchApp { app_id: 1 })
+        .expect("send");
+    server.wait_for("the launch", |r| r.launches == [1]);
+
+    let started = Instant::now();
+    client.bye();
+    assert!(client.reliable.is_idle(), "the Bye was never acked");
+    assert!(started.elapsed() < Duration::from_millis(300));
+    server.recording(|r| assert_eq!(r.byes, vec![5]));
+}

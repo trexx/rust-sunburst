@@ -26,18 +26,45 @@
 //! u16  seq      this frame's sequence, or the last one sent if payload is empty
 //! u16  ack      highest contiguous sequence received from the peer
 //! u8   flags    bit0: carries a payload
+//! u64  epoch    the sender's incarnation (see below)
 //! ...  payload  one control message, envelope included
 //! ```
 //!
 //! Sequences are compared modularly through [`Seq16`], so the wrap at 65535 is
 //! not a special case.
+//!
+//! # Epochs: telling a restarted peer from a replay
+//!
+//! Both ends number from zero, so a peer that restarts — a TV app that
+//! reconnects, which gets a fresh `ClientEndpoint` — starts again at sequence 0
+//! while the other end still holds the old ack. Without more information its
+//! first message reads as a duplicate: it is acked and never delivered, so the
+//! new peer's `Hello` is lost. The old answer ("start at zero") cannot tell the
+//! two apart either, and "sequence 0 from a new address means a restart" is
+//! exactly what a replayed capture looks like.
+//!
+//! So each `Reliable` carries an **epoch**, fixed at construction and strictly
+//! increasing across constructions: wall-clock milliseconds, bumped past the
+//! last one this process handed out. A frame's epoch compared with the one
+//! first seen from the peer classifies it ([`Incarnation`]). A *newer* epoch is
+//! a restarted peer, and the owner decides whether to [`restart`](Reliable::restart)
+//! for it; a *stale* one is an old incarnation or a replay of one, and
+//! [`on_frame`](Reliable::on_frame) drops it. The frames are MAC'd with the
+//! pairing key, so an epoch cannot be forged, only replayed — and a replay is
+//! never newer than what the peer has already sent.
+//!
+//! Wall-clock time means a peer whose clock steps backwards looks stale until
+//! the other end forgets it (idle, `PeerGone`, `Bye`). That is the price of
+//! needing no persisted counter, and a LAN box's NTP-synced clock rarely pays it.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sunburst_core::proto::Seq16;
 
 /// Bytes of reliable framing before the control message.
-pub const FRAME_HEADER_LEN: usize = 5;
+pub const FRAME_HEADER_LEN: usize = 13;
 
 /// Outstanding unacknowledged messages allowed.
 ///
@@ -55,6 +82,36 @@ pub const RETRANSMIT_MS: u64 = 200;
 pub const MAX_ATTEMPTS: u32 = 8;
 
 const FLAG_HAS_PAYLOAD: u8 = 1;
+
+/// How a frame's epoch relates to the peer's, as first seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Incarnation {
+    /// The first frame from this peer: its epoch is adopted.
+    First,
+    /// The incarnation already known.
+    Same,
+    /// A later incarnation: the peer restarted and numbers from zero again.
+    Newer(u64),
+    /// An earlier incarnation, or a replay of one.
+    Stale,
+}
+
+/// The last epoch this process handed out, so two `Reliable`s built in the same
+/// millisecond still get distinct, increasing epochs.
+static LAST_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh epoch: wall-clock milliseconds, strictly after any earlier one.
+fn fresh_epoch() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let prev = LAST_EPOCH
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(now.max(last + 1))
+        })
+        .expect("the closure always returns Some");
+    now.max(prev + 1)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReliableError {
@@ -96,12 +153,22 @@ pub struct Reliable {
     /// or a bare one is emitted if there is nothing else to send.
     ack_pending: bool,
     max_payload: usize,
+    /// This end's incarnation, stamped on every frame.
+    epoch: u64,
+    /// The peer's incarnation, from its first frame (or its last restart).
+    peer_epoch: Option<u64>,
 }
 
 impl Reliable {
     /// `max_payload` is the room left for a control message after the common
     /// header, this frame header, and the MAC.
     pub fn new(max_payload: usize) -> Reliable {
+        Reliable::with_epoch(max_payload, fresh_epoch())
+    }
+
+    /// As [`new`](Self::new), with a chosen epoch. For tests, which need to
+    /// order incarnations without depending on the clock.
+    pub fn with_epoch(max_payload: usize, epoch: u64) -> Reliable {
         Reliable {
             next_seq: Seq16(0),
             ack: None,
@@ -109,7 +176,48 @@ impl Reliable {
             early: BTreeMap::new(),
             ack_pending: false,
             max_payload,
+            epoch,
+            peer_epoch: None,
         }
+    }
+
+    /// This end's epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Classify a frame by its epoch without taking it. `None` for a runt.
+    pub fn incarnation(&self, frame: &[u8]) -> Option<Incarnation> {
+        let epoch = frame_epoch(frame)?;
+        Some(match self.peer_epoch {
+            None => Incarnation::First,
+            Some(known) if epoch == known => Incarnation::Same,
+            Some(known) if epoch > known => Incarnation::Newer(epoch),
+            Some(_) => Incarnation::Stale,
+        })
+    }
+
+    /// Start over for a peer that restarted as `peer_epoch`: forget what was
+    /// sent to and received from its old incarnation, and number from zero
+    /// again, which is what the new one expects. This end's epoch is unchanged.
+    pub fn restart(&mut self, peer_epoch: u64) {
+        self.next_seq = Seq16(0);
+        self.ack = None;
+        self.unacked.clear();
+        self.early.clear();
+        self.ack_pending = false;
+        self.peer_epoch = Some(peer_epoch);
+    }
+
+    /// The bare ack owed for what has arrived, if any, taken now rather than at
+    /// the next [`tick`](Self::tick) — for a caller about to drop this channel,
+    /// so the peer does not keep resending a message that was delivered.
+    pub fn take_ack(&mut self) -> Option<Vec<u8>> {
+        if !self.ack_pending {
+            return None;
+        }
+        self.ack_pending = false;
+        Some(self.build(self.next_seq, None))
     }
 
     /// Queue a message. Returns the frame to transmit.
@@ -138,9 +246,15 @@ impl Reliable {
     }
 
     /// Take a frame from the peer. Returns messages ready to deliver, in order.
+    ///
+    /// A frame from a stale incarnation is dropped unacked. One from a newer
+    /// incarnation is taken as if from the current one, so a caller that wants
+    /// to follow a restart calls [`restart`](Self::restart) first.
     pub fn on_frame(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
-        if frame.len() < FRAME_HEADER_LEN {
-            return Vec::new();
+        match self.incarnation(frame) {
+            None | Some(Incarnation::Stale) => return Vec::new(),
+            Some(Incarnation::First) => self.peer_epoch = frame_epoch(frame),
+            Some(Incarnation::Same | Incarnation::Newer(_)) => {}
         }
         let seq = Seq16(u16::from_le_bytes([frame[0], frame[1]]));
         let peer_ack = Seq16(u16::from_le_bytes([frame[2], frame[3]]));
@@ -200,7 +314,7 @@ impl Reliable {
             // we already have.
             let seq = Seq16(u16::from_le_bytes([entry.frame[0], entry.frame[1]]));
             let payload = entry.frame[FRAME_HEADER_LEN..].to_vec();
-            entry.frame = build_frame(seq, self.ack, Some(&payload));
+            entry.frame = build_frame(seq, self.ack, self.epoch, Some(&payload));
             out.push(entry.frame.clone());
         }
 
@@ -221,7 +335,7 @@ impl Reliable {
     }
 
     fn build(&self, seq: Seq16, payload: Option<&[u8]>) -> Vec<u8> {
-        build_frame(seq, self.ack, payload)
+        build_frame(seq, self.ack, self.epoch, payload)
     }
 
     /// Move everything now contiguous out of the holding area.
@@ -245,7 +359,13 @@ impl Reliable {
     }
 }
 
-fn build_frame(seq: Seq16, ack: Option<Seq16>, payload: Option<&[u8]>) -> Vec<u8> {
+/// The epoch a frame carries, or `None` for a runt.
+fn frame_epoch(frame: &[u8]) -> Option<u64> {
+    let bytes = frame.get(5..FRAME_HEADER_LEN)?;
+    Some(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+}
+
+fn build_frame(seq: Seq16, ack: Option<Seq16>, epoch: u64, payload: Option<&[u8]>) -> Vec<u8> {
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.map_or(0, <[u8]>::len));
     frame.extend_from_slice(&seq.0.to_le_bytes());
     // With nothing received, advertise one before zero. Modular comparison makes
@@ -256,6 +376,7 @@ fn build_frame(seq: Seq16, ack: Option<Seq16>, payload: Option<&[u8]>) -> Vec<u8
     } else {
         0
     });
+    frame.extend_from_slice(&epoch.to_le_bytes());
     if let Some(p) = payload {
         frame.extend_from_slice(p);
     }

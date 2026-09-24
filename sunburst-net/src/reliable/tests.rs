@@ -295,3 +295,111 @@ fn a_full_exchange_survives_loss_in_both_directions() {
         server.outstanding()
     );
 }
+
+#[test]
+fn epochs_increase_across_constructions() {
+    // Two channels built back to back, in the same millisecond more often than
+    // not, still order: that is what lets a peer tell a restart from a replay.
+    let first = Reliable::new(MTU).epoch();
+    let second = Reliable::new(MTU).epoch();
+    assert!(second > first, "{second} is not after {first}");
+}
+
+#[test]
+fn a_restarted_peer_is_newer_and_its_old_self_is_stale() {
+    let mut server = Reliable::with_epoch(MTU, 1);
+    let mut old = Reliable::with_epoch(MTU, 10);
+    let mut new = Reliable::with_epoch(MTU, 20);
+
+    let hello = old.send(b"hello", T0).expect("send");
+    assert_eq!(server.incarnation(&hello), Some(Incarnation::First));
+    assert_eq!(deliver_one(&mut server, &hello), b"hello");
+    assert_eq!(server.incarnation(&hello), Some(Incarnation::Same));
+
+    let again = new.send(b"hello again", T0).expect("send");
+    assert_eq!(server.incarnation(&again), Some(Incarnation::Newer(20)));
+    assert!(server.incarnation(&[0; 4]).is_none(), "a runt has no epoch");
+
+    server.restart(20);
+    assert_eq!(server.incarnation(&hello), Some(Incarnation::Stale));
+    assert_eq!(server.incarnation(&again), Some(Incarnation::Same));
+}
+
+#[test]
+fn without_a_restart_a_new_incarnation_reads_as_a_duplicate() {
+    // The bug the epoch exists for. A fresh peer numbers from zero, the old
+    // ack says zero was delivered, so the new peer's first message is acked and
+    // never handed up — and the ack retires it on the peer, so it is never
+    // resent either.
+    let mut server = Reliable::with_epoch(MTU, 1);
+    let mut old = Reliable::with_epoch(MTU, 10);
+    deliver_one(&mut server, &old.send(b"hello", T0).expect("send"));
+
+    let mut new = Reliable::with_epoch(MTU, 20);
+    let lost = new.send(b"hello again", T0).expect("send");
+    assert!(server.on_frame(&lost).is_empty());
+}
+
+#[test]
+fn a_restart_delivers_the_new_incarnation_from_zero_both_ways() {
+    let mut server = Reliable::with_epoch(MTU, 1);
+    let mut old = Reliable::with_epoch(MTU, 10);
+    for i in 0..3u8 {
+        deliver_one(&mut server, &old.send(&[i], T0).expect("send"));
+    }
+    // The server had something in flight to the old incarnation, too.
+    server.send(b"for the old one", T0).expect("send");
+
+    let mut new = Reliable::with_epoch(MTU, 20);
+    let hello = new.send(b"hello again", T0).expect("send");
+    let Some(Incarnation::Newer(epoch)) = server.incarnation(&hello) else {
+        panic!("not newer");
+    };
+    server.restart(epoch);
+    assert_eq!(deliver_one(&mut server, &hello), b"hello again");
+    assert_eq!(
+        server.outstanding(),
+        0,
+        "the old incarnation's frame is forgotten"
+    );
+
+    // And the server's replies start at zero, which is what the new peer wants.
+    let reply = server.send(b"welcome", T0).expect("send");
+    assert_eq!(deliver_one(&mut new, &reply), b"welcome");
+    assert!(new.is_idle(), "the reply carried the ack");
+}
+
+#[test]
+fn a_stale_frame_is_dropped_without_an_ack() {
+    let mut server = Reliable::with_epoch(MTU, 1);
+    let mut old = Reliable::with_epoch(MTU, 10);
+    let captured = old.send(b"hello", T0).expect("send");
+    deliver_one(&mut server, &captured);
+    server.tick(T0).expect("tick");
+
+    let mut new = Reliable::with_epoch(MTU, 20);
+    let hello = new.send(b"hello again", T0).expect("send");
+    server.restart(20);
+    deliver_one(&mut server, &hello);
+    server.tick(T0).expect("tick");
+
+    // The capture, replayed after the restart, is neither delivered nor acked.
+    assert!(server.on_frame(&captured).is_empty());
+    assert!(
+        server.tick(T0).expect("tick").is_empty(),
+        "no ack for a stale frame"
+    );
+}
+
+#[test]
+fn take_ack_hands_over_the_owed_ack_once() {
+    let (mut a, mut b) = pair();
+    assert!(b.take_ack().is_none(), "nothing arrived, nothing owed");
+    b.on_frame(&a.send(b"bye", T0).expect("send"));
+
+    let ack = b.take_ack().expect("an ack is owed");
+    a.on_frame(&ack);
+    assert!(a.is_idle(), "the ack retired the message");
+    assert!(b.take_ack().is_none(), "and it is not owed twice");
+    assert!(b.tick(T0).expect("tick").is_empty());
+}

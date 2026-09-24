@@ -155,8 +155,9 @@ session_key = BLAKE3::derive_key("sunburst 2026 session key v1",
                                  pairing_secret ‖ client_nonce ‖ server_nonce)
 ```
 
-Captured packets then fail verification in any later session. Held in memory
-only. `Hello` carries `client_nonce`; `SessionConfig` carries `server_nonce`, so
+Captured packets then fail verification in any later session, and the server's
+replay window starts over whenever it installs a new session key, so a client
+that numbers input from 1 again is heard. Held in memory only. `Hello` carries `client_nonce`; `SessionConfig` carries `server_nonce`, so
 `SessionConfig` itself — and any retransmit of it — is signed with the pairing
 key, and both ends switch once it has crossed. How the switch is sequenced is
 under *Which key verifies a packet* below.
@@ -225,6 +226,8 @@ common header (type=3)
 u16  ctrl_seq     this frame's sequence
 u16  ctrl_ack     highest contiguous sequence received from the peer
 u8   ctrl_flags   bit0: carries a payload
+u64  ctrl_epoch   the sender's incarnation: wall-clock ms at construction,
+                  strictly increasing across constructions
 ...  message      one control message, envelope included
 u64  mac          absent only for the pairing exchange
 ```
@@ -232,6 +235,20 @@ u64  mac          absent only for the pairing exchange
 Acks are cumulative and piggyback on any outgoing message; a bare ack goes out
 when there is nothing else to say. Window of 8 outstanding, retransmit at 200ms,
 peer declared gone after 8 attempts.
+
+**The epoch tells a restarted client from a replay.** Both ends number from zero,
+so a client that reconnects with a fresh endpoint starts again at sequence 0
+while the server still holds the old ack. To that old state its first message is
+a duplicate: it is acked and never delivered, and the reconnect's `Hello` is
+lost. A control frame whose epoch is *newer* than the client's last one restarts
+that client's channel on the server. The old incarnation's stream stops, and its
+queued control and session key are dropped. An *older* epoch is dropped unacked.
+A control frame may move the client's return address only if it is a newer
+incarnation, because the same epoch arriving from a new port is a resent
+capture, not a client. The frames are MAC'd with the pairing key, so an epoch can
+be replayed but not forged, and a replay is never newer than what the client has
+already sent. `Bye` is acked before the server forgets the client, so the client
+does not keep resending it.
 
 **Delivery is in order, which is the opposite of video and deliberate.** Pairing
 is a three-step exchange, and a `PairConfirm` overtaking its `PairRequest` would

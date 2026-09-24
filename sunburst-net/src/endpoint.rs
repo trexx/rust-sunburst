@@ -28,17 +28,34 @@
 //! be accepted. Keying by client means the window that already saw that sequence
 //! is the one consulted, wherever the packet came from.
 //!
-//! # Known gap: the key is the pairing secret, not a session key
+//! # A client that restarts
 //!
-//! PROTOCOL.md specifies a per-session key derived from the pairing secret and a
-//! nonce from each side. This endpoint verifies against the pairing secret
-//! directly, because the message that would carry `server_nonce` is
-//! `SessionConfig`, whose fields Phase 3 has not decided.
+//! A TV app that reconnects builds a fresh `ClientEndpoint`: a new source port,
+//! and a reliable channel numbering from zero. The old per-client state would
+//! read its `Hello` as a duplicate. So the reliable frame carries the sender's
+//! **epoch** (see `reliable`), and a control frame from a *newer* epoch restarts
+//! the client's channel: the old incarnation's stream stops, its queued control
+//! and its session key are dropped, and the channel numbers from zero again.
 //!
-//! What that leaves open, stated rather than buried: the replay window lives in
-//! memory, so **after a server restart a captured input packet can be replayed
-//! once**. Within a run it cannot — the window follows the client, per above.
-//! Session keys close it, and they land with `SessionConfig`.
+//! The epoch is also what may move the return address on the control channel. A
+//! control frame from a new address is accepted only if it is a newer
+//! incarnation (or the client's first control frame). Otherwise it is a capture
+//! resent from elsewhere, and following it would hand the live session's return
+//! path, and its session key, to whoever resent it.
+//!
+//! The replay window starts over each time a session key is installed. Input
+//! from the new session is signed with that key, which nothing captured before
+//! it can carry. So a client whose input sequence restarts with its session is
+//! heard, and nothing replayable is let back in.
+//!
+//! # What the pairing key still signs
+//!
+//! Input switches to the per-session key once `SessionConfig` is out (see
+//! `Channel`), so a packet captured in one session fails in every other. The
+//! remaining exposure, stated rather than buried: anything a client signs with the
+//! **pairing key** before its session key is installed can be replayed after a
+//! server restart, which empties the replay window. The shipped clients send no
+//! input in that window; `fakeclient input` does.
 //!
 //! # Pairing is the one unauthenticated path
 //!
@@ -62,7 +79,7 @@ use sunburst_core::proto::{
 };
 
 use crate::handler::{ControlHandler, Outbound};
-use crate::reliable::{FRAME_HEADER_LEN, Reliable, ReliableError};
+use crate::reliable::{FRAME_HEADER_LEN, Incarnation, Reliable, ReliableError};
 
 /// Room for a control message once the common header, the reliable frame header
 /// and the MAC are accounted for.
@@ -302,10 +319,22 @@ impl<H: ControlHandler> Endpoint<H> {
 
             match self.sessions.get_mut(&client) {
                 Some(session) => {
-                    // The same client from a different port. The replay window
-                    // comes with it — that is the point of keying on the client.
-                    // The old session key is dropped: a reconnect re-`Hello`s and
-                    // gets a fresh one, and a stale key must not linger.
+                    // The same client from a different port. On the control
+                    // channel only a restarted client may move the return
+                    // address; the same or an older epoch from elsewhere is a
+                    // resent capture (see the module docs).
+                    if channel == Channel::Control
+                        && !matches!(
+                            session.reliable.incarnation(control_frame(datagram)),
+                            Some(Incarnation::First | Incarnation::Newer(_))
+                        )
+                    {
+                        return None;
+                    }
+                    // The replay window comes with it — that is the point of
+                    // keying on the client. The old session key is dropped: a
+                    // reconnect re-`Hello`s and gets a fresh one, and a stale
+                    // key must not linger.
                     self.by_addr.remove(&session.addr);
                     session.addr = from;
                     session.last_seen_ms = now_ms;
@@ -344,6 +373,26 @@ impl<H: ControlHandler> Endpoint<H> {
         // when no key verifies, and then only while armed.
         if let Some(client) = self.authenticate(datagram, from, Channel::Control) {
             let frame = &body[..body.len().saturating_sub(MAC_LEN)];
+            let restarted = {
+                let session = self.sessions.get_mut(&client).expect("just authenticated");
+                match session.reliable.incarnation(frame) {
+                    Some(Incarnation::Newer(epoch)) => {
+                        // A new incarnation of the client: nothing of the old
+                        // one's channel, queue or session key carries over.
+                        session.reliable.restart(epoch);
+                        session.pending_out.clear();
+                        session.session_key = None;
+                        session.client_nonce = None;
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if restarted {
+                // Its stream too. One stream runs at a time, so the old one
+                // left running would refuse the new incarnation's `Hello`.
+                self.handler.session_stop(client);
+            }
             let messages = {
                 let session = self.sessions.get_mut(&client).expect("just authenticated");
                 session.reliable.on_frame(frame)
@@ -444,6 +493,16 @@ impl<H: ControlHandler> Endpoint<H> {
             }
             ClientControl::Bye => {
                 self.handler.on_bye(client);
+                // Ack before forgetting, or the client keeps resending the Bye
+                // to a server that no longer knows it.
+                let ack = self.sessions.get_mut(&client).and_then(|s| {
+                    s.reliable
+                        .take_ack()
+                        .map(|frame| (s.addr, frame, s.pairing_key.clone()))
+                });
+                if let Some((addr, frame, key)) = ack {
+                    self.transmit(addr, &frame, Some(&key), PacketType::Control);
+                }
                 self.forget(client);
             }
             // Pairing messages from an already-authenticated peer are ignored:
@@ -532,6 +591,10 @@ impl<H: ControlHandler> Endpoint<H> {
             &client_nonce,
             &config.server_nonce,
         ));
+        // Input from here on carries the new key, which nothing captured
+        // earlier can, so the window may start over. A client restarts its
+        // input sequence with its session.
+        session.replay = ReplayWindow::new();
         Some(())
     }
 
@@ -1052,6 +1115,33 @@ impl ClientEndpoint {
         }
     }
 
+    /// Say goodbye: send `Bye` and wait briefly for its ack, so the server
+    /// stops the stream now rather than when it next notices the silence.
+    /// Best effort — a lost `Bye` is covered by the server's idle timeout and by
+    /// the next incarnation's epoch.
+    pub fn bye(&mut self) {
+        if self.send_control(&ClientControl::Bye).is_err() {
+            return;
+        }
+        // The socket is on its way out; a short timeout keeps the wait bounded
+        // by the deadline rather than by one long read.
+        let _ = self
+            .socket
+            .set_read_timeout(Some(Duration::from_millis(20)));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while !self.reliable.is_idle() && Instant::now() < deadline {
+            match self.recv() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if self.tick().is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     /// Emit retransmits and owed acks.
     pub fn tick(&mut self) -> io::Result<()> {
         let now_ms = self.now_ms();
@@ -1064,6 +1154,13 @@ impl ClientEndpoint {
         }
         Ok(())
     }
+}
+
+/// The reliable frame inside an authenticated control datagram: the body with
+/// the MAC stripped.
+fn control_frame(datagram: &[u8]) -> &[u8] {
+    let body = &datagram[HEADER_LEN.min(datagram.len())..];
+    &body[..body.len().saturating_sub(MAC_LEN)]
 }
 
 pub fn unix_now() -> u64 {

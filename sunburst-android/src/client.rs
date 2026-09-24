@@ -472,6 +472,9 @@ fn run_inner(
         client.tick().map_err(|e| e.to_string())?;
     }
 
+    // Tell the server now, so the stream stops at once and a reconnect is not
+    // left waiting on the old one's timeout.
+    client.bye();
     decoder.stop();
     Ok(())
 }
