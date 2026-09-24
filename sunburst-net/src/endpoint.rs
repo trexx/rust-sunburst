@@ -871,6 +871,12 @@ impl ClientEndpoint {
         Ok(client)
     }
 
+    /// How long [`recv`](Self::recv) waits for a datagram. A client that also
+    /// services input between reads wants this short once streaming.
+    pub fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.socket.set_read_timeout(Some(timeout))
+    }
+
     /// Send `Hello`, remembering its nonce so the session key can be derived
     /// from the `SessionConfig` that answers it.
     pub fn send_hello(&mut self, hello: sunburst_core::proto::Hello) -> io::Result<()> {

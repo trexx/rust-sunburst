@@ -11,6 +11,7 @@ use jni::JNIEnv;
 use jni::objects::JClass;
 use jni::sys::{jboolean, jfloat, jint, jlong};
 
+use crate::cursor_predict::pack;
 use crate::input_map::ClientInput;
 use crate::jni_bridge::Client;
 
@@ -46,6 +47,26 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeKey(
     );
 }
 
+/// CLOCK_MONOTONIC milliseconds, for the prediction's "still moving" window.
+fn now_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable out-param for clock_gettime.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    #[allow(clippy::unnecessary_cast)] // narrower fields on armv7
+    let ms = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+    ms
+}
+
+/// A captured-pointer move (the sum of the event's batched history, in
+/// fractional counts): send the whole counts, numbered here so the prediction
+/// can match them to the server's reports, and return where the overlay should
+/// be drawn now — or -1 while not predicting, when the overlay follows the
+/// server's reports as before.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeMouseMove(
     _env: JNIEnv,
@@ -53,8 +74,51 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeMouseMove(
     handle: jlong,
     dx: jfloat,
     dy: jfloat,
-) {
-    enqueue(handle, ClientInput::MouseMove { dx, dy });
+) -> jlong {
+    if handle == 0 {
+        return -1;
+    }
+    // SAFETY: as `enqueue`: a live `Client`, freed only on the UI thread.
+    let client = unsafe { &*(handle as *const Client) };
+    let now = now_ms();
+    let Ok(mut guard) = client.ui_cursor.lock() else {
+        return -1;
+    };
+    let (sub, predictor) = &mut *guard;
+    client.cursor.sync(predictor, now);
+    let (ix, iy) = sub.take(dx, dy);
+    if ix != 0 || iy != 0 {
+        let seq = client.cursor.next_seq();
+        client.push_input(ClientInput::MouseRel {
+            seq,
+            dx: ix,
+            dy: iy,
+        });
+        predictor.on_local_move(seq, ix, iy, now);
+    }
+    pack(predictor.position())
+}
+
+/// A server cursor report arrived (the client thread's upcall, marshalled to
+/// the UI thread): fold it into the prediction and return the overlay position,
+/// or -1 while not predicting.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeCursorSync(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    if handle == 0 {
+        return -1;
+    }
+    // SAFETY: as `enqueue`.
+    let client = unsafe { &*(handle as *const Client) };
+    let Ok(mut guard) = client.ui_cursor.lock() else {
+        return -1;
+    };
+    let (_, predictor) = &mut *guard;
+    client.cursor.sync(predictor, now_ms());
+    pack(predictor.position())
 }
 
 #[unsafe(no_mangle)]

@@ -1127,11 +1127,28 @@ server on the 4070, wired LAN.
 - [ ] **Glass-to-glass measured** (high-speed camera or LED-on-input rig), within
       the 60–100 ms budget. The §4 client instrumentation rows
       (recv/jitter/dec-submit/dec-out/present) fill from the same runs.
-- [ ] **Cursor renders client-side** from the server's CursorShape/CursorPosition
-      and tracks; a changed shape (pointer/hand/text) updates. Monochrome cursors
-      and no-alpha shapes are the ones to eye. Local prediction (moving the
-      overlay from the client's own mouse deltas) is the refinement if the
-      round-tripped position feels laggy.
+- [ ] **Cursor renders client-side** from the server's CursorShape/CursorPosition;
+      a changed shape (pointer/hand/text) updates. Monochrome cursors and
+      no-alpha shapes are the ones to eye.
+- [ ] **The overlay moves with the hand.** With the EPP toggle on (so the server
+      reports a gain), the overlay moves on the same frame as the mouse, not a
+      beat behind; it no longer waits for the server's report. It must not
+      rubber-band. When the mouse stops, the overlay settles onto the server's
+      position within ~100 ms, and the correction should be too small to see.
+- [ ] **A warp is corrected.** A game that recentres the pointer (a menu
+      opening, a camera-mode switch) moves the overlay there within ~100 ms,
+      even mid-motion.
+- [ ] **Slow motion moves.** Creep the mouse: the pointer crawls rather than
+      sticking. Android's fractional deltas used to be truncated to zero.
+- [ ] **Off the captured output, the overlay hides** (a second monitor, or
+      the VDD with a physical monitor beside it) rather than pinning to an
+      edge.
+- [ ] **With EPP left on in the OS**, the gain is 0 and the overlay just
+      follows the server's reports, as before prediction.
+- [ ] **Input latency on a still screen.** With audio off and nothing moving,
+      keys and clicks still land at once. The client used to hold queued input
+      until a datagram arrived, up to its 500 ms read timeout; it now polls
+      every 2 ms. Check the client's CPU on the Homatics with the stream idle.
 - [ ] **Decoder quirks.** These are not probeable (decoder behaviour, not
       capability): confirm the Shield takes reference invalidation and the
       Homatics AV1 takes intra-refresh; on the Homatics HEVC, retest with periodic

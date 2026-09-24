@@ -9,10 +9,10 @@
 //! boxed [`Client`]); `nativeStop` signals the thread and joins it.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::client::{Callbacks, StreamPrefs};
@@ -23,6 +23,7 @@ use ndk::native_window::NativeWindow;
 use sunburst_core::proto::StreamCodec;
 
 use crate::client;
+use crate::cursor_predict::{CursorPredictor, CursorShared, SubPixel};
 use crate::input_map::ClientInput;
 
 /// A running client: the stop flag its thread polls, the join handle, and the
@@ -35,6 +36,12 @@ pub struct Client {
     /// The client thread's OS tid, set once it starts, so the Java
     /// PerformanceHintManager can target that thread. 0 until set.
     client_tid: Arc<AtomicI32>,
+    /// Shared with the client thread: input numbering, geometry, and the
+    /// server's latest cursor report.
+    pub cursor: Arc<CursorShared>,
+    /// The cursor prediction. Locked only from the UI thread (the JNI input and
+    /// cursor-sync calls), so never contended, and never by the client thread.
+    pub ui_cursor: Mutex<(SubPixel, CursorPredictor)>,
 }
 
 impl Client {
@@ -152,6 +159,8 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
         pad_volume: pad_volume.clamp(0, 100) as u8,
     };
     let (input_tx, input_rx) = mpsc::channel();
+    let cursor = Arc::new(CursorShared::default());
+    let thread_cursor = Arc::clone(&cursor);
     let client_tid = Arc::new(AtomicI32::new(0));
     let thread_tid = Arc::clone(&client_tid);
     let thread = std::thread::Builder::new()
@@ -166,6 +175,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
                 thread_stop,
                 input_rx,
                 thread_tid,
+                thread_cursor,
                 callbacks,
             )
         })
@@ -177,6 +187,8 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
         thread,
         input_tx,
         client_tid,
+        cursor,
+        ui_cursor: Mutex::new((SubPixel::default(), CursorPredictor::new())),
     })) as jlong
 }
 

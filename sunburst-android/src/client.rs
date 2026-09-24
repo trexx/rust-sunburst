@@ -23,6 +23,7 @@ use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
 };
 
+use crate::cursor_predict::CursorShared;
 use crate::decode::Decoder;
 use crate::input_map::{ClientInput, InputAccumulator};
 use crate::pad::{PadOutputRouter, PadSink};
@@ -75,7 +76,7 @@ fn mono_ms() -> u64 {
 }
 
 /// Upcalls into the Kotlin activity from the client thread (attached to the JVM
-/// per call — cursor events are infrequent). The activity draws the cursor
+/// for the thread's life). The activity draws the cursor
 /// overlay, so the pointer never rides the video.
 pub struct Callbacks {
     pub vm: JavaVM,
@@ -189,14 +190,18 @@ pub fn run(
     stop: Arc<AtomicBool>,
     input_rx: Receiver<ClientInput>,
     client_tid: Arc<AtomicI32>,
+    cursor: Arc<CursorShared>,
     callbacks: Callbacks,
 ) {
     // Publish our tid so the Java PerformanceHintManager can target this thread.
     // SAFETY: gettid takes no arguments and cannot fail.
     let tid = unsafe { libc::gettid() };
     client_tid.store(tid, Ordering::Relaxed);
+    // Stay attached for the thread's life: cursor reports now upcall on every
+    // change, and attaching per call would pay for it each time.
+    let _ = callbacks.vm.attach_current_thread_permanently();
     if let Err(e) = run_inner(
-        server, secret, codecs, prefs, &window, &stop, &input_rx, &callbacks,
+        server, secret, codecs, prefs, &window, &stop, &input_rx, &cursor, &callbacks,
     ) {
         log::error!("client stopped: {e}");
     }
@@ -211,6 +216,7 @@ fn run_inner(
     window: &NativeWindow,
     stop: &AtomicBool,
     input_rx: &Receiver<ClientInput>,
+    cursor: &CursorShared,
     callbacks: &Callbacks,
 ) -> Result<(), String> {
     let mut client = ClientEndpoint::connect_paired(server, secret).map_err(|e| e.to_string())?;
@@ -269,6 +275,15 @@ fn run_inner(
     let fps = (config.fps_mhz.max(1000) / 1000) as i32;
 
     let mut decoder = Decoder::new(&current, fps, window)?;
+    // What the UI thread predicts the cursor against.
+    cursor.set_space(current.width, current.height);
+    cursor.set_gain_milli(config.pointer_gain_milli);
+    // Negotiated: from here the loop must also service input promptly. A long
+    // read timeout held queued input until a datagram arrived, which on a still
+    // screen with audio off was up to half a second.
+    client
+        .set_read_timeout(Duration::from_millis(2))
+        .map_err(|e| e.to_string())?;
     // Closed until a keyframe of the current build arrives. The server's
     // startup IDR went out during negotiation, so the gate asks for one at once.
     let mut gate = KeyframeGate::new(current.first_frame, mono_ms());
@@ -315,8 +330,7 @@ fn run_inner(
     let mut dropped = 0u32;
     let mut last_feedback = Instant::now();
     let mut input_acc = InputAccumulator::new();
-    let mut input_seq: u32 = 1;
-    let mut cursor = CursorReassembler::default();
+    let mut cursor_shape = CursorReassembler::default();
     // Server→client rumble/pad-output, deduplicated and timed out before it
     // reaches the pad. The sink is a stub until the GIP bridge lands (Stage B).
     let mut pad_out = PadOutputRouter::new(BridgePadSink);
@@ -366,15 +380,24 @@ fn run_inner(
                     );
                     decoder.reconfigure(&cp, fps, window)?;
                     gate.close(cp.first_frame, last_fed, mono_ms());
+                    cursor.set_space(cp.width, cp.height);
                 }
                 current = cp;
             }
             Some(Inbound::Control(ServerControl::CursorShape(c))) => {
-                if let Some((bgra, w, h, hx, hy)) = cursor.push(&c) {
+                if let Some((bgra, w, h, hx, hy)) = cursor_shape.push(&c) {
                     callbacks.cursor_shape(&bgra, w, h, hx, hy);
                 }
             }
-            Some(Inbound::Control(ServerControl::CursorPosition { x, y, visible, .. })) => {
+            Some(Inbound::Control(ServerControl::CursorPosition {
+                x,
+                y,
+                visible,
+                input_seq,
+            })) => {
+                // For the UI thread's prediction, then the upcall that makes it
+                // look (and the fallback position when it is not predicting).
+                cursor.publish(x, y, visible, input_seq);
                 callbacks.cursor_position(x as i32, y as i32, visible);
             }
             Some(Inbound::Audio(pkt)) => {
@@ -445,12 +468,15 @@ fn run_inner(
         }
 
         // Drain queued input and send it, mapped to wire events. The session
-        // key is installed, so the sequence starts at 1 each session.
+        // key is installed, so the sequence starts at 1 each session. Mouse
+        // moves come already numbered by the UI thread, which predicts the
+        // cursor from them; everything else is numbered here, from the same
+        // counter.
         while let Ok(raw) = input_rx.try_recv() {
-            if let Some(event) = input_acc.apply(raw)
-                && client.send_input(&InputPacket { input_seq, event }).is_ok()
-            {
-                input_seq = input_seq.wrapping_add(1);
+            let seq = raw.seq();
+            if let Some(event) = input_acc.apply(raw) {
+                let input_seq = seq.unwrap_or_else(|| cursor.next_seq());
+                let _ = client.send_input(&InputPacket { input_seq, event });
             }
         }
 
@@ -474,10 +500,9 @@ fn run_inner(
                         continue;
                     }
                 };
-                if let Some(event) = input_acc.apply(ClientInput::Pad { index, state })
-                    && client.send_input(&InputPacket { input_seq, event }).is_ok()
-                {
-                    input_seq = input_seq.wrapping_add(1);
+                if let Some(event) = input_acc.apply(ClientInput::Pad { index, state }) {
+                    let input_seq = cursor.next_seq();
+                    let _ = client.send_input(&InputPacket { input_seq, event });
                 }
             }
         }

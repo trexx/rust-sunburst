@@ -32,6 +32,7 @@ pub mod usb;
 // Pure, host-testable logic (no platform); public so the host build does not
 // see it as dead when its only caller is Android-gated.
 pub mod audio_ring;
+pub mod cursor_predict;
 pub mod hdr_static_info;
 pub mod headset;
 pub mod input_map;

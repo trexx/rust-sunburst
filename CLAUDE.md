@@ -70,7 +70,10 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   is the box run, `HARDWARE_TESTING.md` §9.)
 - **Render the cursor client-side** from separately-delivered shape data. Removes
   the network round-trip from perceived pointer latency. Biggest single
-  responsiveness win in the system.
+  responsiveness win in the system. The client also **predicts** the pointer:
+  it moves the overlay from its own mouse at the server's reported gain, and
+  reconciles against each `CursorPosition` plus the moves the server had not
+  yet applied (`input_seq`). See `sunburst-android/src/cursor_predict.rs`.
 - **Subframe readback is mandatory,** not an optimisation. With one NVENC and no
   SFE, encode time (~9–11ms p99 at 4K on this card) is a fixed floor. Emitting slices (HEVC) / tiles (AV1)
   as they complete overlaps encode with transmit and is the only way to hide it.

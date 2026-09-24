@@ -269,8 +269,20 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     private fun onCapturedPointer(event: MotionEvent): Boolean {
         if (handle == 0L) return false
         when (event.actionMasked) {
-            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE ->
-                nativeMouseMove(handle, event.x, event.y) // captured: x/y are deltas
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE -> {
+                // Captured: x/y are deltas, and a batched event carries earlier
+                // ones in its history, which used to be dropped.
+                var dx = event.x
+                var dy = event.y
+                for (i in 0 until event.historySize) {
+                    dx += event.getHistoricalX(i)
+                    dy += event.getHistoricalY(i)
+                }
+                // Rust sends the move and predicts where the pointer now is, so
+                // the overlay moves with the hand instead of a round trip later.
+                val predicted = nativeMouseMove(handle, dx, dy)
+                if (predicted >= 0) cursorView.setPacked(predicted)
+            }
             MotionEvent.ACTION_BUTTON_PRESS ->
                 nativeMouseButton(handle, event.actionButton, true)
             MotionEvent.ACTION_BUTTON_RELEASE ->
@@ -321,9 +333,14 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         runOnUiThread { cursorView.setShape(bitmap, hotspotX, hotspotY) }
     }
 
-    /** A cursor position, normalised 0..65535 across the server's monitor. */
+    /** A server cursor report, normalised 0..65535 across the captured output.
+     *  Folded into the prediction when there is one; drawn as-is when not (the
+     *  server reports a gain of 0 while Enhanced Pointer Precision is on). */
     fun onCursorPosition(x: Int, y: Int, visible: Boolean) {
-        runOnUiThread { cursorView.setPosition(x, y, visible) }
+        runOnUiThread {
+            val predicted = if (handle != 0L) nativeCursorSync(handle) else -1L
+            if (predicted >= 0) cursorView.setPacked(predicted) else cursorView.setPosition(x, y, visible)
+        }
     }
 
     /** Draws the server's cursor above the video, so the pointer is not encoded
@@ -350,6 +367,10 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
             invalidate()
         }
 
+        /** A position packed by Rust: `visible << 32 | x << 16 | y`. */
+        fun setPacked(p: Long) =
+            setPosition(((p shr 16) and 0xFFFF).toInt(), (p and 0xFFFF).toInt(), (p shr 32) != 0L)
+
         override fun onDraw(canvas: Canvas) {
             val bmp = bitmap ?: return
             if (!visible) return
@@ -375,7 +396,8 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeSurfaceChanged(handle: Long, surface: Surface)
     private external fun nativeClientTid(handle: Long): Int
     private external fun nativeKey(handle: Long, code: Int, down: Boolean, meta: Int)
-    private external fun nativeMouseMove(handle: Long, dx: Float, dy: Float)
+    private external fun nativeMouseMove(handle: Long, dx: Float, dy: Float): Long
+    private external fun nativeCursorSync(handle: Long): Long
     private external fun nativeMouseButton(handle: Long, code: Int, down: Boolean)
     private external fun nativeWheel(handle: Long, delta: Float, horizontal: Boolean)
     private external fun nativePadButton(handle: Long, code: Int, down: Boolean)

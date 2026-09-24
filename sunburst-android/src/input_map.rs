@@ -22,9 +22,12 @@ pub enum ClientInput {
         down: bool,
         meta: i32,
     },
-    MouseMove {
-        dx: f32,
-        dy: f32,
+    /// A relative mouse move already in whole counts, numbered by the UI
+    /// thread (which predicts the cursor from it) as `seq`.
+    MouseRel {
+        seq: u32,
+        dx: i16,
+        dy: i16,
     },
     MouseButton {
         code: i32,
@@ -181,6 +184,16 @@ pub fn trigger_to_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0) as u8
 }
 
+impl ClientInput {
+    /// The sequence number the UI thread already gave this input, if any.
+    pub fn seq(&self) -> Option<u32> {
+        match self {
+            ClientInput::MouseRel { seq, .. } => Some(*seq),
+            _ => None,
+        }
+    }
+}
+
 /// Accumulates gamepad state across button/axis events so each change emits a
 /// full [`GamepadState`]; other events map one-to-one.
 ///
@@ -220,11 +233,8 @@ impl InputAccumulator {
                     InputEvent::KeyUp { vk, modifiers }
                 })
             }
-            ClientInput::MouseMove { dx, dy } => {
-                Some(InputEvent::MouseMove(MouseMotion::Relative {
-                    dx: dx.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
-                    dy: dy.clamp(i16::MIN as f32, i16::MAX as f32) as i16,
-                }))
+            ClientInput::MouseRel { dx, dy, .. } => {
+                Some(InputEvent::MouseMove(MouseMotion::Relative { dx, dy }))
             }
             ClientInput::MouseButton { code, down } => {
                 let button = android_mouse_button(code)?;
