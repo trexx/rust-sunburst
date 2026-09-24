@@ -25,6 +25,8 @@ mod input;
 #[cfg(target_os = "android")]
 mod jni_bridge;
 #[cfg(target_os = "android")]
+mod launcher;
+#[cfg(target_os = "android")]
 mod pair;
 #[cfg(target_os = "android")]
 pub mod usb;
@@ -32,6 +34,7 @@ pub mod usb;
 // Pure, host-testable logic (no platform); public so the host build does not
 // see it as dead when its only caller is Android-gated.
 pub mod audio_ring;
+pub mod catalogue;
 pub mod cursor_predict;
 pub mod hdr_static_info;
 pub mod headset;
