@@ -23,6 +23,7 @@
 //! the one thing it must not be able to do. The MAC costs about 100ns.
 
 pub mod auth;
+pub mod color;
 pub mod control;
 pub mod feedback;
 pub mod header;
@@ -34,6 +35,7 @@ pub mod rumble;
 pub mod seq;
 
 pub use auth::{MAC_LEN, NONCE_LEN, SessionKey};
+pub use color::{ColorInfo, cicp};
 pub use control::{
     AppListing, AudioParams, CURSOR_CHUNK_MAX, CURSOR_FORMAT_BGRA32, ClientControl, ClientMessage,
     CursorChunk, DecoderQuirks, HdrMastering, Hello, PairRequest, ServerControl, ServerMessage,

@@ -21,7 +21,6 @@
 
 use std::ffi::{CStr, c_char, c_void};
 
-use sunburst_capture::HdrMetadata;
 use sunburst_core::codec::av1::{
     SequenceHeader, TileGrid, parse_sequence_header, plan_tiles, scan_frame, uniform_grid,
 };
@@ -222,7 +221,7 @@ pub struct EncoderConfig {
     /// the nearest power-of-two grid the level allows — `4` is 2×2). `>1` turns
     /// on subframe readback.
     pub slices: u32,
-    pub hdr: Option<HdrMetadata>,
+    pub hdr: Option<sunburst_core::proto::HdrMastering>,
     /// The colorimetry to tag the bitstream with, matched to the convert output.
     pub color: ColorSpace,
     /// `(period, count)` for gradual intra refresh, or `None`. Gated on the
@@ -854,8 +853,8 @@ impl<'a> Encoder<'a> {
             input_pitch,
             bitstream: bs.bitstream_buffer,
             registered: None,
-            mastering: cfg.hdr.as_ref().map(MasteringDisplayInfo::from_metadata),
-            max_cll: cfg.hdr.as_ref().map(ContentLightLevel::from_metadata),
+            mastering: cfg.hdr.as_ref().map(MasteringDisplayInfo::from_mastering),
+            max_cll: cfg.hdr.as_ref().map(ContentLightLevel::from_mastering),
             cfg: cfg.clone(),
             av1_seq: None,
             av1_tiles: None,

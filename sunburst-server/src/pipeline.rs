@@ -616,7 +616,7 @@ fn build_and_convert<'a>(
     ecfg.color = color;
     // Mastering-display / MaxCLL SEI only when the source is genuinely HDR.
     ecfg.hdr = if frame_hdr {
-        capture.caps().hdr_metadata
+        capture.caps().hdr_metadata.map(|m| m.mastering())
     } else {
         None
     };

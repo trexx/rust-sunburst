@@ -26,6 +26,7 @@
 //! carries it in pieces. Every chunk repeats the shape's head, and the channel
 //! delivers in order, so the receiver appends and never has to reorder.
 
+pub use super::color::HdrMastering;
 use super::pairing::{NONCE_LEN, TAG_LEN};
 
 /// Bytes of envelope before the payload.
@@ -313,20 +314,6 @@ pub fn negotiate_codec(prefer: Option<StreamCodec>, client_codecs: u8) -> Option
         None if has(StreamCodec::H264) => Some(StreamCodec::H264),
         None => None,
     }
-}
-
-/// HDR mastering metadata, in the SMPTE ST 2086 fixed-point units the
-/// bitstream itself carries: chromaticity in 0.00002 steps, luminance in
-/// 0.0001 cd/m². The client hands these to `MediaFormat.KEY_HDR_STATIC_INFO`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct HdrMastering {
-    /// Red, green, blue `[x, y]`.
-    pub primaries: [[u16; 2]; 3],
-    pub white: [u16; 2],
-    pub max_luminance: u32,
-    pub min_luminance: u32,
-    pub max_cll: u16,
-    pub max_fall: u16,
 }
 
 /// Opus audio parameters for the session, present when the server streams sound.
@@ -707,14 +694,7 @@ impl ServerControl {
                 b.extend_from_slice(&c.server_ns.to_le_bytes());
                 b.extend_from_slice(&c.hello_delay_ns.to_le_bytes());
                 if let Some(h) = &c.hdr {
-                    for [x, y] in h.primaries.iter().chain(core::iter::once(&h.white)) {
-                        b.extend_from_slice(&x.to_le_bytes());
-                        b.extend_from_slice(&y.to_le_bytes());
-                    }
-                    b.extend_from_slice(&h.max_luminance.to_le_bytes());
-                    b.extend_from_slice(&h.min_luminance.to_le_bytes());
-                    b.extend_from_slice(&h.max_cll.to_le_bytes());
-                    b.extend_from_slice(&h.max_fall.to_le_bytes());
+                    put_mastering(b, h);
                 }
                 if let Some(a) = &c.audio {
                     b.extend_from_slice(&a.sample_rate.to_le_bytes());
@@ -800,19 +780,7 @@ impl ServerControl {
                 let server_ns = r.u64()? as i64;
                 let hello_delay_ns = r.u32()?;
                 let hdr = if flags & 1 != 0 {
-                    let mut xy = [[0u16; 2]; 4];
-                    for pair in &mut xy {
-                        pair[0] = r.u16()?;
-                        pair[1] = r.u16()?;
-                    }
-                    Some(HdrMastering {
-                        primaries: [xy[0], xy[1], xy[2]],
-                        white: xy[3],
-                        max_luminance: r.u32()?,
-                        min_luminance: r.u32()?,
-                        max_cll: r.u16()?,
-                        max_fall: r.u16()?,
-                    })
+                    Some(read_mastering(&mut r)?)
                 } else {
                     None
                 };
@@ -906,6 +874,37 @@ fn split_envelope(buf: &[u8]) -> Result<(u8, &[u8], usize), ControlError> {
 
 /// Bounds-checked forward reader, so every payload is not its own set of index
 /// arithmetic waiting to panic on a hostile packet.
+/// The 24-byte ST 2086 block, as `SessionConfig` and `CodecPrivate` both carry
+/// it: R, G, B, white `[x, y]` as u16, then max and min luminance as u32, then
+/// MaxCLL and MaxFALL as u16. One writer and one reader, so the two messages
+/// cannot drift apart.
+fn put_mastering(b: &mut Vec<u8>, h: &HdrMastering) {
+    for [x, y] in h.primaries.iter().chain(core::iter::once(&h.white)) {
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+    }
+    b.extend_from_slice(&h.max_luminance.to_le_bytes());
+    b.extend_from_slice(&h.min_luminance.to_le_bytes());
+    b.extend_from_slice(&h.max_cll.to_le_bytes());
+    b.extend_from_slice(&h.max_fall.to_le_bytes());
+}
+
+fn read_mastering(r: &mut Reader<'_>) -> Result<HdrMastering, ControlError> {
+    let mut xy = [[0u16; 2]; 4];
+    for pair in &mut xy {
+        pair[0] = r.u16()?;
+        pair[1] = r.u16()?;
+    }
+    Ok(HdrMastering {
+        primaries: [xy[0], xy[1], xy[2]],
+        white: xy[3],
+        max_luminance: r.u32()?,
+        min_luminance: r.u32()?,
+        max_cll: r.u16()?,
+        max_fall: r.u16()?,
+    })
+}
+
 struct Reader<'a> {
     buf: &'a [u8],
     at: usize,

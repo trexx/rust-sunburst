@@ -34,7 +34,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // hdr-preferred D3D11 capture (NvFBC off), the runtime NVENC, an output file.
     let mut capture = select::build(false, None, true, OutputSelect::Primary)?;
-    let hdr = capture.caps().hdr_metadata; // the display's mastering metadata, if HDR
+    // The display's mastering metadata, if HDR, in ST 2086 units.
+    let hdr = capture.caps().hdr_metadata.map(|m| m.mastering());
     let nvenc = Nvenc::load()?;
     let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
 

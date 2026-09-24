@@ -26,20 +26,14 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
     ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput5,
-    IDXGIOutput6, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
 
-use crate::{
-    Backend, Caps, Capture, CaptureError, Frame, FrameMeta, HdrMetadata, TextureFormat,
-    TextureFrame,
-};
+use crate::{Backend, Caps, Capture, CaptureError, Frame, FrameMeta, TextureFormat, TextureFrame};
 
 /// A live Desktop Duplication of the primary output.
 pub struct DdaCapture {
@@ -56,56 +50,20 @@ pub struct DdaCapture {
     delivered: bool,
 }
 
-/// HDR state + mastering metadata from a DXGI output's modern (`IDXGIOutput6`)
-/// desc: the scRGB colour space means the desktop is in HDR mode. Shared by DDA
-/// and WGC so both backends detect HDR identically; falls back to SDR when the
-/// modern desc is unavailable.
-pub(crate) fn output_hdr(output: &IDXGIOutput) -> (bool, Option<HdrMetadata>) {
-    let Ok(o6) = output.cast::<IDXGIOutput6>() else {
-        return (false, None);
-    };
-    // SAFETY: `o6` is a live output interface; GetDesc1 fills a plain descriptor.
-    let d1 = match unsafe { o6.GetDesc1() } {
-        Ok(d1) => d1,
-        Err(_) => return (false, None),
-    };
-    // An HDR desktop's OUTPUT reports HDR10 (PQ + BT.2020); the scRGB
-    // G10_NONE_P709 space is the composition surface, not the output signal.
-    // Microsoft's D3D12HDR sample checks exactly this value.
-    let hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-    let meta = hdr.then_some(HdrMetadata {
-        red: d1.RedPrimary,
-        green: d1.GreenPrimary,
-        blue: d1.BluePrimary,
-        white: d1.WhitePoint,
-        min_luminance: d1.MinLuminance,
-        max_luminance: d1.MaxLuminance,
-        max_full_frame_luminance: d1.MaxFullFrameLuminance,
-    });
-    (hdr, meta)
-}
-
 impl DdaCapture {
-    /// Build a duplication of the selected monitor (`Primary` = output 0, the
-    /// historical default; `Index(n)` = the n-th output, for a virtual display).
-    pub fn new(output: crate::OutputSelect) -> Result<DdaCapture, CaptureError> {
-        let output_index = match output {
-            crate::OutputSelect::Primary => 0,
-            crate::OutputSelect::Index(n) => n,
-        };
+    /// Build a duplication of the selected monitor (`Primary` = the primary
+    /// monitor; `Index(n)` = the n-th output, for a virtual display).
+    pub fn new(select: crate::OutputSelect) -> Result<DdaCapture, CaptureError> {
+        let (adapter, output) = crate::output::resolve_output(select)?;
         // SAFETY: standard DXGI/D3D11 entry points; every returned interface is
         // refcounted and released by `windows`.
         unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
-            let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).map_err(backend)?;
-            let output = adapter.EnumOutputs(output_index).map_err(backend)?;
-
             // Dimensions from the output desc; HDR + mastering from the modern
             // desc via the shared helper (WGC uses the same detection).
             let d = output.GetDesc().map_err(backend)?;
             let r = d.DesktopCoordinates;
             let (width, height) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
-            let (hdr, hdr_metadata) = output_hdr(&output);
+            let (hdr, hdr_metadata) = crate::output::output_hdr(&output);
 
             let mut device: Option<ID3D11Device> = None;
             D3D11CreateDevice(

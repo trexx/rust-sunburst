@@ -166,7 +166,17 @@ impl NvFbcCapture {
                 hdr,
                 width: 0,
                 height: 0,
-                hdr_metadata: None,
+                // NvFBC has no DXGI output of its own. It grabs the primary
+                // desktop, so the primary's desc is the right source, and
+                // without it an HDR stream from this path carried no mastering
+                // SEI at all.
+                hdr_metadata: if hdr {
+                    crate::output::output_info(crate::OutputSelect::Primary)
+                        .ok()
+                        .and_then(|o| o.hdr_metadata)
+                } else {
+                    None
+                },
             },
         };
 

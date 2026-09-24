@@ -24,18 +24,17 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Foundation::{E_POINTER, POINT};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
     ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, IDXGIAdapter1,
-    IDXGIDevice, IDXGIFactory1,
+    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, IDXGIDevice,
 };
-use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint};
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -88,37 +87,14 @@ impl WgcCapture {
             let inspectable = CreateDirect3D11DeviceFromDXGIDevice(&dxgi).map_err(backend)?;
             let d3d: IDirect3DDevice = inspectable.cast().map_err(backend)?;
 
-            // The monitor to capture, as an HMONITOR: the primary, or the n-th
-            // DXGI output's monitor for a selected (e.g. virtual) display.
-            let hmon: HMONITOR = match output {
-                crate::OutputSelect::Primary => {
-                    MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY)
-                }
-                crate::OutputSelect::Index(n) => {
-                    let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
-                    let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).map_err(backend)?;
-                    let out = adapter.EnumOutputs(n).map_err(backend)?;
-                    out.GetDesc().map_err(backend)?.Monitor
-                }
-            };
-
-            // HDR state for the captured monitor, matched by HMONITOR, via the
-            // same DXGI-output query DDA uses: WGC's FP16 pool carries SDR and HDR
-            // alike, so this is what distinguishes them. SDR if no output matches.
-            let (hdr, hdr_metadata) = {
-                let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(backend)?;
-                let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).map_err(backend)?;
-                let mut found = (false, None);
-                let mut i = 0;
-                while let Ok(out) = adapter.EnumOutputs(i) {
-                    if out.GetDesc().map(|d| d.Monitor == hmon).unwrap_or(false) {
-                        found = crate::dda::output_hdr(&out);
-                        break;
-                    }
-                    i += 1;
-                }
-                found
-            };
+            // The monitor to capture: the same DXGI output DDA would duplicate
+            // (the primary, or the n-th output for a selected virtual display),
+            // as an HMONITOR. Its HDR state comes from the same query DDA uses:
+            // WGC's FP16 pool carries SDR and HDR alike, so this is what
+            // distinguishes them.
+            let (_, dxgi_output) = crate::output::resolve_output(output)?;
+            let hmon: HMONITOR = dxgi_output.GetDesc().map_err(backend)?.Monitor;
+            let (hdr, hdr_metadata) = crate::output::output_hdr(&dxgi_output);
             let interop: IGraphicsCaptureItemInterop =
                 windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                     .map_err(backend)?;

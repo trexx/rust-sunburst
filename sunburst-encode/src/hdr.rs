@@ -8,9 +8,12 @@
 //! codec config the driver writes the SMPTE ST 2086 mastering-display and content-
 //! light-level SEI (HEVC) / metadata OBU (AV1).
 //!
-//! The scaling to ST 2086 fixed point is pure logic and unit-tested.
+//! The scaling to ST 2086 fixed point is not here: it is
+//! `sunburst_core::proto::HdrMastering::from_display`, shared with the
+//! handshake so the SEI and what the client is told cannot disagree. This is
+//! only NVENC's field order.
 
-use sunburst_capture::HdrMetadata;
+use sunburst_core::proto::HdrMastering;
 
 /// CIE xy chromaticity in ST 2086 fixed point (increments of 0.00002).
 #[repr(C)]
@@ -42,34 +45,34 @@ pub(crate) struct ContentLightLevel {
     pub max_pic_average_light_level: u16,
 }
 
-/// CIE xy → ST 2086 fixed point (0.00002 increments → ×50000).
-fn chroma(xy: [f32; 2]) -> ChromaPoint {
-    ChromaPoint {
-        x: (xy[0] * 50_000.0).round().clamp(0.0, 65_535.0) as u16,
-        y: (xy[1] * 50_000.0).round().clamp(0.0, 65_535.0) as u16,
+impl ChromaPoint {
+    fn from_xy(xy: [u16; 2]) -> ChromaPoint {
+        ChromaPoint { x: xy[0], y: xy[1] }
     }
 }
 
 impl MasteringDisplayInfo {
-    pub(crate) fn from_metadata(m: &HdrMetadata) -> MasteringDisplayInfo {
+    /// A pure reorder: the scaling to ST 2086 already happened, once, in
+    /// `HdrMastering::from_display`, which the handshake shares. NVENC orders
+    /// the primaries g, b, r; the wire and the display desc order them r, g, b.
+    pub(crate) fn from_mastering(m: &HdrMastering) -> MasteringDisplayInfo {
+        let [r, g, b] = m.primaries;
         MasteringDisplayInfo {
-            g: chroma(m.green),
-            b: chroma(m.blue),
-            r: chroma(m.red),
-            white_point: chroma(m.white),
-            // nits → 0.0001 cd/m² units (×10000).
-            max_luma: (m.max_luminance * 10_000.0).round().max(0.0) as u32,
-            min_luma: (m.min_luminance * 10_000.0).round().max(0.0) as u32,
+            g: ChromaPoint::from_xy(g),
+            b: ChromaPoint::from_xy(b),
+            r: ChromaPoint::from_xy(r),
+            white_point: ChromaPoint::from_xy(m.white),
+            max_luma: m.max_luminance,
+            min_luma: m.min_luminance,
         }
     }
 }
 
 impl ContentLightLevel {
-    pub(crate) fn from_metadata(m: &HdrMetadata) -> ContentLightLevel {
+    pub(crate) fn from_mastering(m: &HdrMastering) -> ContentLightLevel {
         ContentLightLevel {
-            max_content_light_level: m.max_luminance.round().clamp(0.0, 65_535.0) as u16,
-            max_pic_average_light_level: m.max_full_frame_luminance.round().clamp(0.0, 65_535.0)
-                as u16,
+            max_content_light_level: m.max_cll,
+            max_pic_average_light_level: m.max_fall,
         }
     }
 }
@@ -79,43 +82,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scales_bt2020_primaries_and_luminance() {
-        // A 1000-nit BT.2020 mastering display.
-        let m = HdrMetadata {
-            red: [0.708, 0.292],
-            green: [0.170, 0.797],
-            blue: [0.131, 0.046],
-            white: [0.3127, 0.3290],
-            min_luminance: 0.005,
-            max_luminance: 1000.0,
-            max_full_frame_luminance: 400.0,
+    fn reorders_rgb_into_nvenc_gbr() {
+        let m = HdrMastering {
+            primaries: [[1, 2], [3, 4], [5, 6]],
+            white: [7, 8],
+            max_luminance: 9,
+            min_luminance: 10,
+            max_cll: 11,
+            max_fall: 12,
         };
-        let mdi = MasteringDisplayInfo::from_metadata(&m);
-        assert_eq!(mdi.r.x, 35_400); // 0.708 × 50000
-        assert_eq!(mdi.g.y, 39_850); // 0.797 × 50000
-        assert_eq!(mdi.b.x, 6_550); //  0.131 × 50000
-        assert_eq!(mdi.white_point.x, 15_635); // 0.3127 × 50000
-        assert_eq!(mdi.max_luma, 10_000_000); // 1000 × 10000
-        assert_eq!(mdi.min_luma, 50); // 0.005 × 10000
-
-        let cll = ContentLightLevel::from_metadata(&m);
-        assert_eq!(cll.max_content_light_level, 1000);
-        assert_eq!(cll.max_pic_average_light_level, 400);
-    }
-
-    #[test]
-    fn clamps_absurd_values() {
-        let m = HdrMetadata {
-            red: [2.0, 2.0],
-            green: [0.0, 0.0],
-            blue: [0.0, 0.0],
-            white: [0.0, 0.0],
-            min_luminance: 0.0,
-            max_luminance: 100_000.0,
-            max_full_frame_luminance: 100_000.0,
-        };
-        let cll = ContentLightLevel::from_metadata(&m);
-        assert_eq!(cll.max_content_light_level, 65_535);
-        assert_eq!(MasteringDisplayInfo::from_metadata(&m).r.x, 65_535);
+        let mdi = MasteringDisplayInfo::from_mastering(&m);
+        assert_eq!((mdi.r.x, mdi.r.y), (1, 2));
+        assert_eq!((mdi.g.x, mdi.g.y), (3, 4));
+        assert_eq!((mdi.b.x, mdi.b.y), (5, 6));
+        assert_eq!((mdi.white_point.x, mdi.white_point.y), (7, 8));
+        assert_eq!((mdi.max_luma, mdi.min_luma), (9, 10));
+        let cll = ContentLightLevel::from_mastering(&m);
+        assert_eq!(
+            (cll.max_content_light_level, cll.max_pic_average_light_level),
+            (11, 12)
+        );
     }
 }

@@ -41,6 +41,7 @@ use std::time::Duration;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 pub mod dda;
+pub mod output;
 pub mod wgc;
 
 // NvFBC (opt-in resilience). `cuda`/`nvfbc` are the internal FFI; `tocuda`
@@ -67,8 +68,8 @@ pub enum Backend {
 
 /// Which monitor a backend captures.
 ///
-/// `Primary` is the default and the historical behaviour (DXGI output 0 /
-/// `MONITOR_DEFAULTTOPRIMARY`). `Index(n)` selects the n-th DXGI output on the
+/// `Primary` is the default: the monitor Windows calls primary, for every
+/// backend (see [`output`]). `Index(n)` selects the n-th DXGI output on the
 /// first adapter — used to capture a virtual display (the opt-in MTT VDD) when
 /// it is not the primary monitor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -176,6 +177,22 @@ pub struct HdrMetadata {
     pub max_luminance: f32,
     /// Maximum full-frame-average luminance (nits) — MaxFALL.
     pub max_full_frame_luminance: f32,
+}
+
+impl HdrMetadata {
+    /// In the ST 2086 units the bitstream and the handshake carry, through the
+    /// one conversion both use.
+    pub fn mastering(&self) -> sunburst_core::proto::HdrMastering {
+        sunburst_core::proto::HdrMastering::from_display(
+            self.red,
+            self.green,
+            self.blue,
+            self.white,
+            self.min_luminance,
+            self.max_luminance,
+            self.max_full_frame_luminance,
+        )
+    }
 }
 
 /// Why a capture attempt failed.

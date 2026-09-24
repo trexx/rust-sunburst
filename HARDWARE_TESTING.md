@@ -1074,9 +1074,12 @@ frame rate that is not a bug.
 
 Not covered here, and why: **client-side cursor rendering** landed in Phase 5
 (server-side GDI capture and the client overlay both), validated in §10 rather
-than here. **HDR mastering in `SessionConfig`** is `None` for now. The encoder's
-ST 2086 SEI carries the display's real metadata (box-verified, `7b39a53`); the
-handshake block is filled when the per-encoder-build colour info lands.
+than here. **HDR mastering in `SessionConfig`** is read from the output after
+the HDR toggle, through the same ST 2086 conversion the encoder's SEI uses, so
+the two carry identical numbers (the SEI itself is box-verified, `7b39a53`).
+Confirm DXGI reports the new state in time: an HDR session whose `SessionConfig`
+has no mastering, while its SEI does, means the query ran before the toggle
+settled.
 
 ---
 
@@ -1099,10 +1102,11 @@ server on the 4070, wired LAN.
       av1C. The fix is the per-encoder-build `CodecPrivate` work (a keyframe gate
       and a startup `RequestIdr`).
 - [ ] **HDR end to end.** `Display.HdrCapabilities` positive, the panel enters
-      HDR, colours and highlights correct, no UI-text chroma fringing. (The
-      mastering rides in the bitstream today; `SessionConfig.hdr` is not yet
-      populated server-side — that is the KEY_HDR_STATIC_INFO path, ready and
-      inert.)
+      HDR, colours and highlights correct, no UI-text chroma fringing.
+      `SessionConfig.hdr` now carries the output's mastering, read after the HDR
+      toggle, so `KEY_HDR_STATIC_INFO` is set from the handshake as well as the
+      in-band SEI. `fakeclient stream` prints it: confirm it matches the display
+      (1000-nit panel → max 1000 nits) and is absent for H.264.
 - [ ] **No microstutter over 30 minutes** — the vsync-timed `releaseOutputBuffer`,
       not immediate release. If it stutters, revisit the present timestamp and
       the jitter-buffer min depth.

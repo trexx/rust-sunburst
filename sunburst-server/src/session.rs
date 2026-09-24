@@ -257,6 +257,25 @@ impl StreamControl for SessionManager {
         let display_guard = DisplayGuard::apply(want_hdr, resolution);
         let epp_guard = settings.disable_epp.then(EppGuard::disable);
 
+        let output = match settings.capture_output {
+            Some(i) => OutputSelect::Index(i),
+            None => OutputSelect::Primary,
+        };
+        // What the captured output reports now that the display is set up: the
+        // mastering the handshake announces. It is the server's expectation, not
+        // a promise. The desktop's real state decides the colour path per frame,
+        // and DXGI can lag a toggle it has only just been told about, so a
+        // client configures from what each encoder build reports, not from this.
+        let hdr_mastering = if want_hdr {
+            sunburst_capture::output::output_info(output)
+                .ok()
+                .filter(|o| o.hdr)
+                .and_then(|o| o.hdr_metadata)
+                .map(|m| m.mastering())
+        } else {
+            None
+        };
+
         let socket = self.socket.try_clone().ok()?;
         let shared = StreamShared::new(bitrate_kbps);
         let (headers_tx, headers_rx) = mpsc::channel();
@@ -280,10 +299,7 @@ impl StreamControl for SessionManager {
                 SessionBackend::Dda => Some(sunburst_capture::Backend::Dda),
                 SessionBackend::Auto | SessionBackend::Nvfbc => None,
             },
-            output: match settings.capture_output {
-                Some(i) => OutputSelect::Index(i),
-                None => OutputSelect::Primary,
-            },
+            output,
             preset: settings.preset,
             vbr: settings.vbr,
             idr_period: settings.idr_period,
@@ -377,9 +393,7 @@ impl StreamControl for SessionManager {
             last_cursor_ms: 0,
         });
 
-        // HDR mastering rides in the bitstream (the encoder's output flags), so
-        // it is not duplicated here; the client reads it from the stream. The
-        // clock facts let the client attribute one-way delay.
+        // The clock facts let the client attribute one-way delay.
         Some(SessionConfig {
             session_id,
             codec,
@@ -387,7 +401,7 @@ impl StreamControl for SessionManager {
             height: hello.height as u16,
             fps_mhz: hello.refresh_mhz,
             bitrate_kbps,
-            hdr: None,
+            hdr: hdr_mastering,
             audio: audio_on.then_some(AudioParams {
                 sample_rate: audio_pipeline::SAMPLE_RATE,
                 channels: audio_pipeline::CHANNELS,
