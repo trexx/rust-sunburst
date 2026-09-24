@@ -53,8 +53,9 @@ moves into Phase 3 where the `Capture` trait is built. It is never the default �
 it needs an undocumented private-data key and is deprecated below this project's
 OS floor — but DDA goes black on DRM-protected content and dies on the secure
 desktop, so a second GPU-resident path is resilience as much as speed. What
-decides its real worth is the present→capture latency harness that follows Phase
-0, not the throughput numbers above.
+decided its real worth was the present→capture latency harness, not the throughput
+numbers above — and it answered: NvFBC is **1.2–1.5ms worse** than DDA and WGC
+(`HARDWARE_TESTING.md` §7). So it is kept for resilience alone.
 
 That it took seven runs to get a number worth trusting is the more useful lesson,
 and `HARDWARE_TESTING.md` §1 keeps the wrong turns alongside the answer: an idle
@@ -115,15 +116,16 @@ that out now is much cheaper than finding it out in Phase 5.
 - UDP socket, single port.
 - Authenticated input/control packets: keyed MAC + sequence number, replay rejection.
 - Minimal reliable channel (seq + ack + retransmit, ~150 lines) for control messages.
-- Gamepad: **ViGEmBus, chosen on evidence rather than inherited.** It was
-  archived on 2 November 2023 (trademark conflict), so five alternatives were
-  surveyed and HIDMaestro was probed on real hardware. HIDMaestro's shared memory
-  is reachable and writable from Rust, but its bytes are a fully-formed
-  profile-specific HID report built by 53KB of C# across 231 profiles, and it
-  documents no non-.NET consumer surface — so using it means .NET on the input
-  path. ViGEmBus is ~6 ioctls against an ABI frozen by archival. `libvirtualhid`
-  fails on licence; `inputtino` and WinUHid do not apply. See
-  `HARDWARE_TESTING.md` §8. Rumble callback → forward to client.
+- Gamepad: **HIDMaestro's UMDF2 driver, with the reports built in Rust.** This
+  was first planned as ViGEmBus. ViGEmBus was archived on 2 November 2023, so five
+  alternatives were surveyed, and HIDMaestro was set aside because its reports
+  were built by 53KB of C#, which would have put .NET on the input path. That
+  objection went away once the report codec was ported to Rust byte for byte
+  (`sunburst-input/src/pad/`, proven against HIDMaestro's 63 golden hashes). So
+  the decision was reversed (`b7d971f`): a pad presents as its own family rather
+  than always as an X360. `libvirtualhid` fails on licence; `inputtino` and
+  WinUHid do not apply. See `HARDWARE_TESTING.md` §8. Rumble callback → forward
+  to client.
 - Keyboard via scancode `SendInput` (see CLAUDE.md traps).
 - Mouse: absolute mode (`MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`,
   normalised 0–65535) and relative mode. Wheel + horizontal wheel + XBUTTON1/2.
@@ -140,7 +142,7 @@ that out now is much cheaper than finding it out in Phase 5.
 
 **This phase lands in two chunks**, because it splits unevenly by what can be
 verified. The protocol and transport half is testable on the development
-machine; ViGEm and `SendInput` are testable on none of it.
+machine; the virtual pads and `SendInput` are testable on none of it.
 
 1. **Control channel and transport** *(done)* — control-message payloads, the
    reliable layer, the UDP endpoint, and the fake client.
@@ -166,16 +168,29 @@ interaction characterised and documented.
 Still no network. Output is an elementary stream on disk, verified by playback on
 the actual TVs.
 
+**Status: landed and streaming on the 4070; TV playback pending.** All three
+backends are in `sunburst-capture`, and NvFBC's convert kernels are vendored PTX.
+H.264, HEVC and AV1 encode on the box, and the colour signalling (VUI, the AV1
+`color_config`, the ST 2086 SEI) is checked from the dumps (`HARDWARE_TESTING.md`
+§9). First contact broke NVENC init, the HDR path and the AV1 drain, and all
+three are fixed. The measured p99s are in §4: encode about 9–11ms, convert about
+0.1ms. What remains is playback on the TVs and the capture→encode p99 over a
+sustained run.
+
 - `Capture` trait + `Caps`. `AccessLost` recoverable at any point.
 - **DDA** backend: blocking `AcquireNextFrame` on a dedicated thread, release
   immediately after taking the texture reference.
 - **WGC** backend: free-threaded frame pool, `R16G16B16A16Float` for HDR.
-- **NvFBC** backend, opt-in: promoted out of the Phase 0 probe (now `tools/probe-windows`), keyed
-  `CreateEx` → `NvFBCToCuda` → `cuGraphicsD3D11RegisterResource` so the trait
-  still yields a D3D11 texture. Never selected automatically.
+- **NvFBC** backend, opt-in: promoted out of the Phase 0 probe (now
+  `tools/probe-windows`), keyed `CreateEx` → `NvFBCToCuda`, and it **stays
+  CUDA-native**. The trait yields `Frame::Cuda`, a CUDA convert kernel produces
+  P010/NV12, and NVENC takes it as `CUDADEVICEPTR` input — never bounced through
+  D3D11 (CLAUDE.md, *Architectural decisions*). Never selected automatically.
 - Backend selection: WGC on Win11, DDA on Win10, fall back to the other on
   `AccessLost` or repeated black-frame detection. NvFBC only when asked for.
-- scRGB→P010 compute shader.
+- Colour convert, chosen per frame from the captured desktop's real HDR state:
+  P010 BT.2020 PQ (HDR), P010 BT.709 (SDR on HEVC/AV1), or NV12 BT.709 (H.264).
+  An 8-bit sRGB desktop is linearised in the shader.
 - NVENC init: HEVC Main10 and AV1 Main10, P1–P4, `TUNING_INFO_ULTRA_LOW_LATENCY`,
   CBR, no lookahead, no B-frames, infinite GOP.
 - **Subframe readback** — slices for HEVC, tiles for AV1. Not optional (see CLAUDE.md).
@@ -197,9 +212,11 @@ state machines, delay-gradient rate control, the deadline pacer and USO
 batching). The encoder gained force-IDR, `inputTimeStamp`, invalidation and
 seamless bitrate reconfigure; the server starts a session on `Hello` and drives
 recovery, rate control and paced/offloaded send. `fakeclient stream` is the stub
-receiver and the play-on-TV dump. What remains is the box run — see
-`HARDWARE_TESTING.md` §9. Windows-only pieces are compile-verified via
-`cargo xwin`, not yet measured.
+receiver and the play-on-TV dump. The first box runs streamed 4K HEVC and AV1
+to it. They fixed the AV1 NACK storm (6229 → 0), a pacer feedback loop (send p99
+1,275ms → single-digit ms) and the rate caps, and they recorded send p99s in
+`HARDWARE_TESTING.md` §4. What remains is the rest of §9: sustained runs,
+induced loss, `tc` convergence, and USO on vs off.
 
 - Packetization per PROTOCOL.md. MTU-safe, ≤1200 byte payload.
 - **USO send offload** (`WSASetSockopt(UDP_SEND_MSG_SIZE)`) and URO receive
@@ -329,7 +346,7 @@ virtual display:
 
 What remains is the box run — HARDWARE_TESTING §12. The display and VDD code is
 `cargo xwin`-verified; behaviour (which output is the virtual one, the VDD's exact
-hardware id, HDR/mode restore) is confirmed on the 4070.
+hardware id, HDR/mode restore) is still to be confirmed on the 4070.
 - ~~**NvFBC**~~ — **moved to Phase 3** as an opt-in backend. Phase 0.1 unlocked
   it, made it GPU-resident via ToCuda and measured 0.86–0.94x DDA, which settles
   throughput and nothing else. It belongs beside the other backends rather than
@@ -538,15 +555,17 @@ to fetch.
 
 ## Capture backend reference
 
-Ranked by latency. Full detail in CLAUDE.md traps.
+Full detail in CLAUDE.md traps. Latency is present→capture, measured on a 144Hz
+desktop (`HARDWARE_TESTING.md` §7). It works out to about half the refresh
+interval, so a higher desktop refresh rate lowers every row.
 
-| Backend | Latency | Status |
+| Backend | Latency (p50) | Status |
 |---|---|---|
-| Swapchain hook | Pre-composition, saves ~1 frame, uncapped fps | Phase 7, opt-in |
-| IDD | Very good; solves headless + resolution matching | Phase 7 |
-| NvFBC | GPU-resident via ToCuda; **0.86–0.94x DDA** on throughput, latency unmeasured | Phase 3, opt-in |
-| WGC | Post-composition, refresh-capped | Phase 3, Win11 default |
-| DDA | Post-composition, refresh-capped | Phase 3, Win10 default |
+| DDA | **3.83ms** | Phase 3, Win10 default |
+| WGC | **4.24ms** | Phase 3, Win11 default |
+| NvFBC | **5.28ms**, 1.2–1.5ms worse; 0.86–0.94× DDA on throughput | Phase 3, opt-in, for resilience alone (DRM, secure desktop) |
+| Virtual display (IDD) | Same capture path as above; solves headless and resolution matching | Phase 7, the MikeTheTech VDD **consumed**, opt-in `virtual_display` |
+| ~~Swapchain hook~~ | Would skip composition, which costs only ~4ms at 144Hz | **Struck** on measurement (Phase 7) |
 
 Not implemented, listed so nobody proposes them: GDI `BitBlt`, `PrintWindow`,
 Magnification API, `DwmGetDxSharedSurface`, mirror drivers. All CPU-readback,

@@ -9,7 +9,8 @@ Tick items off as they are verified, and note the device and driver each result
 came from. **Anything found broken is recorded here with the symptom before it is
 fixed**, so the same case gets re-tested afterwards.
 
-**Legend:** `[ ]` untested · `[x]` verified · `[!]` failed, see note
+**Legend:** `[ ]` untested · `[x]` verified · `[~]` partly verified, the note says
+what is left · `[!]` failed, see note
 
 ---
 
@@ -274,9 +275,10 @@ one NVENC and no SFE this is the only mechanism that hides encode time, and it
 exists on both codecs rather than just HEVC.
 
 **One encoder engine, as AD104 has.** No Split Frame Encoding — it needs two or
-more. Encode time stays a fixed 5–10ms floor, which is what makes the line above
-load-bearing rather than an optimisation. Note the floor itself is still the
-inherited Blackwell-era *estimate*; §4 is where Ada's real number goes.
+more. Encode time is a fixed floor, which is what makes the line above
+load-bearing rather than an optimisation. That floor was an inherited
+Blackwell-era estimate of 5–10ms; Ada's measured enc-unit p99 is **9.2–11.3ms
+HEVC and 10.6ms AV1** at 4K (§4), at the top of the estimate or just past it.
 
 **NvFBC is unlocked, working, GPU-resident, and kept — as an opt-in backend
 beside DDA and WGC, not as a default.**
@@ -510,6 +512,26 @@ slower cores, so the budget needs re-confirming on each.
 | S (Windows) | | | |
 | A (Shield) | | | |
 | B (Homatics) | | | |
+
+### Per-stage p99, env S (live sessions, 2026-09-21 to 09-23)
+
+These come from real 4K streams to `fakeclient`, with a moving desktop, at
+50–100 Mbps. Each figure is a **single run of 5–30 s**. The range pools the
+before/after pairs of `71b7614`, `54420cc`, `06f42f0`, `0fb59fc` and `93a5567`,
+so it shows the spread between builds and runs, not a confidence interval. Record
+the driver version with the next run; none of these did.
+
+| Stage | HEVC | AV1 | Note |
+|---|---|---|---|
+| convert (scRGB→P010, GPU) | 79–130 µs | 88–122 µs | an order of magnitude under the 0.8–1.5 ms estimate |
+| enc-submit | 1.4–1.7 µs | 1.4–1.6 µs | a flushed held frame includes its hold (max ~25 ms), under 1 % of encodes |
+| enc-unit (submit → each unit out) | **9.18–11.27 ms** | **10.62 ms** | the real Ada encode floor; AV1 was 13.50 ms before `0fb59fc` |
+| packetize | 14–21 µs | — | before `9d49997` the collector planted 0 ns pairs, so the older 3.9 µs is not comparable |
+| send (packetize → sent, incl. pacer queue) | 4.59–5.83 ms | 5.64–9.31 ms | p95 0.88–3.64 ms; **the tail is not quotable yet** — one build gave 7.7 and 52 ms on two runs |
+
+Not yet filled in for S: the `record()` cost, the clock read, and the
+dropped-sample count over 5 minutes, which need `sunburst-instr selftest` and a
+sustained run.
 
 ---
 
@@ -914,6 +936,17 @@ the option, gated on the allocation measurement, not built.
   still unspent is ViGEm's DS4 target. USB/IP is recorded against Phase 8 as
   "revisit if upstream fixes GIP", not as a plan.
 
+**Superseded, and left visible: the ViGEmBus verdict above was reversed**
+(`b7d971f`, "No ViGEmBus fallback, by decision"). What changed the answer is that
+the objection to HIDMaestro was .NET on the input path, and that went away once
+the reports were built in Rust instead. `sunburst-input/src/pad/` is a
+byte-for-byte port of HIDMaestro's data-driven report codec, proven against its
+63 committed report hashes. The server drives HIDMaestro's UMDF2 driver
+directly: it creates the device nodes through SetupAPI and `SwDeviceCreate`, and
+writes the shared-memory sections Investigation B mapped. So a pad presents as
+its own family rather than always as an X360, and the "X360 ceiling" above no
+longer applies.
+
 The direct pad baseline — p50 8.00ms, p99 12.00ms, 100% continuity — stays on
 record. It is what the Phase 8 acceptance criterion ("input latency measured
 against a directly-connected pad") will be compared to when the adapter path
@@ -923,20 +956,84 @@ exists.
 
 ## 9. Phase 3/4 — capture → encode → transport (env S, receiver on the Linux box)
 
-The whole transport is host-tested and the Windows half compiles under
-`cargo xwin`, but nothing here is measured. These run the server on the 4070 and
-`fakeclient stream` on the Linux box across the wired LAN. Pair once, then:
+These run the server on the 4070 and `fakeclient stream` on the Linux box across
+the wired LAN. The first box runs happened 2026-09-21 to 09-23. They brought up
+NVENC, the colour path and the AV1 drain, which were all broken on first contact
+(the `[!]` rows below). Every run so far is **5–30 s** long, so none of the
+sustained-run items is closed. Pair once, raising the decoder ceiling as you do:
+the default quirks cap an unknown decoder at 50 Mbps, which makes every
+4K/100 Mbps item below untestable. Then:
 
 ```
+fakeclient pair   --server <box>:47811 --max-bitrate-hint 100000
 fakeclient stream --server <box>:47811 --codecs hevc --out a.265 --secs 60 --stats
 ```
 
-- [ ] **A session starts on `Hello`.** `SessionConfig` then `CodecPrivate`
-      arrive; the session-key switch holds (input still verifies afterwards); the
-      web UI Sessions panel shows it, and a UI disconnect stops it.
+**Run it with something moving on the desktop** (a 60 fps video, testufo). DDA and
+WGC yield nothing when the screen is still, so an idle desktop reads as a low
+frame rate that is not a bug.
+
+**Found broken, now fixed**, recorded so the same cases get re-tested:
+
+- [!] **NVENC init failed with `failed with 8`** (`NV_ENC_ERR_INVALID_PARAM`) on
+      every P-preset. The ME-hint struct was 4 bytes instead of 16, which put
+      `tuningInfo` at offset 112 instead of 136, so the driver read it as zero.
+      10-bit depth was also never set, so `nvEncRegisterResource` then rejected
+      the P010 surface. After the fix **H.264, HEVC and AV1 all encode and
+      deliver end to end.** *(env S, `5e5bcc6`.)*
+- [!] **Turning HDR on crashed NVENC** (access violation in
+      `nvEncodeAPI64.dll`), and colour was right only on an HDR desktop. The
+      `codecPicParams` union sat at 76 instead of 80, `HevcPicParamsHead` was
+      missing a pointer, and DDA checked the wrong DXGI colour space while WGC
+      hard-coded SDR. Fixed: HEVC HDR streams, the VUI reads
+      bt2020/smpte2084/bt2020nc, and the mastering-display + content-light SEI
+      carry the display's real metadata. *(env S, `7b39a53`.)*
+- [!] **AV1 delivered no keyframe** (dav1d: "no sequence header") and HEVC lost
+      frame 0. The drain gave up polling before a 4K AV1 frame existed. Fixed by
+      blocking on the first read; AV1 keyframes now carry the sequence header
+      and BT.2020 PQ. *(env S, `67f1c18`; its p99 was never posted.)* fakeclient
+      also dropped the startup IDR during negotiation and now requests one
+      (`a29873f`). **The Android client has the same gap** — see §10.
+- [!] **AV1 frames came out ~16× over budget** (~1.7 MB against ~104 KB at
+      50 Mbps), causing a NACK storm (~6 k) at ~8 fps. Under
+      `enableSubFrameWrite` NVENC re-reports stale tile bytes past the end of
+      the frame. The drain now stops at the tile group whose `tg_end` is the
+      last tile: **4 tile groups, ~61 KB average, NACKs 6229 → 0.**
+      *(env S, 50 Mbps, `71b7614`.)*
+- [!] **The av1C record contradicted its own sequence header**: "tier 0 —
+      MISMATCH: the sequence header says tier 1". NVENC signals High tier at 4K;
+      av1C is now built from the parsed header, and fakeclient checks every AV1
+      session. The AV1 tile grid is derived from the spec: at `slices=64`, all
+      165 frames carried exactly 56 tile groups (a 4K 8×8 request gives 7 rows);
+      the default is a clean 2×2, ~107 KB against a ~208 KB budget.
+      *(env S, AV1 100 Mbps, `0fb59fc`.)*
+- [!] **Pacing on the live rate target fed back into a 1.2 s send queue**:
+      AV1 send p99 **1,275 ms**, against 7.7 ms with the pacer pinned. The pacer
+      now runs at 2 × max(initial, target). *(env S, `54420cc`.)*
+- [!] **The instrumentation registry filled after about five sessions**, and new
+      stage threads went unregistered: rows vanished from the p99 table, and a
+      failed thread allocated a 64 KB ring on every `record()`. Rings are now
+      reclaimed at thread exit. *(host-verified, `9d49997`.)* **Treat any env-S
+      p99 table from before that commit with suspicion** if the server had run
+      several sessions.
+- [!] **The capture governor lost the last frame of every motion** (33–56 % of
+      motions at 90–240 Hz desktops, simulated), and a 59.94 Hz client got a
+      59 fps governor. With a 60 fps video, **AV1 ran at exactly 60 fps (300/300
+      in 5 s at 100 Mbps).** *(env S, `06f42f0`.)* Content at an integer multiple
+      of the client rate juddered; on a 120 Hz desktop into a 60 Hz client,
+      content steps more than 30 % off the interval went from **12 / 1800 to
+      0 / 600**. *(env S, 120 Hz, HEVC, 30 s → 10 s, `93a5567`.)*
+
+**Still to run:**
+
+- [~] **A session starts on `Hello`.** `SessionConfig` then `CodecPrivate`
+      arrive, and the stream starts once an IDR is requested (`a29873f`).
+      **Not yet shown:** the session-key switch holding (input still verifies
+      afterwards), the web UI Sessions panel listing it, and a UI disconnect
+      stopping it.
 - [ ] **Sustained 4K60 HEVC, 30 min:** 0 abandons, 0 keyframes after the first,
       the instrumentation ring reports 0 dropped samples. Repeat `--codecs av1
-      --out a.ivf`.
+      --out a.ivf`. *(The longest run so far is 30 s.)*
 - [ ] **2% loss recovers by retransmission:** `--drop 2` -> 0 keyframes after the
       first, abandons ~ 0. `--drop 2 --no-retransmit` -> abandons occur and the
       server log shows invalidations, **not** forced IDRs, on HEVC at `dpb_depth
@@ -944,12 +1041,16 @@ fakeclient stream --server <box>:47811 --codecs hevc --out a.265 --secs 60 --sta
 - [ ] **Rate control converges and holds.** On the receiver:
       `tc qdisc add dev <nic> root tbf rate 80mbit burst 32kbit latency 50ms`.
       The bitrate `GET /api/sessions` reports falls under 80 Mbps within 2 s and
-      does not oscillate; removing the qdisc lets it climb back.
+      does not oscillate; removing the qdisc lets it climb back. Watch the send
+      p99 too: the pacer loop above was exactly this kind of oscillation.
 - [ ] **USO on vs off:** the `send`-stage p99 with USO against
       `SUNBURST_NO_USO=1`, and which path actually ran.
-- [ ] **PR-gate p99s** for the send, encode, capture and governor changes,
+- [~] **PR-gate p99s** for the send, encode, capture and governor changes,
       against the pre-merge baseline (Section 4). Noise floor ~3%: take more runs
-      or say "inconclusive" rather than quoting a 1% move.
+      or say "inconclusive" rather than quoting a 1% move. Single-run before/after
+      pairs exist in `54420cc`, `06f42f0`, `0fb59fc` and `93a5567`, and §4 holds
+      their pooled ranges. **The send tail is not yet quotable:** two runs of one
+      build and config gave 7.7 and 52 ms, so it needs many runs.
 - [ ] **AccessLost and secure desktop.** Alt-tab into a fullscreen game and back:
       the pipeline rebuilds and re-sends `CodecPrivate`, the stream continues.
       Lock the screen: `SecureDesktop{active:1}` then `{0}` on unlock, and the
@@ -961,17 +1062,21 @@ fakeclient stream --server <box>:47811 --codecs hevc --out a.265 --secs 60 --sta
       the one assumption the kernel could not settle off the box.
 - [ ] **WGC frame-arrival wait:** confirm the event-signalled wait holds up under
       a real 4K60 run -- no missed frames, no added latency versus the DDA path.
+      *(No run so far recorded which backend it used; name it from now on.)*
 - [ ] **Phase 3 playback:** mux the dumps (`ffmpeg -i a.265 -c copy a.mkv`; the
       `.ivf` plays directly) and confirm they play on the Shield and the Homatics
       with HDR active. This closes Phase 3's "both streams play on their target
-      device" criterion.
-- [ ] The instrumentation Section 4 rows for env S can be filled from these runs.
+      device" criterion. *(So far the dumps are checked on Linux only: dav1d and
+      the VUI/sequence-header colour.)*
+- [~] The instrumentation Section 4 rows for env S can be filled from these runs.
+      The per-stage p99s are there; `record()` cost and the dropped-sample count
+      are not.
 
 Not covered here, and why: **client-side cursor rendering** landed in Phase 5
 (server-side GDI capture and the client overlay both), validated in §10 rather
-than here. **HDR mastering in `SessionConfig`** is `None` for now; the encoder
-writes the ST 2086 metadata into the bitstream, and populating the handshake
-block from the display is a Phase 5 refinement.
+than here. **HDR mastering in `SessionConfig`** is `None` for now. The encoder's
+ST 2086 SEI carries the display's real metadata (box-verified, `7b39a53`); the
+handshake block is filled when the per-encoder-build colour info lands.
 
 ---
 
@@ -987,6 +1092,12 @@ server on the 4070, wired LAN.
 - [ ] **Streams and decodes.** 4K60 to the `SurfaceView`: HEVC on the Shield, AV1
       on the Homatics. Watch for the av1C silent-failure (configures, outputs
       nothing) — a black screen with no decoder error is that.
+      **Known gap, found on the box through fakeclient (`a29873f`):** the server's
+      startup IDR arrives during negotiation, and the Android client drops it
+      without ever sending `RequestIdr`. With an infinite GOP it may sit black
+      until something forces a keyframe, so a black screen is that before it is
+      av1C. The fix is the per-encoder-build `CodecPrivate` work (a keyframe gate
+      and a startup `RequestIdr`).
 - [ ] **HDR end to end.** `Display.HdrCapabilities` positive, the panel enters
       HDR, colours and highlights correct, no UI-text chroma fringing. (The
       mastering rides in the bitstream today; `SessionConfig.hdr` is not yet
@@ -1079,9 +1190,17 @@ with the MikeTheTech Virtual Display Driver installed.
 
 ## 13. H.264 — a low-latency SDR codec (env S, A and B)
 
-H.264 is built end to end but its NVENC config, the NV12 convert (HLSL + the
-`argb_to_nv12` CUDA kernel) and the tonemap are `cargo xwin`-verified only. Set the
-server codec preference (or a per-app override) to H.264.
+H.264 encodes and delivers end to end on the 4070 (`5e5bcc6`), and its VUI now
+carries BT.709 (1/1/1) (`7b39a53`). Nothing below has been checked on a TV or by
+eye: not the picture, not the tonemap, and not the NvFBC path's `argb_to_nv12`
+kernel. Set the server codec preference (or a per-app override) to H.264.
+
+- [!] **`H264ConfigHead` was misaligned**: `separateColourPlaneFlag..ppsId` were
+      modelled as one packed word, so `maxNumRefFrames`, `sliceMode` and the
+      intra-refresh fields were written 16 bytes low. **H.264 slicing and
+      references were silently misconfigured** until `7b39a53` rewrote it and
+      locked the offsets. Re-check slice layout and 2 % loss recovery with that
+      in mind.
 
 - [ ] **Negotiate + decode.** A client offering `video/avc` negotiates H.264 and
       decodes it; HEVC/AV1 still negotiate when preferred; auto never picks H.264
@@ -1114,9 +1233,13 @@ instrumentation rows where latency is involved.
       reproduces the OS default (WGC on Win11, DDA on Win10). Backends measure
       within the §7 half-millisecond of each other; NvFBC is the 1.2–1.5 ms-worse
       resilience path, as documented — confirm it is not silently the default.
-- [ ] **Slices / IDR / DPB / fps cap.** A non-zero slice count changes the slice
-      layout on the wire; a forced IDR period shortens the GOP; an fps cap holds
-      the encode rate below the client's refresh. Defaults (0/0/8/0) are today's.
+- [~] **Slices / IDR / DPB / fps cap.** `slices` counts **units per frame for
+      every codec** (HEVC/H.264 slices, AV1 tiles; 0 = the default 4, which is 4
+      slices or a 2×2 grid). Verified for AV1: `slices=64` gives 56 tile groups
+      at 4K (7 rows, as the spec derives) and the default a clean 2×2
+      (`0fb59fc`). **Still open:** the HEVC slice count on the wire, a forced
+      IDR period shortening the GOP, and an fps cap holding the encode rate
+      below the client's refresh. Defaults (0/0/8/0) are today's.
 - [ ] **Audio codec knobs.** Opus frame duration (2.5/5/10/20 ms), FEC and
       complexity change the audio packet cadence/robustness; 5 ms/FEC-on/10 stays
       the default, and A/V sync (§11) holds across the range.
@@ -1184,11 +1307,16 @@ list: a wired pad, then the adapter with a headset, through Big Picture.
 
 | Needed for | Hardware |
 |---|---|
-| §1's NvFBC row | The 4070 box; `--enable-nvfbc` needs elevation |
-| §7 latency | The 4070 box, screen left alone while it runs |
-| §8 HIDMaestro | HIDMaestro installed and its cert trusted; a pad created |
-| §8 USB/IP | `usbip-win2` ≥ 0.9.8.0 on the box, `usbip` here, a USB device to forward |
-| §2 | Both Android boxes, adb reachable |
-| §4 client rows | Phase 5 client, so not yet |
-| Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads |
+| §1 second NVENC session | The 4070 box with OBS or ShadowPlay/Instant Replay running; `tools/probe-windows` |
+| §3 Homatics link | An Ethernet cable to the Homatics, then `tools/check-phy.sh` |
+| §4 S row, §9 | The 4070 box and the Linux box wired, `tc` on the receiver, paired with `--max-bitrate-hint` |
+| §4 client rows, §10, §11, §13 | The Shield and the Homatics with the debug APK, an HDR panel in Game Mode |
+| §5, §6, §10 input | A real Steam game launched from Big Picture; an elevated window for UIPI |
+| §11, §14 audio, §15 mic | Steam Remote Play's "Steam Streaming Speakers/Microphone" devices installed |
+| §12 virtual display | The MikeTheTech Virtual Display Driver installed |
+| Phase 8 | Xbox Wireless Adapter (`045e:02e6`) and up to four pads, a headset |
 | Glass-to-glass (Phase 5) | High-speed camera, or an LED-on-input rig |
+
+Done and dropped from this table: §2 (both boxes enumerated), §7 (latency
+measured), and §8 (HIDMaestro and USB/IP both closed). §1's NvFBC row no longer
+needs `--enable-nvfbc`, because keyed `CreateEx` succeeded without it.

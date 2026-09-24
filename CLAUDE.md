@@ -72,7 +72,7 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   the network round-trip from perceived pointer latency. Biggest single
   responsiveness win in the system.
 - **Subframe readback is mandatory,** not an optimisation. With one NVENC and no
-  SFE, encode time (5–10ms) is a fixed floor. Emitting slices (HEVC) / tiles (AV1)
+  SFE, encode time (~9–11ms p99 at 4K on this card) is a fixed floor. Emitting slices (HEVC) / tiles (AV1)
   as they complete overlaps encode with transmit and is the only way to hide it.
 - **Never enable AV1 UHQ mode.** It buys compression via pre-analysis — exactly
   the latency we're eliminating. Stay on `TUNING_INFO_ULTRA_LOW_LATENCY`, P1–P4.
@@ -114,25 +114,29 @@ Any change touching a hot path ships a before/after **p99** from the
 instrumentation ring in the PR description. No numbers, no merge. This applies to
 changes that look free — the point is to catch the ones that aren't.
 
-## Latency budget (4K60 HDR, measured targets)
+## Latency budget (4K60 HDR)
 
-| Stage | Target | Notes |
+**Bold** figures are measured on env S; the rest are still estimates.
+
+| Stage | Figure | Notes |
 |---|---|---|
-| DWM composition | ~16.7ms | Only swapchain hooking may avoid this; NvFBC does not |
-| Capture acquire | 0.5–2ms | |
-| scRGB→P010 shader | 0.8–1.5ms | |
-| NVENC HEVC P1 ULL | 5–9ms | Fixed floor; one NVENC, so no SFE |
-| NVENC AV1 P1 ULL | 6–10ms | |
-| Packetize + send | <0.5ms | USO offload |
+| DWM composition | **~half the refresh interval** | ~3.5ms at 144Hz, ~8.3ms at 60Hz (below); nothing escapes it |
+| Capture acquire | **~0.4ms** | present→capture minus composition (below) |
+| scRGB→P010 shader | **0.08–0.13ms p99** | was estimated at 0.8–1.5ms |
+| NVENC HEVC P1 ULL | **9.2–11.3ms p99** | enc-unit, submit → each slice out. Fixed floor; one NVENC, so no SFE |
+| NVENC AV1 P1 ULL | **10.6ms p99** | enc-unit; 2×2 tiles |
+| Packetize | **14–21µs p99** | |
+| Send | **4.6–9.3ms p99** | includes the pacer queue; p95 0.9–3.6ms; the tail varies 7.7–52ms run to run, so it is not quotable yet |
 | Wire @ 1GbE | 1–3ms | |
 | Jitter buffer | 0–8ms | Adaptive |
 | MediaCodec decode | 8–16ms | |
 | Panel | 1–3 frames | Game Mode mandatory |
 
-Honest glass-to-glass: **60–100ms**, and that figure is now **pessimistic by
-roughly 9–13ms** — it was summed with composition at 16.7ms. It is not restated
-here as a new total, because every other line in the table except capture is
-still an estimate and a corrected sum of estimates is not a measurement. Sub-40ms
+Honest glass-to-glass: **60–100ms**. That figure was summed with composition at
+16.7ms, so it is **pessimistic by roughly 9–13ms** on that line, while encode came
+in at or just past the top of its estimate. It is not restated as a new total:
+the client half (jitter, decode, panel) is still an estimate, and a corrected sum
+of estimates is not a measurement. Sub-40ms
 claims elsewhere measure capture-to-wire, not what the eye sees; do not chase
 them.
 
@@ -155,22 +159,25 @@ DDA, WGC and NvFBC all delivered 123–133 distinct frames/sec — the refresh r
 That is measured, not assumed, and it is why swapchain hooking is no longer
 carried as a latency win.
 
-The two NVENC rows are **targets, not measurements** — they were written against
-the Blackwell encoder this project originally assumed and have not been measured
-on Ada. `HARDWARE_TESTING.md` §4 is where the real numbers land, and they replace
-these when they arrive.
+The server rows come from **single 5–30s runs** at 50–100 Mbps
+(`HARDWARE_TESTING.md` §4 has the per-run table and commits). They replace the
+Blackwell-era estimates this project started from (HEVC 5–9ms, AV1 6–10ms, shader
+0.8–1.5ms, packetize+send <0.5ms). Sustained-run numbers replace them in turn.
 
 Bitrate: HEVC 100–150 Mbps, AV1 70–100 Mbps. Shield's decoder caps out before
-1GbE does — treat ~150 Mbps as its practical ceiling.
+1GbE does — treat ~150 Mbps as its practical ceiling. **A device with no quirks
+entry is capped at 50 Mbps** (`DecoderQuirks.max_bitrate_hint`'s default). To test
+real 4K bitrates, pair with `fakeclient pair --max-bitrate-hint KBPS`, or seed the
+device's quirks.
 
 ## Crate layout
 
 ```
 sunburst-core/     protocol types, packets, timestamps, instrumentation. no I/O.
-sunburst-capture/  Capture trait + 5 backends
+sunburst-capture/  Capture trait + 3 backends (DDA, WGC, NvFBC)
 sunburst-encode/   NVENC FFI, HEVC + AV1 (10-bit) + H.264 (8-bit SDR)
 sunburst-audio/    WASAPI loopback + Opus
-sunburst-input/    ViGEm + SendInput + session helper
+sunburst-input/    HIDMaestro virtual pads + SendInput + desktop re-attach
 sunburst-net/      UDP, pacing, NACK, rate control
 sunburst-server/   orchestration; tokio lives here and only here
 sunburst-web/      management API: clients, sessions, config, apps. Cross-platform.
@@ -267,7 +274,8 @@ and a bitrate ceiling (`Hello.prefer_codec` / `max_bitrate_kbps`, see
 PROTOCOL.md) and set purely-local presentation prefs (jitter depth, cursor
 overlay, performance hint). Requests are advisory: `negotiate_codec` only honours
 a preferred codec the device's `codecs` bitmask already offers, and the bitrate
-is the minimum of the server setting, the codec ceiling, and the client's ask.
+is the minimum of the server setting, the codec ceiling, the decoder's quirks
+hint and the client's ask (`sunburst_net::rate::session_bitrate`, host-tested).
 
 **Breadth stops exactly where the settled decisions are.** These are not missing
 knobs to be added later; they are the architecture above:
@@ -390,10 +398,14 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   declined: the curve is undocumented and varies with pointer speed, and being
   subtly wrong reads as "the mouse feels off", which is close to unattributable.
   One checkbox per install beats a guess that drifts.
-- Steam Input grabs ViGEm pads and presents its own emulated device. Usually
+- Pads are HIDMaestro UMDF2 device nodes carrying reports built in Rust
+  (`sunburst-input/src/pad/`), not ViGEmBus. That reversed the Phase 2 plan
+  (`b7d971f`); `HARDWARE_TESTING.md` §8 keeps the reasoning.
+- Steam Input grabs virtual pads and presents its own emulated device. Usually
   transparent; occasionally double-enumerates. Test this path early — it presents
   as "controller does nothing in one specific game".
-- ViGEmBus is blocklisted by some kernel anti-cheats. `SendInput` sets
+- Kernel anti-cheats blocklist some virtual-pad drivers; ViGEmBus is a known
+  case, and HIDMaestro's driver is untested against them. `SendInput` sets
   `LLKHF_INJECTED`. Inherited support burden; nothing to be done.
 
 **Capture**
@@ -410,6 +422,28 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
 - ShadowPlay / Instant Replay / OBS open their own session on our single physical
   NVENC. The driver time-shares it and per-frame encode times get jittery in a way
   that looks like our bug. Warn at startup if another session is detected.
+- **A still desktop yields no frames.** DDA and WGC deliver only on change, so an
+  idle screen reads as a low frame rate and a stalled stream. Test with motion
+  (a 60 fps video, testufo) or the numbers mean nothing. Two wrong conclusions
+  came from this before it was written down.
+
+**NVENC**
+- The FFI overlays are transcribed from `nvEncodeAPI.h`, and a wrong size or
+  offset fails far from its cause. A 4-byte ME-hint struct that should have been
+  16 zeroed `tuningInfo` and made every init fail with code 8. A 4-aligned union
+  put the HDR SEI pointers 4 bytes off and crashed the driver. **Lock every
+  overlay field you touch with `offset_of!`/size asserts** against the 13.1
+  header; they run in the Windows CI test job.
+- Surface `nvEncGetLastErrorString` on failure. A bare `NV_ENC_ERR_INVALID_PARAM`
+  hides the one sentence that names the field.
+- 10-bit needs `inputBitDepth`/`outputBitDepth = NV_ENC_BIT_DEPTH_10` in SDK 13.x,
+  not `pixelBitDepthMinus8`. Without it init succeeds as 8-bit and
+  `nvEncRegisterResource` rejects the P010 surface.
+
+**Timing**
+- Windows timed waits round to the ~15.6ms default tick unless the process holds
+  `timeBeginPeriod(1)` (the server does, with Windows 11's hidden-window
+  opt-out). A pacer or governor that mysteriously wakes late is this first.
 
 **HDR**
 - Windows 10 HDR is a **global display toggle**, not per-app like Win11. It is
@@ -423,8 +457,14 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   `virtual_display` and `capture_output` config flags — the VDD is **consumed**
   (device enable/disable via SetupAPI + capture output selection), never authored
   or vendored, so there is no WDDM signing or GPL entanglement.
-- Capture yields scRGB linear FP16. Shader: normalise by 80 nits → BT.2020
-  primaries → PQ EOTF⁻¹ → 4:2:0 subsample. Get chroma siting right or UI text fringes.
+- On an HDR desktop, capture yields scRGB linear FP16. Shader: normalise by 80
+  nits → BT.2020 primaries → PQ EOTF⁻¹ → 4:2:0 subsample. Get chroma siting right
+  or UI text fringes. **Not every frame is FP16:** DDA on an SDR desktop yields
+  8-bit sRGB, which the shader must linearise first. HDR is detected from the
+  output's `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`, not from the scRGB
+  composition space. That wrong check once made colour correct on HDR desktops
+  only. The convert and colorimetry follow the captured state per frame, so an
+  HDR↔SDR flip rebuilds the encoder.
 
 **AV1 is not a flag on the HEVC path**
 - OBUs, not NAL units. No Annex-B start codes. Packetize on OBU boundaries;
@@ -432,6 +472,12 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
 - MediaCodec `csd-0` is an **av1C record**, not raw headers. Marker/version byte,
   `seq_profile`, `seq_level_idx`, `seq_tier`, bit-depth flags, then the sequence
   header OBU. Wrong av1C = decoder configures fine and silently outputs nothing.
+  **Build it from the parsed sequence header, never from config.** NVENC signals
+  High tier at 4K, and a hard-coded Main tier contradicted the OBU it wrapped.
+- Under `enableSubFrameWrite`, NVENC keeps re-reporting stale tile bytes after
+  the frame is complete, so `bitstreamSizeInBytes` grows past the real frame.
+  **Bound the read by the OBUs**: stop at the tile group whose `tg_end` is the last
+  tile. Draining by byte count once sent frames 16× over budget.
 - Tiles replace slices for subframe packetization. Start at 2×2 for 4K. The
   `slices` setting counts units per frame for every codec (4 = 2×2 tiles); the
   grid comes from the AV1 spec's uniform spacing, which at 4K can give fewer

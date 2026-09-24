@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Input injection: ViGEm, scancode `SendInput`, and desktop re-attach.
+//! Input injection: HIDMaestro virtual pads, scancode `SendInput`, and desktop
+//! re-attach.
 //!
 //! # Not `#![cfg(windows)]` at the crate root
 //!
