@@ -1116,6 +1116,20 @@ server on the 4070, wired LAN.
 - [ ] **Pairs from the TV.** Arm pairing in the web UI; the app shows a PIN; type
       it into the UI; the client stores the secret and reconnects paired after a
       restart. A wrong PIN fails to stream (the derived secrets differ).
+- [ ] **The app grid.** Sunburst opens on a grid of the server's apps with their
+      box art, Desktop first, D-pad navigable (the focused tile outlined and
+      raised). Reopen it: the art comes from the cache, with no transfer. Replace
+      one app's art in the web UI and reopen: only that image is fetched again,
+      and the old file is evicted. With more apps than fit one reliable frame
+      (~40 long names) the grid still shows them all.
+- [ ] **Launch, then stream.** Choosing an app launches it on the server, then
+      the stream opens on it; Back returns to the grid. "Already running" still
+      streams, after a toast; an unknown app does not. Desktop streams without
+      launching anything.
+- [ ] **A settings change reconnects.** Change the codec in settings: the
+      client stops and reconnects on a fresh endpoint, and the server hears it at
+      once. It used to lose the reconnect's `Hello` to the old session's
+      reliable state; now the newer epoch restarts it.
 - [ ] **Streams and decodes.** 4K60 to the `SurfaceView`: HEVC on the Shield, AV1
       on the Homatics. Watch for the av1C silent-failure (configures, outputs
       nothing) — a black screen with no decoder error is that.
@@ -1231,8 +1245,9 @@ with the MikeTheTech Virtual Display Driver installed.
       unsupported mode is refused (CDS_TEST) rather than blanking the screen.
 - [ ] **Per-app profile.** Launch a game whose entry has a bitrate/codec
       override; the live stream uses it, not the global default (codec only
-      applies when the game is launched before the client connects). The game
-      exits and its prep is undone (the `try_wait` reap).
+      applies when the game is launched before the client connects — which is
+      what launching from the TV's app grid does). The game exits and its prep
+      is undone (the watcher reaps it).
 - [ ] **Virtual display** (opt-in `virtual_display`). With the VDD installed, the
       session enables it and — with `capture_output` set to its DXGI index —
       streams a client-native-resolution virtual display; the physical display is

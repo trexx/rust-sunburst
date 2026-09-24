@@ -553,9 +553,15 @@ and a fast user switch; input reaches an elevated window.
   one interactive session by design, so a second user is not something it could
   serve anyway.
 
-Box art is **deferred rather than dropped** — the control channel carries names
-and ids only, and nothing forecloses adding an HTTP fetch once there is something
-to fetch.
+**Box art and the TV's app grid landed.** Art is uploaded in the web UI
+(downscaled in the browser), stored per app, and sent to the TV over the
+authenticated control channel, not HTTP. The client already holds that channel,
+keyed with its pairing secret; an HTTP fetch would need a second, client-facing
+auth scheme (PROTOCOL.md has the reasoning). The TV caches art by content digest.
+Its launcher screen is now a D-pad grid that launches the app on the server
+before streaming, which is also what per-app codec overrides need. The app list
+is paged, since a long list used to be dropped whole for not fitting one frame.
+Box validation is `HARDWARE_TESTING.md` §5/§10.
 
 ---
 

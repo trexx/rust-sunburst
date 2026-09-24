@@ -188,8 +188,9 @@ sunburst-gip-bridge/ vendored xow/xone C++ (MT7612U radio + GIP + wired) + libus
                    + shim, behind a C FFI Rust calls. Host = pure-Rust stub; the
                    real path is #[cfg(all(target_os="android", feature="vendored"))].
 sunburst-android/  cdylib + JNI shim
-android/           Gradle project; Kotlin owns Activity + SurfaceView, and
-                   forwards the input and platform queries with no NDK equivalent
+android/           Gradle project; Kotlin owns the Activities (app grid, stream,
+                   pairing, settings) + SurfaceView, and forwards the input and
+                   platform queries with no NDK equivalent
 web/               Vite + React + TS management UI
 tools/             development tools: fakeclient, probe-windows, check-phy.sh
 ```

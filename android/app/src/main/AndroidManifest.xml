@@ -25,17 +25,24 @@
         android:label="Sunburst"
         android:supportsRtl="true">
 
-        <!-- The streaming client: the leanback launcher entry. -->
+        <!-- The app grid: the leanback launcher entry. Choosing an app launches
+             it on the server and opens the stream. -->
         <activity
-            android:name=".StreamActivity"
+            android:name=".LauncherActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden"
             android:label="Sunburst">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The streaming client, opened from the grid. -->
+        <activity
+            android:name=".StreamActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:label="Sunburst" />
 
         <!-- Pairing screen, opened by the stream activity when unpaired. -->
         <activity
