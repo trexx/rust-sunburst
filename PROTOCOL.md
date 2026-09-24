@@ -391,9 +391,11 @@ Server → client:
   ...  chunk
   ```
 - `CursorPosition` — `u16 x, u16 y` (0–65535, normalised to the captured
-  monitor), `u8 visible`. A correction, not the primary source: the client moves
-  its own cursor from its own input, and this arrives when the server-observed
-  position disagrees (a warp, or absolute mode). Throttled to ≤10/s.
+  output's own rectangle, wherever it sits on the virtual desktop), `u8
+  visible` (false when the cursor is hidden *or* off the captured output). The
+  server's observation of the pointer. It is sent when that changes: at once
+  for visibility, at most every 100 ms for motion, and never while the pointer
+  is still, so a stopped pointer's resting place always lands within 100 ms.
 - `SecureDesktop` — `u8 active`. Capture unavailable (UAC, lock screen, DRM);
   the client shows a placeholder rather than a frozen frame, and `active = 0`
   ends it.

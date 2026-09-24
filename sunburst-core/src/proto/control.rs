@@ -476,10 +476,10 @@ pub enum ServerControl {
     /// again after every rebuild; see [`CodecPrivate`].
     CodecPrivate(CodecPrivate),
     CursorShape(CursorChunk),
-    /// Sent when the server-observed pointer position should override the
-    /// client's own — a warp, or a switch into absolute mode. Throttled.
+    /// The server-observed pointer. Sent when it changes: visibility at once,
+    /// motion at most every 100 ms, nothing while it is still.
     CursorPosition {
-        /// 0–65535, normalised to the captured monitor.
+        /// 0–65535, normalised to the captured output's rectangle.
         x: u16,
         y: u16,
         visible: bool,

@@ -38,6 +38,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // capture governor's flush deadline, the send thread's idle park) would
     // otherwise round up to the ~15.6 ms default tick.
     let _timer = realtime::TimerResolution::one_ms();
+    // Per-monitor DPI awareness before anything reads a coordinate: the cursor
+    // poller and the capture backends all assume physical pixels, and the
+    // capture thread used to be the first to ask, after the poller had started.
+    sunburst_capture::select::set_dpi_awareness();
     let store = Store::open_default()?;
     let config_dir = store.dir().to_path_buf();
 

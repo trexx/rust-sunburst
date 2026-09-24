@@ -37,6 +37,7 @@ use crate::cursor::CursorPoller;
 use crate::display::{self, DisplayGuard, EppGuard, VirtualDisplay};
 use crate::mic_pipeline::MicPipeline;
 use crate::pipeline::{CodecHeaders, Pipeline, PipelineParams, StreamShared, retransmit_ring};
+use sunburst_net::cursor::PositionThrottle;
 
 /// The live-session view the web UI reads and the disconnect it can request.
 /// Shared between the manager (on the endpoint thread) and the `Host` (on the
@@ -116,7 +117,9 @@ struct Active {
     headers_sent: bool,
     secure_sent: bool,
     cursor: CursorPoller,
-    last_cursor_ms: u64,
+    cursor_throttle: PositionThrottle,
+    /// The output captured, re-read on each rebuild for the cursor's bounds.
+    output: OutputSelect,
 }
 
 pub struct SessionManager {
@@ -266,6 +269,12 @@ impl StreamControl for SessionManager {
         // a promise. The desktop's real state decides the colour path per frame,
         // and DXGI can lag a toggle it has only just been told about, so a
         // client configures from what each encoder build reports, not from this.
+        // The pointer is reported against the captured output, wherever it sits
+        // on the virtual desktop.
+        let mut cursor = CursorPoller::new();
+        if let Ok(info) = sunburst_capture::output::output_info(output) {
+            cursor.set_bounds(info.desktop);
+        }
         let hdr_mastering = if want_hdr {
             sunburst_capture::output::output_info(output)
                 .ok()
@@ -389,8 +398,9 @@ impl StreamControl for SessionManager {
             retransmit: retransmit_tx,
             headers_sent: false,
             secure_sent: false,
-            cursor: CursorPoller::new(),
-            last_cursor_ms: 0,
+            cursor,
+            cursor_throttle: PositionThrottle::new(),
+            output,
         });
 
         // The clock facts let the client attribute one-way delay.
@@ -490,6 +500,12 @@ impl StreamControl for SessionManager {
         // rebuild, which sends a fresh set down the same channel).
         while let Ok(headers) = a.headers_rx.try_recv() {
             a.headers_sent = true;
+            // A rebuild may follow a mode change: re-read where the captured
+            // output now sits, so the pointer is reported against it.
+            if let Ok(info) = sunburst_capture::output::output_info(a.output) {
+                a.cursor.set_bounds(info.desktop);
+                a.cursor_throttle.reset();
+            }
             out.push(Outbound::Control {
                 client: a.client,
                 message: ServerControl::CodecPrivate(CodecPrivate {
@@ -514,9 +530,9 @@ impl StreamControl for SessionManager {
             });
         }
 
-        // Cursor: the shape (reliably) whenever it changes, the position
-        // throttled to ~10/s. The client renders it, so it never rides the
-        // video and never re-encodes.
+        // Cursor: the shape (reliably) whenever it changes, the position when
+        // it changes, at most ~10/s for motion. The client renders it, so it
+        // never rides the video and never re-encodes.
         let update = a.cursor.poll();
         for chunk in update.shape {
             out.push(Outbound::Control {
@@ -524,10 +540,7 @@ impl StreamControl for SessionManager {
                 message: ServerControl::CursorShape(chunk),
             });
         }
-        let now = now_ms();
-        if now.saturating_sub(a.last_cursor_ms) >= 100 {
-            a.last_cursor_ms = now;
-            let (x, y, visible) = update.position;
+        if let Some((x, y, visible)) = a.cursor_throttle.offer(update.position, now_ms()) {
             out.push(Outbound::Control {
                 client: a.client,
                 message: ServerControl::CursorPosition { x, y, visible },

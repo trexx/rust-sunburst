@@ -14,6 +14,7 @@
 //! video.
 
 pub mod audio;
+pub mod cursor;
 pub mod endpoint;
 pub mod governor;
 pub mod handler;

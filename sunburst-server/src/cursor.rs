@@ -23,13 +23,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SM_CXSCREEN, SM_CYSCREEN,
 };
 
+use sunburst_net::cursor::normalise;
+
 /// One poll's worth of cursor state.
 pub struct CursorUpdate {
     /// Chunks of a new shape (empty if the shape did not change). A hidden
     /// cursor is a single chunk with `width == 0`.
     pub shape: Vec<CursorChunk>,
-    /// The pointer position, normalised to the primary monitor (0..65535), and
-    /// whether it is visible.
+    /// The pointer position, normalised to the captured output (0..65535), and
+    /// whether it is visible *on that output*.
     pub position: (u16, u16, bool),
 }
 
@@ -38,8 +40,9 @@ pub struct CursorPoller {
     last_cursor: isize,
     shape_id: u32,
     hidden_sent: bool,
-    screen_w: i32,
-    screen_h: i32,
+    /// The captured output, `[left, top, right, bottom]` in virtual-desktop
+    /// pixels. The pointer is reported relative to it.
+    bounds: [i32; 4],
 }
 
 impl Default for CursorPoller {
@@ -49,21 +52,22 @@ impl Default for CursorPoller {
 }
 
 impl CursorPoller {
+    /// A poller reporting against the primary monitor at the origin, until
+    /// [`set_bounds`](Self::set_bounds) names the captured output.
     pub fn new() -> CursorPoller {
         // SAFETY: GetSystemMetrics is a pure query.
-        let (screen_w, screen_h) = unsafe {
-            (
-                GetSystemMetrics(SM_CXSCREEN).max(1),
-                GetSystemMetrics(SM_CYSCREEN).max(1),
-            )
-        };
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
         CursorPoller {
             last_cursor: 0,
             shape_id: 0,
             hidden_sent: false,
-            screen_w,
-            screen_h,
+            bounds: [0, 0, w.max(1), h.max(1)],
         }
+    }
+
+    /// The captured output's rectangle, from `sunburst_capture::output`.
+    pub fn set_bounds(&mut self, bounds: [i32; 4]) {
+        self.bounds = bounds;
     }
 
     /// Poll once. Cheap unless the cursor shape changed.
@@ -110,13 +114,10 @@ impl CursorPoller {
             }];
         }
 
-        let x =
-            (ci.ptScreenPos.x.clamp(0, self.screen_w) as u32 * 65535 / self.screen_w as u32) as u16;
-        let y =
-            (ci.ptScreenPos.y.clamp(0, self.screen_h) as u32 * 65535 / self.screen_h as u32) as u16;
+        let (x, y, on_output) = normalise(ci.ptScreenPos.x, ci.ptScreenPos.y, self.bounds);
         CursorUpdate {
             shape,
-            position: (x, y, showing),
+            position: (x, y, showing && on_output),
         }
     }
 }
