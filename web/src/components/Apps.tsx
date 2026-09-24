@@ -1,8 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
-import { api } from "../api";
-import type { AppEntry, Status } from "../api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ART_MAX_BYTES, api } from "../api";
+import type { AppEntry, ArtInfo, Status } from "../api";
+
+/** Box art is shown on the TV as a 2:3 tile; nothing bigger is worth sending. */
+const ART_MAX_W = 600;
+const ART_MAX_H = 900;
+
+/** Draw `file` no larger than the tile needs and encode it small enough for the
+ *  server: WebP (JPEG where the browser cannot encode WebP), stepping the
+ *  quality down until it fits. The server never decodes an image; this is the
+ *  one place one is resized. */
+async function prepareArt(file: File): Promise<Blob> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, ART_MAX_W / bitmap.width, ART_MAX_H / bitmap.height);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("this browser cannot draw to a canvas");
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+
+  const encode = (type: string, quality: number) =>
+    new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, type, quality));
+  for (const quality of [0.85, 0.75, 0.6, 0.45, 0.3]) {
+    let blob = await encode("image/webp", quality);
+    // A browser that cannot write WebP hands back PNG instead; use JPEG.
+    if (!blob || blob.type !== "image/webp") blob = await encode("image/jpeg", quality);
+    if (blob && blob.size <= ART_MAX_BYTES) return blob;
+  }
+  throw new Error("could not make this image small enough");
+}
 
 const BLANK: AppEntry = {
   id: 0,
@@ -32,10 +62,33 @@ export function Apps({
   const [apps, setApps] = useState<AppEntry[]>([]);
   const [editing, setEditing] = useState<AppEntry | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Thumbnails by app id, as object URLs; the digest says when to refetch. The
+  // ref is the cache `refresh` reads (a stable callback would otherwise see
+  // only the first, empty map); the state is what renders.
+  const cache = useRef(new Map<number, { digest: string; url: string }>());
+  const [thumbs, setThumbs] = useState(cache.current);
+  const artFor = useRef<number | null>(null);
+  const picker = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
     try {
       setApps(await api.get<AppEntry[]>("/api/apps"));
+      const art = await api.get<ArtInfo[]>("/api/art");
+      const next = new Map<number, { digest: string; url: string }>();
+      for (const a of art) {
+        const known = cache.current.get(a.app_id);
+        if (known && known.digest === a.digest) {
+          next.set(a.app_id, known);
+          continue;
+        }
+        const blob = await api.getBlob(`/api/apps/${a.app_id}/art`);
+        if (blob) next.set(a.app_id, { digest: a.digest, url: URL.createObjectURL(blob) });
+      }
+      for (const [id, t] of cache.current) {
+        if (next.get(id) !== t) URL.revokeObjectURL(t.url);
+      }
+      cache.current = next;
+      setThumbs(next);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -44,6 +97,20 @@ export function Apps({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Object URLs hold their image until revoked.
+  useEffect(
+    () => () => {
+      for (const t of cache.current.values()) URL.revokeObjectURL(t.url);
+    },
+    [],
+  );
+
+  async function uploadArt(file: File | undefined) {
+    const id = artFor.current;
+    if (!file || id === null) return;
+    await act(async () => api.putBlob(`/api/apps/${id}/art`, await prepareArt(file)));
+  }
 
   async function act(fn: () => Promise<unknown>) {
     setError(null);
@@ -57,6 +124,10 @@ export function Apps({
   }
 
   const running = status?.running_app ?? null;
+  const chooseArt = (id: number) => {
+    artFor.current = id;
+    picker.current?.click();
+  };
   // An untracked app (a URI with nothing to watch) is replaced by the next
   // launch, so it does not disable the buttons.
   const blocking = running !== null && running.tracking !== "untracked";
@@ -75,6 +146,7 @@ export function Apps({
           <table>
             <thead>
               <tr>
+                <th>Art</th>
                 <th>Name</th>
                 <th>Command</th>
                 <th />
@@ -83,6 +155,13 @@ export function Apps({
             <tbody>
               {apps.map((a) => (
                 <tr key={a.id}>
+                  <td>
+                    {thumbs.has(a.id) ? (
+                      <img className="thumb" src={thumbs.get(a.id)!.url} alt="" />
+                    ) : (
+                      <div className="thumb" />
+                    )}
+                  </td>
                   <td>
                     {a.name}
                     {running?.app_id === a.id && (
@@ -100,6 +179,16 @@ export function Apps({
                       Launch
                     </button>
                     <button onClick={() => setEditing(a)}>Edit</button>
+                    <button onClick={() => chooseArt(a.id)}>
+                      {thumbs.has(a.id) ? "Replace art" : "Add art"}
+                    </button>
+                    {thumbs.has(a.id) && (
+                      <button
+                        onClick={() => void act(() => api.del(`/api/apps/${a.id}/art`))}
+                      >
+                        Remove art
+                      </button>
+                    )}
                     <button
                       className="danger"
                       onClick={() => void act(() => api.del(`/api/apps/${a.id}`))}
@@ -112,6 +201,22 @@ export function Apps({
             </tbody>
           </table>
         )}
+
+        <input
+          ref={picker}
+          type="file"
+          accept="image/*"
+          hidden
+          onChange={(e) => {
+            void uploadArt(e.target.files?.[0]);
+            e.target.value = "";
+          }}
+        />
+        <p className="hint">
+          Box art shows on the TV's app grid. Any image works: it is scaled to at
+          most {ART_MAX_W}×{ART_MAX_H} and compressed in the browser before it is
+          sent.
+        </p>
 
         <div className="row">
           <button onClick={() => setEditing({ ...BLANK })}>Add application</button>

@@ -282,3 +282,13 @@ details.advanced > summary {
   font-weight: 600;
   list-style: revert;
 }
+
+/* Box-art thumbnails in the app table, the TV tile's 2:3. */
+.thumb {
+  display: block;
+  width: 40px;
+  height: 60px;
+  object-fit: cover;
+  border-radius: var(--radius);
+  background: var(--border);
+}

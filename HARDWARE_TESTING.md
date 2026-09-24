@@ -579,6 +579,11 @@ the part that a fake cannot answer.
 - [ ] **Terminate ends the whole tree** (the job), plus any `wait_process`
       started since the launch. A same-named process that was already running
       is left alone.
+- [ ] **Box art uploads from the UI.** Add art to an app from a large photo
+      and from a small PNG: each arrives at most 600×900, under 512 KiB, as WebP
+      (or JPEG in a browser that cannot write WebP), and shows as a thumbnail.
+      Replace and remove work, and survive a server restart. A GIF is refused
+      with a message, not accepted and then failing on the TV.
 - [ ] **A server restart does not kill the game.** Restart from the UI mid-game:
       the game keeps running (the job has no kill-on-close). The price, stated:
       after the restart it runs untracked and its prep is not undone.

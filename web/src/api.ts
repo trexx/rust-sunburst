@@ -32,6 +32,21 @@ export class ApiError extends Error {
   }
 }
 
+/** The error for a refused request, with the server's own message. */
+async function failure(response: Response): Promise<ApiError> {
+  // The server sends {"error": "..."} for everything it refuses. Falling back
+  // to the status text matters for the cases it cannot, such as a proxy
+  // returning HTML.
+  let message = response.statusText;
+  try {
+    const parsed = await response.json();
+    if (parsed && typeof parsed.error === "string") message = parsed.error;
+  } catch {
+    // Not JSON. The status text is the best available answer.
+  }
+  return new ApiError(response.status, message);
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -48,19 +63,7 @@ async function request<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
-  if (!response.ok) {
-    // The server sends {"error": "..."} for everything it refuses. Falling back
-    // to the status text matters for the cases it cannot, such as a proxy
-    // returning HTML.
-    let message = response.statusText;
-    try {
-      const parsed = await response.json();
-      if (parsed && typeof parsed.error === "string") message = parsed.error;
-    } catch {
-      // Not JSON. The status text is the best available answer.
-    }
-    throw new ApiError(response.status, message);
-  }
+  if (!response.ok) throw await failure(response);
 
   if (response.status === 204 || response.headers.get("content-length") === "0") {
     return undefined as T;
@@ -69,11 +72,35 @@ async function request<T>(
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+/** Upload raw bytes (an image), returning the parsed JSON answer. */
+async function putBlob<T>(path: string, blob: Blob): Promise<T> {
+  const response = await fetch(path, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${getToken()}`, "Content-Type": blob.type },
+    body: blob,
+  });
+  if (!response.ok) throw await failure(response);
+  return (await response.json()) as T;
+}
+
+/** Fetch raw bytes, or `null` for a 404. An `<img>` cannot send the bearer
+ *  token, so images are fetched here and shown through an object URL. */
+async function getBlob(path: string): Promise<Blob | null> {
+  const response = await fetch(path, {
+    headers: { Authorization: `Bearer ${getToken()}` },
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw await failure(response);
+  return await response.blob();
+}
+
 export const api = {
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body ?? {}),
   put: <T>(path: string, body: unknown) => request<T>("PUT", path, body),
   del: <T>(path: string) => request<T>("DELETE", path),
+  putBlob,
+  getBlob,
 };
 
 // ---------------------------------------------------------------- shapes
@@ -167,6 +194,18 @@ export interface AppEntry {
   /** The game's own executable, for an entry that hands off to it. */
   wait_process: string | null;
 }
+
+/** An app's box art, as the server stores it and the TV caches it. */
+export interface ArtInfo {
+  app_id: number;
+  /** Hex of the content digest the TV caches by. */
+  digest: string;
+  len: number;
+  format: string;
+}
+
+/** The server's limit on a stored image. */
+export const ART_MAX_BYTES = 512 * 1024;
 
 export type Codec = "auto" | "hevc" | "av1" | "h264";
 export type RateControl = "cbr" | "vbr";
