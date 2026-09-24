@@ -12,6 +12,7 @@
 //! the control plane; a `spawn_blocking` round trip would cost more than the
 //! write.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ use crate::metrics::MetricsRecord;
 use crate::pairing::{Pairing, PairingError};
 use crate::random;
 use crate::store::{Store, StoreError};
-use sunburst_core::proto::SessionKey;
+use sunburst_core::proto::{ART_MAX_BYTES, ArtFormat, ArtRef, SessionKey};
 
 /// Request, reduced to what routing actually needs.
 #[derive(Clone, Debug, Default)]
@@ -58,6 +59,16 @@ impl ApiRequest {
             method: "PUT".into(),
             path: path.into(),
             body: serde_json::to_vec(&body).expect("test body serialises"),
+            ..Default::default()
+        }
+    }
+
+    /// A raw body, as an image upload sends it.
+    pub fn put_raw(path: &str, body: &[u8]) -> ApiRequest {
+        ApiRequest {
+            method: "PUT".into(),
+            path: path.into(),
+            body: body.to_vec(),
             ..Default::default()
         }
     }
@@ -133,11 +144,18 @@ struct Inner {
     pairing: Pairing,
 }
 
+/// One app's box art, held in memory: the control channel answers from here,
+/// never from disk, because the endpoint thread also receives input.
+type ArtIndex = HashMap<u32, (ArtRef, Arc<[u8]>)>;
+
 /// Everything the API operates on.
 pub struct AppState {
     store: Store,
     host: Arc<dyn Host>,
     inner: Mutex<Inner>,
+    /// Separate from `inner`, so an art lookup on the endpoint thread never
+    /// waits behind a config save.
+    art: Mutex<ArtIndex>,
 }
 
 impl AppState {
@@ -157,10 +175,19 @@ impl AppState {
 
         let next_client_id = clients.iter().map(|c| c.id).max().map_or(1, |m| m + 1);
         let auth = Auth::from_config(&config.web);
+        // Art for apps that still exist and that is still something the client
+        // can decode; anything else on disk is ignored rather than served.
+        let art: ArtIndex = store
+            .load_art()?
+            .into_iter()
+            .filter(|(id, _)| config.app(*id).is_some())
+            .filter_map(|(id, bytes)| ArtRef::of(&bytes).map(|r| (id, (r, bytes.into()))))
+            .collect();
 
         Ok(AppState {
             store,
             host,
+            art: Mutex::new(art),
             inner: Mutex::new(Inner {
                 config,
                 clients,
@@ -316,7 +343,22 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
-    /// The catalogue as the client sees it: names and ids, nothing else.
+    /// An app's box art, for the control channel.
+    pub fn art(&self, app_id: u32) -> Option<(ArtRef, Arc<[u8]>)> {
+        self.art.lock().expect("not poisoned").get(&app_id).cloned()
+    }
+
+    /// What the app list says about an app's art.
+    pub fn art_ref(&self, app_id: u32) -> Option<ArtRef> {
+        self.art
+            .lock()
+            .expect("not poisoned")
+            .get(&app_id)
+            .map(|(r, _)| *r)
+    }
+
+    /// The catalogue as the client sees it: names and ids. Art is attached by
+    /// the control handler from [`art_ref`](Self::art_ref).
     pub fn app_list(&self) -> Vec<AppListing> {
         self.inner
             .lock()
@@ -332,8 +374,8 @@ impl AppState {
     }
 }
 
-/// What the client is told about an app. Names and ids only; box art is a later
-/// phase and the control channel is the wrong carrier for it anyway.
+/// What the client is told about an app, before its art is attached. The art
+/// itself travels the control channel (`sunburst_core::proto::art`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppListing {
     pub id: u32,
@@ -433,6 +475,10 @@ pub fn dispatch(state: &AppState, req: &ApiRequest, now: u64) -> ApiResponse {
         ("PUT", ["api", "apps", id]) => update_app(state, req, id),
         ("DELETE", ["api", "apps", id]) => delete_app(state, id),
         ("POST", ["api", "apps", id, "launch"]) => launch_app(state, id),
+        ("GET", ["api", "apps", id, "art"]) => get_art(state, id),
+        ("PUT", ["api", "apps", id, "art"]) => put_art(state, req, id),
+        ("DELETE", ["api", "apps", id, "art"]) => delete_art(state, id),
+        ("GET", ["api", "art"]) => list_art(state),
         ("POST", ["api", "apps", "terminate"]) => terminate_app(state),
 
         ("GET", ["api", "sessions"]) => sessions(state),
@@ -681,7 +727,121 @@ fn delete_app(state: &AppState, id: &str) -> ApiResponse {
         return ApiResponse::error(400, e);
     }
     inner.config = candidate;
+    // Its art goes with it: an id is never reused, so a stale image would only
+    // ever be dead weight.
+    state.art.lock().expect("not poisoned").remove(&id);
+    let _ = state.store.delete_art(id);
     ApiResponse::empty(204)
+}
+
+/// What the UI is told about an app's art.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct ArtInfo {
+    pub app_id: u32,
+    /// Hex of the digest the TV caches by.
+    pub digest: String,
+    pub len: u32,
+    pub format: String,
+}
+
+impl ArtInfo {
+    fn of(app_id: u32, r: &ArtRef) -> ArtInfo {
+        ArtInfo {
+            app_id,
+            digest: r.digest.iter().map(|b| format!("{b:02x}")).collect(),
+            len: r.len,
+            format: r.format.extension().into(),
+        }
+    }
+}
+
+fn app_exists(state: &AppState, id: u32) -> bool {
+    state
+        .inner
+        .lock()
+        .expect("not poisoned")
+        .config
+        .app(id)
+        .is_some()
+}
+
+fn get_art(state: &AppState, id: &str) -> ApiResponse {
+    let Some(id) = parse_id(id) else {
+        return ApiResponse::error(400, "app id must be a number");
+    };
+    match state.art(id) {
+        Some((r, bytes)) => ApiResponse {
+            status: 200,
+            content_type: r.format.content_type(),
+            body: bytes.to_vec(),
+        },
+        None => ApiResponse::error(404, "no art for this app"),
+    }
+}
+
+/// The body is the image itself. Its format is read from its bytes — never from
+/// a header or a name, which say only what someone claimed — and the server
+/// does not decode it: the web UI downscales before uploading, and the TV is
+/// what decodes.
+fn put_art(state: &AppState, req: &ApiRequest, id: &str) -> ApiResponse {
+    let Some(id) = parse_id(id) else {
+        return ApiResponse::error(400, "app id must be a number");
+    };
+    if !app_exists(state, id) {
+        return ApiResponse::error(404, "no such app");
+    }
+    if req.body.len() > ART_MAX_BYTES {
+        return ApiResponse::error(
+            413,
+            format!("images are limited to {} KiB", ART_MAX_BYTES / 1024),
+        );
+    }
+    if ArtFormat::sniff(&req.body).is_none() {
+        return ApiResponse::error(415, "not a PNG, JPEG or WebP image");
+    }
+    let Some(r) = ArtRef::of(&req.body) else {
+        return ApiResponse::error(400, "empty image");
+    };
+    if let Err(e) = state.store.save_art(id, &req.body) {
+        return ApiResponse::error(500, e);
+    }
+    state
+        .art
+        .lock()
+        .expect("not poisoned")
+        .insert(id, (r, req.body.clone().into()));
+    ApiResponse::ok(&ArtInfo::of(id, &r))
+}
+
+fn delete_art(state: &AppState, id: &str) -> ApiResponse {
+    let Some(id) = parse_id(id) else {
+        return ApiResponse::error(400, "app id must be a number");
+    };
+    if state
+        .art
+        .lock()
+        .expect("not poisoned")
+        .remove(&id)
+        .is_none()
+    {
+        return ApiResponse::error(404, "no art for this app");
+    }
+    match state.store.delete_art(id) {
+        Ok(()) => ApiResponse::empty(204),
+        Err(e) => ApiResponse::error(500, e),
+    }
+}
+
+fn list_art(state: &AppState) -> ApiResponse {
+    let mut list: Vec<ArtInfo> = state
+        .art
+        .lock()
+        .expect("not poisoned")
+        .iter()
+        .map(|(id, (r, _))| ArtInfo::of(*id, r))
+        .collect();
+    list.sort_by_key(|a| a.app_id);
+    ApiResponse::ok(&list)
 }
 
 fn launch_app(state: &AppState, id: &str) -> ApiResponse {

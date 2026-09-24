@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! On-disk state: `config.json` and `clients.json`.
+//! On-disk state: `config.json`, `clients.json`, and `art/<app id>`.
 //!
 //! **Two files, not one.** Settings are rendered in the UI and can appear in a
 //! log; pairing secrets must do neither. Keeping them apart means the config can
@@ -19,6 +19,9 @@ use crate::config::{Config, ConfigError};
 
 const CONFIG_FILE: &str = "config.json";
 const CLIENTS_FILE: &str = "clients.json";
+/// Box art, one file per app, named by the app id. No extension: the format is
+/// read from the bytes, never from a name.
+const ART_DIR: &str = "art";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -133,6 +136,46 @@ impl Store {
     pub fn save_clients(&self, clients: &[PairedClient]) -> Result<(), StoreError> {
         let json = serde_json::to_string_pretty(clients).expect("clients always serialise");
         write_atomic(&self.clients_path(), json.as_bytes(), true)
+    }
+
+    fn art_path(&self, app_id: u32) -> PathBuf {
+        self.dir.join(ART_DIR).join(app_id.to_string())
+    }
+
+    /// Store an app's box art, replacing any it had. Checked by the caller.
+    pub fn save_art(&self, app_id: u32, bytes: &[u8]) -> Result<(), StoreError> {
+        write_atomic(&self.art_path(app_id), bytes, false)
+    }
+
+    /// Remove an app's box art. Not an error if it had none.
+    pub fn delete_art(&self, app_id: u32) -> Result<(), StoreError> {
+        let path = self.art_path(app_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StoreError::Io { path, source }),
+        }
+    }
+
+    /// Every stored image, by app id. Files that are not named by an id (a
+    /// leftover `.tmp`, something put there by hand) are ignored.
+    pub fn load_art(&self) -> Result<Vec<(u32, Vec<u8>)>, StoreError> {
+        let dir = self.dir.join(ART_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(StoreError::Io { path: dir, source }),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            let path = entry.path();
+            let bytes = fs::read(&path).map_err(|source| StoreError::Io { path, source })?;
+            out.push((id, bytes));
+        }
+        Ok(out)
     }
 }
 
@@ -399,5 +442,28 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "secrets readable by others: {mode:o}");
+    }
+
+    #[test]
+    fn art_round_trips_and_strays_are_ignored() {
+        let dir = Temp::new("art");
+        let store = Store::at(&dir.0);
+        assert!(store.load_art().expect("load").is_empty(), "none yet");
+        store.save_art(3, b"three").expect("save");
+        store.save_art(7, b"seven").expect("save");
+        store.save_art(3, b"three again").expect("replace");
+        fs::write(dir.0.join("art").join("notes.txt"), b"x").expect("stray");
+        let mut art = store.load_art().expect("load");
+        art.sort();
+        assert_eq!(
+            art,
+            vec![(3, b"three again".to_vec()), (7, b"seven".to_vec())]
+        );
+        store.delete_art(3).expect("delete");
+        store.delete_art(3).expect("deleting twice is fine");
+        assert_eq!(
+            store.load_art().expect("load"),
+            vec![(7, b"seven".to_vec())]
+        );
     }
 }

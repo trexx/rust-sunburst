@@ -572,6 +572,88 @@ fn a_host_failure_becomes_a_500_not_a_panic() {
     assert_eq!(r.status, 500, "{}", body_text(&r));
 }
 
+// ---------------------------------------------------------------- box art
+
+fn png(extra: usize) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.resize(8 + extra, 0x42);
+    v
+}
+
+#[test]
+fn art_uploads_serves_lists_and_deletes() {
+    let h = Harness::new("art");
+    let app = h.add_app("Game");
+    let path = format!("/api/apps/{}/art", app.id);
+    let image = png(1_000);
+
+    let r = h.send(ApiRequest::put_raw(&path, &image));
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    let info: ArtInfo = r.parse().expect("art info");
+    assert_eq!(
+        (info.app_id, info.len, info.format.as_str()),
+        (app.id, 1_008, "png")
+    );
+    assert_eq!(info.digest.len(), 32);
+
+    let r = h.send(ApiRequest::get(&path));
+    assert_eq!((r.status, r.content_type), (200, "image/png"));
+    assert_eq!(r.body, image);
+
+    let listed: Vec<ArtInfo> = h.send(ApiRequest::get("/api/art")).parse().expect("list");
+    assert_eq!(listed, vec![info]);
+    // What the TV's list carries is the same digest.
+    let r = h.state.art_ref(app.id).expect("indexed");
+    assert_eq!(r.digest, sunburst_core::proto::art_digest(&image));
+
+    assert_eq!(h.send(ApiRequest::delete(&path)).status, 204);
+    assert_eq!(h.send(ApiRequest::get(&path)).status, 404);
+    assert_eq!(h.send(ApiRequest::delete(&path)).status, 404);
+}
+
+#[test]
+fn art_is_checked_by_its_bytes_and_its_size() {
+    let h = Harness::new("artcheck");
+    let app = h.add_app("Game");
+    let path = format!("/api/apps/{}/art", app.id);
+    let r = h.send(ApiRequest::put_raw(&path, b"GIF89a not accepted"));
+    assert_eq!(r.status, 415, "{}", body_text(&r));
+    let r = h.send(ApiRequest::put_raw(&path, &png(ART_MAX_BYTES)));
+    assert_eq!(r.status, 413, "{}", body_text(&r));
+    let r = h.send(ApiRequest::put_raw("/api/apps/999/art", &png(10)));
+    assert_eq!(r.status, 404, "{}", body_text(&r));
+    assert!(h.state.art(app.id).is_none(), "nothing refused was kept");
+}
+
+#[test]
+fn art_survives_a_restart_and_goes_with_its_app() {
+    let h = Harness::new("artpersist");
+    let keep = h.add_app("Keep");
+    let gone = h.add_app("Gone");
+    for app in [&keep, &gone] {
+        let r = h.send(ApiRequest::put_raw(
+            &format!("/api/apps/{}/art", app.id),
+            &png(64),
+        ));
+        assert_eq!(r.status, 200);
+    }
+    assert_eq!(
+        h.send(ApiRequest::delete(&format!("/api/apps/{}", gone.id)))
+            .status,
+        204
+    );
+    assert!(
+        h.state.art(gone.id).is_none(),
+        "deleting the app deletes its art"
+    );
+
+    // A fresh load from the same directory rebuilds the index from disk.
+    let reloaded =
+        AppState::load(Store::at(&h.dir.0), Arc::clone(&h.host) as Arc<dyn Host>).expect("reload");
+    assert!(reloaded.art(keep.id).is_some());
+    assert!(reloaded.art(gone.id).is_none());
+}
+
 // ---------------------------------------------------------------- pairing
 
 /// Everything the client does, given the PIN it displays on the TV.

@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{
-    AppListing, DecoderQuirks, Feedback, Hello, InputEvent, PairRequest, Seq16, SessionConfig,
-    SessionKey, StreamCodec,
+    AppListing, ArtRef, DecoderQuirks, Feedback, Hello, InputEvent, PairRequest, Seq16,
+    SessionConfig, SessionKey, StreamCodec,
 };
 // Re-exported so callers of this crate do not need to reach past it for the
 // seams its own handler is generic over.
@@ -172,11 +172,15 @@ impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
             .app_list()
             .into_iter()
             .map(|a| AppListing {
+                art: self.state.art_ref(a.id),
                 id: a.id,
                 name: a.name,
-                art: None,
             })
             .collect()
+    }
+
+    fn on_art(&mut self, app_id: u32) -> Option<(ArtRef, Arc<[u8]>)> {
+        self.state.art(app_id)
     }
 
     fn on_launch(&mut self, app_id: u32) -> Result<(), String> {
