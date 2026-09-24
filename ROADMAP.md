@@ -365,7 +365,13 @@ hardware id, HDR/mode restore) is still to be confirmed on the 4070.
   was never wrong to plan, it was wrong to plan *unmeasured*. **The cheaper win is
   a display setting** — running the server's desktop at a high refresh rate buys
   ~5ms with no code at all.
-- **Non-Steam game launching.**
+- **Non-Steam game launching** — any exe or URI entry already launched. What
+  was missing was knowing when such a game is running. A launcher stub exits
+  after starting the game, which reaped the app (and undid its prep) while the
+  game was on screen; a URI had no process at all and blocked every later
+  launch. Now each launch runs in a job object, an entry can name the game's
+  own `wait_process` for a hand-off that leaves the job, and an untracked URI
+  is replaced by the next launch (`sunburst_web::apptrack`, host-tested; §5).
 
 ---
 

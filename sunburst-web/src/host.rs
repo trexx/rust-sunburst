@@ -15,6 +15,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::apptrack::{Tracking, TrackingKind};
 use crate::config::AppEntry;
 
 #[derive(Debug, thiserror::Error)]
@@ -66,12 +67,22 @@ pub struct RunningApp {
     pub app_id: u32,
     pub pid: u32,
     pub started_at: u64,
+    /// How its lifetime is judged (see `apptrack`).
+    pub tracking: TrackingKind,
+    /// Launched, but the process it is judged by has not appeared yet.
+    pub starting: bool,
 }
 
 pub trait Host: Send + Sync {
     fn status(&self) -> HostStatus;
 
     /// Launch, running the entry's `prep` commands first.
+    ///
+    /// One app runs at a time: a launch while one is running is refused with
+    /// [`HostError::AlreadyRunning`] — **unless** the running one is
+    /// untracked (a URI with no `wait_process`), which nothing could ever
+    /// notice exiting. That one is replaced: its prep is undone and the new app
+    /// launched.
     fn launch(&self, app: &AppEntry) -> Result<RunningApp, HostError>;
 
     /// Terminate the running app and undo its `prep` commands.
@@ -153,6 +164,19 @@ impl Fake {
     pub fn restarts(&self) -> u32 {
         self.state.lock().expect("not poisoned").restarts
     }
+
+    /// The running app exits on its own, as the Windows host's watcher would
+    /// notice: it is no longer running.
+    pub fn simulate_exit(&self) {
+        self.state.lock().expect("not poisoned").running = None;
+    }
+
+    /// The watched process appeared.
+    pub fn simulate_started(&self) {
+        if let Some(r) = self.state.lock().expect("not poisoned").running.as_mut() {
+            r.starting = false;
+        }
+    }
 }
 
 impl Host for Fake {
@@ -170,14 +194,19 @@ impl Host for Fake {
         if state.fail {
             return Err(HostError::Failed("fake failure".into()));
         }
-        if let Some(running) = &state.running {
+        if let Some(running) = &state.running
+            && running.tracking != TrackingKind::Untracked
+        {
             return Err(HostError::AlreadyRunning(running.app_id));
         }
         state.next_pid += 1;
+        let tracking = Tracking::for_entry(app).kind();
         let running = RunningApp {
             app_id: app.id,
             pid: 1000 + state.next_pid,
             started_at: 1_700_000_000,
+            tracking,
+            starting: tracking == TrackingKind::Process,
         };
         state.running = Some(running.clone());
         Ok(running)
@@ -277,6 +306,43 @@ mod tests {
             host.launch(&app(2)),
             Err(HostError::AlreadyRunning(1))
         ));
+    }
+
+    #[test]
+    fn an_untracked_launch_is_replaced_rather_than_blocking() {
+        // Big Picture by URI: nothing to watch, so nothing would ever reap it,
+        // and before this every later launch was a conflict.
+        let host = Fake::new();
+        let bp = AppEntry {
+            exe: "steam://open/bigpicture".into(),
+            ..app(1)
+        };
+        let started = host.launch(&bp).expect("launch");
+        assert_eq!(started.tracking, TrackingKind::Untracked);
+        let next = host.launch(&app(2)).expect("replaces the untracked one");
+        assert_eq!(next.app_id, 2);
+        assert_eq!(host.running_app().map(|r| r.app_id), Some(2));
+    }
+
+    #[test]
+    fn a_watched_launch_starts_then_runs_then_exits() {
+        let host = Fake::new();
+        let game = AppEntry {
+            exe: "steam://rungameid/1".into(),
+            wait_process: Some("Game.exe".into()),
+            ..app(3)
+        };
+        let r = host.launch(&game).expect("launch");
+        assert_eq!((r.tracking, r.starting), (TrackingKind::Process, true));
+        assert!(matches!(
+            host.launch(&app(4)),
+            Err(HostError::AlreadyRunning(3))
+        ));
+        host.simulate_started();
+        assert!(!host.running_app().expect("running").starting);
+        host.simulate_exit();
+        assert!(host.running_app().is_none());
+        host.launch(&app(4)).expect("free again");
     }
 
     #[test]

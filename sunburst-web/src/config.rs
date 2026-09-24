@@ -244,6 +244,11 @@ pub struct AppEntry {
     /// Run before launch, undone after exit. Resolution changes, HDR toggles.
     pub prep: Vec<PrepCommand>,
     pub overrides: SessionOverrides,
+    /// The game's own executable name (`Game.exe`), for an entry that hands
+    /// off to it rather than being it: a `steam://rungameid` URI, or a launcher
+    /// that starts the game outside its own process tree. The app counts as
+    /// running while this process does. See `apptrack`.
+    pub wait_process: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -285,6 +290,8 @@ pub enum ConfigError {
     EmptyAppName(u32),
     #[error("app {0} has an empty exe")]
     EmptyAppExe(u32),
+    #[error("app {0}'s wait_process must be a bare executable name such as Game.exe")]
+    BadWaitProcess(u32),
 }
 
 impl Config {
@@ -317,6 +324,13 @@ impl Config {
             }
             if app.exe.trim().is_empty() {
                 return Err(ConfigError::EmptyAppExe(app.id));
+            }
+            if app
+                .wait_process
+                .as_deref()
+                .is_some_and(|n| !crate::apptrack::valid_process_name(n))
+            {
+                return Err(ConfigError::BadWaitProcess(app.id));
             }
         }
         Ok(())
@@ -465,6 +479,24 @@ mod tests {
     }
 
     #[test]
+    fn wait_process_must_be_a_bare_image_name() {
+        let mut c = Config::default();
+        let mut app = AppEntry {
+            id: 0,
+            name: "Game".into(),
+            exe: "steam://rungameid/1".into(),
+            wait_process: Some(r"C:\Games\Game.exe".into()),
+            ..Default::default()
+        };
+        c.next_app_id = 1;
+        c.apps = vec![app.clone()];
+        assert_eq!(c.validate(), Err(ConfigError::BadWaitProcess(0)));
+        app.wait_process = Some("Game.exe".into());
+        c.apps = vec![app];
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
     fn a_missing_exe_path_is_storable() {
         // Deliberately not validated. Drives get remapped and games get moved;
         // an entry that cannot be saved because its path is currently wrong is
@@ -514,6 +546,7 @@ mod tests {
                 codec: Some(CodecPreference::Av1),
                 ..Default::default()
             },
+            wait_process: Some("Game.exe".into()),
         }];
 
         let json = serde_json::to_string_pretty(&c).expect("serialise");

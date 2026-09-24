@@ -487,6 +487,56 @@ fn launching_a_second_app_is_a_conflict_not_a_silent_swap() {
 }
 
 #[test]
+fn big_picture_by_uri_does_not_block_the_next_launch() {
+    // A URI launch has no process to follow, so nothing ever reaps it. Before
+    // tracking, every launch after Big Picture was a 409 until a restart.
+    let h = Harness::new("untracked");
+    let body = AppEntry {
+        name: "Big Picture".into(),
+        exe: "steam://open/bigpicture".into(),
+        ..Default::default()
+    };
+    let bp: AppEntry = h
+        .send(ApiRequest::post("/api/apps", &body))
+        .parse()
+        .expect("app");
+    let game = h.add_app("Game");
+    let r = h.send(ApiRequest::post(&format!("/api/apps/{}/launch", bp.id), ()));
+    let running: RunningApp = r.parse().expect("running");
+    assert_eq!(running.tracking, crate::apptrack::TrackingKind::Untracked);
+    let r = h.send(ApiRequest::post(
+        &format!("/api/apps/{}/launch", game.id),
+        (),
+    ));
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+    assert_eq!(h.host.running_app().map(|r| r.app_id), Some(game.id));
+}
+
+#[test]
+fn an_app_that_exits_on_its_own_frees_the_next_launch() {
+    let h = Harness::new("reaped");
+    let a = h.add_app("A");
+    let b = h.add_app("B");
+    h.send(ApiRequest::post(&format!("/api/apps/{}/launch", a.id), ()));
+    h.host.simulate_exit();
+    let r = h.send(ApiRequest::post(&format!("/api/apps/{}/launch", b.id), ()));
+    assert_eq!(r.status, 200, "{}", body_text(&r));
+}
+
+#[test]
+fn a_bad_wait_process_is_refused_at_save() {
+    let h = Harness::new("waitproc");
+    let body = AppEntry {
+        name: "Game".into(),
+        exe: "steam://rungameid/1".into(),
+        wait_process: Some(r"C:\Games\Game.exe".into()),
+        ..Default::default()
+    };
+    let r = h.send(ApiRequest::post("/api/apps", &body));
+    assert_eq!(r.status, 400, "{}", body_text(&r));
+}
+
+#[test]
 fn launching_an_unknown_app_is_a_404() {
     let h = Harness::new("launch404");
     assert_eq!(

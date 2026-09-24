@@ -13,6 +13,7 @@ pub mod cursor;
 pub mod display;
 pub mod mic_pipeline;
 pub mod pipeline;
+pub mod proc;
 pub mod realtime;
 pub mod session;
 pub mod win_host;
@@ -53,6 +54,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The live-session registry the web UI reads and the session manager writes.
     let sessions = Sessions::new();
     let host = Arc::new(WindowsHost::new(Some(drain), Arc::clone(&sessions)));
+    host.start_watcher();
     let state = Arc::new(AppState::load(store, host)?);
 
     let web = state.web_config();

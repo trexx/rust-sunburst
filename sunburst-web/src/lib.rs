@@ -26,6 +26,7 @@
 //! construction rather than by remembering.
 
 pub mod api;
+pub mod apptrack;
 pub mod auth;
 pub mod client;
 pub mod config;

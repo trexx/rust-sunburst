@@ -561,8 +561,27 @@ the part that a fake cannot answer.
       Manager and confirm the undo commands still run — this is the path that
       leaves a display in the wrong mode.
 - [ ] **`steam://open/bigpicture` launches** through `ShellExecute`. It has no
-      child process to wait on, so confirm the UI does not report it as running
-      forever.
+      child process to wait on, so it is *untracked*: the UI reports it running
+      until something replaces it. Confirm the next launch **replaces** it (its
+      prep undone, the new app started) instead of the 409 every launch after
+      it used to get.
+- [ ] **A launcher-stub game is followed through its launcher.** An exe entry
+      for a launcher that starts the game and exits (GOG Galaxy, Ubisoft
+      Connect): the app stays "running" while the game is up, since the game is
+      in the launch's job object, and its prep is undone when the game exits,
+      not when the stub does. If a launcher breaks away from the job, set
+      `wait_process` instead.
+- [ ] **`wait_process` follows a hand-off.** `steam://rungameid/<id>` with
+      `wait_process = "<Game>.exe"`: "starting" until the game's process
+      appears, "running" while it runs, reaped about 5 s after it exits (a
+      bootstrapper restarting the game under the same name is not an exit).
+      Try an Epic `com.epicgames.launcher://` URI the same way.
+- [ ] **Terminate ends the whole tree** (the job), plus any `wait_process`
+      started since the launch. A same-named process that was already running
+      is left alone.
+- [ ] **A server restart does not kill the game.** Restart from the UI mid-game:
+      the game keeps running (the job has no kill-on-close). The price, stated:
+      after the restart it runs untracked and its prep is not undone.
 - [ ] **A device pairs from the TV and survives a restart.** The PIN is shown on
       the client and typed into the browser. Then restart the server and confirm
       it is still paired — a pairing that lives only in memory is the failure to

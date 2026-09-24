@@ -21,8 +21,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sunburst_core::instr::{DrainHandle, Report};
+use sunburst_web::apptrack::{Observation, Tracker, Tracking, TrackingKind, Verdict};
 use sunburst_web::config::AppEntry;
 use sunburst_web::host::{Host, HostError, HostStatus, RunningApp, SessionSummary};
+
+use crate::proc::{self, Job};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
@@ -57,7 +60,50 @@ struct Launched {
     /// `None` for a URI launch: `ShellExecute` hands the request to whatever is
     /// registered — Steam, usually — and there is no child of ours to wait on.
     child: Option<std::process::Child>,
+    /// Everything the child starts, so a launcher that exits after starting the
+    /// game is not mistaken for the game exiting. `None` for a URI, or if the
+    /// job could not be made or joined (then only the child is watched).
+    job: Option<Job>,
+    tracker: Tracker,
+    launched_at: SystemTime,
 }
+
+impl Launched {
+    fn observe(&mut self, now_ms: u64) -> Verdict {
+        let job_active = match (&self.job, self.child.as_mut()) {
+            (Some(job), _) => job.active_processes(),
+            // No job: the child alone stands for the tree.
+            (None, Some(child)) => Some(u32::from(!matches!(child.try_wait(), Ok(Some(_))))),
+            (None, None) => None,
+        };
+        let process_present = match self.tracker.tracking() {
+            Tracking::Process(name) => Some(proc::process_running(name)),
+            _ => None,
+        };
+        self.tracker.observe(
+            now_ms,
+            Observation {
+                job_active,
+                process_present,
+            },
+        )
+    }
+}
+
+/// Undo an app's prep, in reverse: a prep list is a stack of changes, and
+/// undoing a resolution change before the HDR toggle that depended on it leaves
+/// the display in a state neither step expected. A failed undo is reported but
+/// does not stop the rest; giving up halfway would leave more changed, not less.
+fn undo_prep(app: &AppEntry) {
+    for step in app.prep.iter().rev() {
+        if let Some(undo) = &step.undo {
+            let _ = run_shell(undo);
+        }
+    }
+}
+
+/// How often the watcher looks at a running app.
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 impl WindowsHost {
     pub fn new(drain: Option<DrainHandle>, sessions: Arc<crate::session::Sessions>) -> WindowsHost {
@@ -71,6 +117,45 @@ impl WindowsHost {
 
     fn current_exe() -> Result<std::path::PathBuf, HostError> {
         std::env::current_exe().map_err(|e| HostError::Failed(format!("current_exe: {e}")))
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Look at the running app once: note whether it is still starting, and if
+    /// it has exited, undo its prep and forget it.
+    fn reap(&self) {
+        let mut running = self.running.lock().expect("not poisoned");
+        let Some(launched) = running.as_mut() else {
+            return;
+        };
+        match launched.observe(self.now_ms()) {
+            Verdict::Exited(_) => {
+                // Undo the prep it applied, exactly as `terminate` would — a
+                // game that quit on its own must still restore what it changed.
+                if let Some(launched) = running.take() {
+                    undo_prep(&launched.app);
+                }
+            }
+            verdict => launched.info.starting = verdict == Verdict::Starting,
+        }
+    }
+
+    /// Watch the running app in the background, so its prep is undone when it
+    /// exits even if nobody asks. Control plane: one look a second.
+    pub fn start_watcher(self: &Arc<Self>) {
+        let host = Arc::downgrade(self);
+        std::thread::Builder::new()
+            .name("sunburst-apps".into())
+            .spawn(move || {
+                while let Some(host) = host.upgrade() {
+                    host.reap();
+                    drop(host);
+                    std::thread::sleep(WATCH_INTERVAL);
+                }
+            })
+            .ok();
     }
 }
 
@@ -86,9 +171,19 @@ impl Host for WindowsHost {
     }
 
     fn launch(&self, app: &AppEntry) -> Result<RunningApp, HostError> {
+        // A fresh look first, so an app that has just exited does not block.
+        self.reap();
         let mut running = self.running.lock().expect("not poisoned");
-        if let Some(existing) = running.as_ref() {
-            return Err(HostError::AlreadyRunning(existing.info.app_id));
+        match running.as_ref() {
+            // Nothing could ever notice an untracked launch exiting, so the next
+            // launch replaces it rather than being refused forever.
+            Some(existing) if existing.info.tracking == TrackingKind::Untracked => {
+                if let Some(old) = running.take() {
+                    undo_prep(&old.app);
+                }
+            }
+            Some(existing) => return Err(HostError::AlreadyRunning(existing.info.app_id)),
+            None => {}
         }
 
         // Prep first, and abort the launch if any of it fails: a game started
@@ -100,9 +195,10 @@ impl Host for WindowsHost {
             })?;
         }
 
-        let child = if app.exe.contains("://") {
+        let launched_at = SystemTime::now();
+        let (child, job) = if app.exe.contains("://") {
             shell_execute(&app.exe)?;
-            None
+            (None, None)
         } else {
             let mut command = Command::new(&app.exe);
             command
@@ -113,22 +209,31 @@ impl Host for WindowsHost {
             if let Some(dir) = &app.working_dir {
                 command.current_dir(dir);
             }
-            Some(
-                command
-                    .spawn()
-                    .map_err(|e| HostError::Failed(format!("could not launch {}: {e}", app.exe)))?,
-            )
+            let failed = |e| HostError::Failed(format!("could not launch {}: {e}", app.exe));
+            match Job::new() {
+                Ok(job) => {
+                    let (child, joined) = proc::spawn_in_job(&mut command, &job).map_err(failed)?;
+                    (Some(child), joined.then_some(job))
+                }
+                Err(_) => (Some(command.spawn().map_err(failed)?), None),
+            }
         };
 
+        let tracking = Tracking::for_entry(app);
         let info = RunningApp {
             app_id: app.id,
             pid: child.as_ref().map_or(0, |c| c.id()),
             started_at: unix_now(),
+            tracking: tracking.kind(),
+            starting: matches!(tracking, Tracking::Process(_)),
         };
         *running = Some(Launched {
             app: app.clone(),
             info: info.clone(),
             child,
+            job,
+            tracker: Tracker::new(tracking, self.now_ms()),
+            launched_at,
         });
         Ok(info)
     }
@@ -139,46 +244,28 @@ impl Host for WindowsHost {
             return Ok(());
         };
 
+        // The whole tree, not just our child: a launcher's game is in the job.
+        if let Some(job) = &launched.job {
+            job.terminate();
+        }
         if let Some(child) = launched.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
-
-        // Undo in reverse: a prep list is a stack of changes, and undoing a
-        // resolution change before the HDR toggle that depended on it leaves the
-        // display in a state neither step expected.
-        for step in launched.app.prep.iter().rev() {
-            if let Some(undo) = &step.undo {
-                // A failed undo is reported but does not stop the rest. Giving
-                // up halfway would leave more of the display changed, not less.
-                let _ = run_shell(undo);
-            }
+        // A game handed off outside the job, by name, but only one started
+        // since the launch: a same-named process from before is not ours.
+        if let Tracking::Process(name) = launched.tracker.tracking() {
+            proc::kill_named_since(name, launched.launched_at);
         }
+        undo_prep(&launched.app);
         Ok(())
     }
 
     fn running_app(&self) -> Option<RunningApp> {
-        let mut running = self.running.lock().expect("not poisoned");
-
         // Reap first: an app the user closed themselves should stop being
         // reported as running, or the next launch is refused with a conflict.
-        let exited = running.as_mut().is_some_and(|l| {
-            l.child
-                .as_mut()
-                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
-        });
-        if exited {
-            // Undo the prep it applied, exactly as `terminate` would — a game
-            // that quit on its own must still restore what it changed.
-            if let Some(launched) = running.take() {
-                for step in launched.app.prep.iter().rev() {
-                    if let Some(undo) = &step.undo {
-                        let _ = run_shell(undo);
-                    }
-                }
-            }
-            return None;
-        }
+        self.reap();
+        let running = self.running.lock().expect("not poisoned");
         running.as_ref().map(|l| l.info.clone())
     }
 
