@@ -361,8 +361,8 @@ opt-in, low-latency codec. NVENC has no 10-bit H.264, so it never carries HDR;
 offer, never over an HDR codec. It reuses the HEVC packetizer, sequence-header
 path and reference-invalidation `Window`; its one new piece is an 8-bit SDR
 convert (scRGB→NV12 BT.709, with an ACES HDR→SDR tonemap) on both the D3D11 and
-NvFBC paths, feeding NVENC NV12. See HARDWARE_TESTING §13. The NvFBC NV12 CUDA
-kernel ships as a no-op placeholder PTX until vendored, like the P010 kernel.
+NvFBC paths, feeding NVENC NV12. See HARDWARE_TESTING §13. Both NvFBC CUDA
+kernels (P010 and NV12) are real PTX vendored from `cuda-kernel.yml`.
 
 ---
 

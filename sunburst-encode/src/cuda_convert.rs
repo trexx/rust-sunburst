@@ -9,8 +9,9 @@
 //! `cuCtxPushCurrent`), where the grab buffer lives.
 //!
 //! The kernel is embedded as PTX (`include_bytes!`) and JIT-compiled by the driver
-//! at load, so no CUDA toolkit is needed at runtime. The checked-in PTX is a no-op
-//! placeholder until `.github/workflows/cuda-kernel.yml` produces the real one.
+//! at load, so no CUDA toolkit is needed at runtime. The PTX is vendored from
+//! `.github/workflows/cuda-kernel.yml`, never written by hand;
+//! `tests/ptx_vendored.rs` checks it exports the entries named below.
 
 use std::ffi::c_void;
 
@@ -18,7 +19,7 @@ use sunburst_capture::cuda::{CUDA_SUCCESS, CuContext, CuDevicePtr, CuFunction, C
 
 use crate::convert::ConvertOutput;
 
-/// The compiled convert kernels. The real bytes come from CI; see the module docs.
+/// The compiled convert kernels, vendored from CI; see the module docs.
 const KERNEL_PTX_P010: &[u8] = include_bytes!("../cuda/argb10_to_p010.ptx");
 const KERNEL_PTX_NV12: &[u8] = include_bytes!("../cuda/argb_to_nv12.ptx");
 

@@ -4,9 +4,9 @@
 //! CUDA ARGB10 buffer, a CUDA kernel converts it to P010, and an NVENC-CUDA
 //! session encodes it — no D3D11, the frame never leaves the GPU.
 //!
-//! Box-only, and NvFBC is opt-in resilience: needs the keyed NvFBC create + a
-//! CUDA-toolkit-compiled PTX vendored over the placeholder (see
-//! `.github/workflows/cuda-kernel.yml`). Run on the 4070:
+//! Box-only, and NvFBC is opt-in resilience: needs the keyed NvFBC create and
+//! the vendored convert PTX (`.github/workflows/cuda-kernel.yml`). Run on the
+//! 4070:
 //! `cargo run --example capture_encode_nvfbc -- 300 [av1]`. Type-checks here.
 
 #[cfg(windows)]

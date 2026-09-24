@@ -64,10 +64,10 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   compute shader for the D3D11 backends, a P010 CUDA kernel for NvFBC) and the
   encoder registers two NVENC input types. (The NvFBC CUDA-native spine —
   convert kernel + NVENC-CUDA session — is now wired into
-  `sunburst-server::pipeline` beside the built D3D11 path; the one outstanding
-  piece is the real convert PTX that `cuda-kernel.yml` produces and a maintainer
-  vendors over the placeholder. Until then the CUDA path encodes a black frame,
-  by design.)
+  `sunburst-server::pipeline` beside the built D3D11 path, and its convert
+  kernels are real PTX vendored from `cuda-kernel.yml` — never hand-written;
+  `sunburst-encode/tests/ptx_vendored.rs` checks the entry points. What is left
+  is the box run, `HARDWARE_TESTING.md` §9.)
 - **Render the cursor client-side** from separately-delivered shape data. Removes
   the network round-trip from perceived pointer latency. Biggest single
   responsiveness win in the system.

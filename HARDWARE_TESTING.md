@@ -954,9 +954,11 @@ fakeclient stream --server <box>:47811 --codecs hevc --out a.265 --secs 60 --sta
       the pipeline rebuilds and re-sends `CodecPrivate`, the stream continues.
       Lock the screen: `SecureDesktop{active:1}` then `{0}` on unlock, and the
       client never shows a frozen frame.
-- [ ] **NvFBC spine** (after the real PTX is vendored, `SUNBURST_NVFBC=1`): the
-      CUDA-native path streams. With the placeholder PTX it streams black -- the
-      documented behaviour.
+- [ ] **NvFBC spine** (`SUNBURST_NVFBC=1`): the CUDA-native path streams a real
+      picture — the convert PTX is vendored now, so black is a bug, not the
+      placeholder. Check the colour too: `argb10_to_p010.cu` assumes NvFBC's
+      ARGB10 is already the PQ signal and applies no transfer function, which is
+      the one assumption the kernel could not settle off the box.
 - [ ] **WGC frame-arrival wait:** confirm the event-signalled wait holds up under
       a real 4K60 run -- no missed frames, no added latency versus the DDA path.
 - [ ] **Phase 3 playback:** mux the dumps (`ffmpeg -i a.265 -c copy a.mkv`; the
@@ -1078,15 +1080,14 @@ with the MikeTheTech Virtual Display Driver installed.
 ## 13. H.264 — a low-latency SDR codec (env S, A and B)
 
 H.264 is built end to end but its NVENC config, the NV12 convert (HLSL + the
-placeholder CUDA kernel) and the tonemap are `cargo xwin`-verified only. Set the
+`argb_to_nv12` CUDA kernel) and the tonemap are `cargo xwin`-verified only. Set the
 server codec preference (or a per-app override) to H.264.
 
 - [ ] **Negotiate + decode.** A client offering `video/avc` negotiates H.264 and
       decodes it; HEVC/AV1 still negotiate when preferred; auto never picks H.264
       over an HDR codec.
 - [ ] **Correct 8-bit SDR** (BT.709 colours, no cast) on the DDA/WGC path. On the
-      NvFBC path once the real `argb_to_nv12` PTX is vendored (the checked-in one
-      is a no-op placeholder — a black frame, by design, like the P010 kernel).
+      NvFBC path too (the vendored `argb_to_nv12` / `argb_to_nv12_tonemap` PTX).
 - [ ] **Tonemapping.** With the desktop in HDR, an H.264 stream still looks right
       (highlights rolled off, no clip/oversaturation); in SDR it is unchanged. The
       session does not alter the desktop's HDR state.

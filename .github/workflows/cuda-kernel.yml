@@ -6,8 +6,10 @@
 # The driver JITs the PTX at load, so it is forward-compatible across GPUs.
 #
 # Manual-only (workflow_dispatch): not part of the CI gate. Download the artifact
-# and vendor it over sunburst-encode/cuda/argb10_to_p010.ptx (the checked-in copy
-# is a no-op placeholder), then commit it with the toolkit version + SHA-256.
+# and vendor both files over sunburst-encode/cuda/argb10_to_p010.ptx and
+# argb_to_nv12.ptx, then commit them with the run id, the nvcc version and the
+# SHA-256s (SHA256SUMS.txt). Rerun whenever a .cu file changes;
+# sunburst-encode/tests/ptx_vendored.rs checks the entry points.
 
 name: CUDA kernel PTX
 
@@ -36,8 +38,7 @@ jobs:
           set -euo pipefail
           cd sunburst-encode/cuda
           # The HEVC/AV1 P010 kernel and the H.264 SDR NV12 kernel (two entry
-          # points, SDR + tonemap). Both are vendored over their checked-in no-op
-          # placeholders.
+          # points, SDR + tonemap). Both are vendored into the repo.
           nvcc -ptx -arch=${{ github.event.inputs.arch }} \
             argb10_to_p010.cu -o argb10_to_p010.ptx
           nvcc -ptx -arch=${{ github.event.inputs.arch }} \
