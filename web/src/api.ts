@@ -95,6 +95,10 @@ export interface RunningApp {
   app_id: number;
   pid: number;
   started_at: number;
+  /** How the server follows it: its job, a named process, or not at all (a URI). */
+  tracking: "job" | "process" | "untracked";
+  /** Launched, but the named process has not appeared yet. */
+  starting: boolean;
 }
 
 export interface Quirks {
@@ -160,6 +164,8 @@ export interface AppEntry {
   working_dir: string | null;
   prep: PrepCommand[];
   overrides: Overrides;
+  /** The game's own executable, for an entry that hands off to it. */
+  wait_process: string | null;
 }
 
 export type Codec = "auto" | "hevc" | "av1" | "h264";

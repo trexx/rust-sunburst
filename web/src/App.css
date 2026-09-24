@@ -147,7 +147,8 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   display: block;
   font: inherit;
   width: 100%;
@@ -158,6 +159,10 @@ select {
   border-radius: var(--radius);
   background: var(--bg);
   color: var(--text);
+}
+
+textarea {
+  resize: vertical;
 }
 
 .row input {

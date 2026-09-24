@@ -11,6 +11,7 @@ const BLANK: AppEntry = {
   args: [],
   working_dir: null,
   prep: [],
+  wait_process: null,
   overrides: {
     bitrate_kbps: null,
     codec: null,
@@ -56,6 +57,9 @@ export function Apps({
   }
 
   const running = status?.running_app ?? null;
+  // An untracked app (a URI with nothing to watch) is replaced by the next
+  // launch, so it does not disable the buttons.
+  const blocking = running !== null && running.tracking !== "untracked";
 
   return (
     <>
@@ -82,7 +86,7 @@ export function Apps({
                   <td>
                     {a.name}
                     {running?.app_id === a.id && (
-                      <span className="hint"> — running (pid {running.pid})</span>
+                      <span className="hint"> — {describeRunning(running)}</span>
                     )}
                   </td>
                   <td>
@@ -91,7 +95,7 @@ export function Apps({
                   <td className="row">
                     <button
                       onClick={() => void act(() => api.post(`/api/apps/${a.id}/launch`))}
-                      disabled={running !== null}
+                      disabled={blocking}
                     >
                       Launch
                     </button>
@@ -141,6 +145,22 @@ export function Apps({
   );
 }
 
+function describeRunning(r: {
+  pid: number;
+  tracking: string;
+  starting: boolean;
+}): string {
+  if (r.starting) return "starting (waiting for its process)";
+  switch (r.tracking) {
+    case "untracked":
+      return "launched (not followed; the next launch replaces it)";
+    case "process":
+      return "running (following its process)";
+    default:
+      return `running (pid ${r.pid} and everything it started)`;
+  }
+}
+
 function Editor({
   entry,
   onSave,
@@ -151,7 +171,7 @@ function Editor({
   onCancel: () => void;
 }) {
   const [draft, setDraft] = useState<AppEntry>(entry);
-  const [argsText, setArgsText] = useState(entry.args.join(" "));
+  const [argsText, setArgsText] = useState(entry.args.join("\n"));
 
   function set<K extends keyof AppEntry>(key: K, value: AppEntry[K]) {
     setDraft((d) => ({ ...d, [key]: value }));
@@ -176,18 +196,38 @@ function Editor({
       </label>
 
       <label>
-        Arguments
-        <input
+        Arguments, one per line
+        <textarea
+          rows={3}
           value={argsText}
+          placeholder={"-windowed\n--profile=C:\\Games\\My Profile"}
           onChange={(e) => {
             setArgsText(e.target.value);
+            // One argument per line maps 1:1 onto the list the server passes
+            // to CreateProcess, so an argument with spaces needs no quoting.
             set(
               "args",
-              e.target.value.split(" ").filter((a) => a !== ""),
+              e.target.value.split(/\r?\n/).filter((a) => a !== ""),
             );
           }}
         />
       </label>
+
+      <label>
+        Wait for process
+        <input
+          value={draft.wait_process ?? ""}
+          placeholder="Game.exe"
+          onChange={(e) => set("wait_process", e.target.value.trim() || null)}
+        />
+      </label>
+      <p className="hint">
+        For an entry that hands off to the game rather than being it — a{" "}
+        <code>steam://rungameid/…</code> or Epic URI, or a launcher that starts
+        the game outside its own processes. The app counts as running while
+        this process does. Leave blank for a game started directly, which is
+        followed through everything it starts, and for Big Picture.
+      </p>
 
       <label>
         Working directory
