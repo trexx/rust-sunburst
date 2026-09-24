@@ -383,31 +383,143 @@ fn unsigned_input_is_refused() {
     server.recording(|r| assert!(r.inputs.is_empty(), "unsigned input was injected"));
 }
 
+/// Collect a whole paged app list: pages until `total` entries have arrived.
+fn receive_app_list(client: &mut ClientEndpoint) -> Vec<AppListing> {
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::AppList(page)) = client.recv_control().expect("recv") {
+            assert_eq!(page.start as usize, got.len(), "pages arrive in order");
+            got.extend(page.apps);
+            if got.len() == page.total as usize {
+                return got;
+            }
+        }
+        client.tick().expect("tick");
+        assert!(Instant::now() < deadline, "the app list never completed");
+    }
+}
+
 #[test]
 fn the_app_list_round_trips() {
     let apps = vec![
         AppListing {
             id: 0,
             name: "Big Picture".into(),
+            art: None,
         },
         AppListing {
             id: 4,
             name: "Cyberpunk 2077".into(),
+            art: None,
         },
     ];
     let server = Server::start(Recording::new().with_key(1, key(1)).with_apps(apps.clone()));
     let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
-
     client.send_control(&ClientControl::ListApps).expect("send");
+    assert_eq!(receive_app_list(&mut client), apps);
+}
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let received = loop {
-        if let Some(ServerControl::AppList(list)) = client.recv_control().expect("recv") {
-            break list;
+#[test]
+fn a_list_longer_than_a_frame_arrives_whole() {
+    // Before paging, this list did not fit one reliable frame and was dropped
+    // without a word: the TV saw no apps at all.
+    let apps: Vec<AppListing> = (0..40)
+        .map(|id| AppListing {
+            id,
+            name: format!("{id:03} {}", "A Very Long Game Title ".repeat(8)),
+            art: None,
+        })
+        .collect();
+    let server = Server::start(Recording::new().with_key(1, key(1)).with_apps(apps.clone()));
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    client.send_control(&ClientControl::ListApps).expect("send");
+    assert_eq!(receive_app_list(&mut client), apps);
+}
+
+#[test]
+fn box_art_arrives_whole_and_verifiable() {
+    use sunburst_core::proto::{ArtRef, art_digest};
+
+    let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+    image.extend((0..20_000u32).map(|i| i as u8));
+    let server = Server::start(
+        Recording::new()
+            .with_key(1, key(1))
+            .with_art(4, image.clone()),
+    );
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    let want = ArtRef::of(&image).expect("a png");
+    client
+        .send_control(&ClientControl::ArtRequest {
+            app_id: 4,
+            digest: want.digest,
+        })
+        .expect("send");
+
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(ServerControl::ArtChunk(c)) = client.recv_control().expect("recv") {
+            assert_eq!((c.app_id, c.digest), (4, want.digest));
+            assert_eq!(c.offset as usize, got.len());
+            got.extend_from_slice(&c.data);
+            if got.len() == c.total_len as usize {
+                break;
+            }
         }
-        assert!(Instant::now() < deadline, "no app list arrived");
-    };
-    assert_eq!(received, apps);
+        client.tick().expect("tick");
+        assert!(Instant::now() < deadline, "the art never completed");
+    }
+    assert_eq!(art_digest(&got), want.digest);
+
+    // An app with no art answers with one empty chunk, not silence.
+    client
+        .send_control(&ClientControl::ArtRequest {
+            app_id: 9,
+            digest: [0; 16],
+        })
+        .expect("send");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::ArtChunk(c)) = client.recv_control().expect("recv") {
+            assert_eq!((c.app_id, c.total_len), (9, 0));
+            break;
+        }
+        client.tick().expect("tick");
+        assert!(
+            Instant::now() < deadline,
+            "no answer for an app without art"
+        );
+    }
+}
+
+#[test]
+fn a_launch_is_answered() {
+    let server = Server::start(
+        Recording::new()
+            .with_key(1, key(1))
+            .with_launch_error("an app is already running: 2"),
+    );
+    let mut client = ClientEndpoint::connect(server.addr, Some(key(1))).expect("connect");
+    client
+        .send_control(&ClientControl::LaunchApp { app_id: 5 })
+        .expect("send");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::LaunchResult {
+            app_id,
+            ok,
+            message,
+        }) = client.recv_control().expect("recv")
+        {
+            assert_eq!((app_id, ok), (5, false));
+            assert_eq!(message, "an app is already running: 2");
+            break;
+        }
+        client.tick().expect("tick");
+        assert!(Instant::now() < deadline, "the launch went unanswered");
+    }
 }
 
 #[test]

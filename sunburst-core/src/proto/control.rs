@@ -26,6 +26,7 @@
 //! carries it in pieces. Every chunk repeats the shape's head, and the channel
 //! delivers in order, so the receiver appends and never has to reorder.
 
+pub use super::art::{ART_CHUNK_MAX, AppPage, ArtChunk, ArtFormat, ArtRef};
 pub use super::color::{ColorInfo, HdrMastering};
 use super::pairing::{NONCE_LEN, TAG_LEN};
 use super::seq::Seq16;
@@ -85,6 +86,7 @@ pub enum ClientMessage {
     PairConfirm = 8,
     ListApps = 9,
     LaunchApp = 10,
+    ArtRequest = 11,
 }
 
 /// Server → client discriminants. Complete, including kinds not yet decoded.
@@ -99,6 +101,8 @@ pub enum ServerMessage {
     Bye = 5,
     PairChallenge = 6,
     AppList = 7,
+    ArtChunk = 8,
+    LaunchResult = 9,
 }
 
 impl ClientMessage {
@@ -115,6 +119,7 @@ impl ClientMessage {
             8 => ClientMessage::PairConfirm,
             9 => ClientMessage::ListApps,
             10 => ClientMessage::LaunchApp,
+            11 => ClientMessage::ArtRequest,
             _ => return None,
         })
     }
@@ -142,6 +147,8 @@ impl ServerMessage {
             5 => ServerMessage::Bye,
             6 => ServerMessage::PairChallenge,
             7 => ServerMessage::AppList,
+            8 => ServerMessage::ArtChunk,
+            9 => ServerMessage::LaunchResult,
             _ => return None,
         })
     }
@@ -262,6 +269,9 @@ pub mod codecs {
 pub struct AppListing {
     pub id: u32,
     pub name: String,
+    /// Its box art, if it has any: fetch with `ArtRequest` unless an image with
+    /// this digest is already cached.
+    pub art: Option<ArtRef>,
 }
 
 /// The codec a session streams. The wire value of `SessionConfig.codec` and
@@ -450,6 +460,11 @@ pub enum ClientControl {
     LaunchApp {
         app_id: u32,
     },
+    /// Send this app's box art (see `proto::art`).
+    ArtRequest {
+        app_id: u32,
+        digest: [u8; 16],
+    },
     RequestIdr,
     Resize {
         width: u32,
@@ -476,7 +491,15 @@ pub enum ServerControl {
         request_id: u32,
         server_nonce: [u8; NONCE_LEN],
     },
-    AppList(Vec<AppListing>),
+    /// One page of the app list; see [`app_list_pages`](super::art::app_list_pages).
+    AppList(AppPage),
+    ArtChunk(ArtChunk),
+    /// The answer to `LaunchApp`: whether it started, and why not.
+    LaunchResult {
+        app_id: u32,
+        ok: bool,
+        message: String,
+    },
     SessionConfig(SessionConfig),
     /// One encoder build's configuration. Sent when the encoder is built and
     /// again after every rebuild; see [`CodecPrivate`].
@@ -517,6 +540,11 @@ fn envelope(out: &mut Vec<u8>, kind: u8, body: impl FnOnce(&mut Vec<u8>)) {
     out[len_at..len_at + 2].copy_from_slice(&len.to_le_bytes());
 }
 
+/// Bytes [`put_str`] writes for `s`.
+pub(crate) fn put_str_len(s: &str) -> usize {
+    1 + s.len()
+}
+
 fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), ControlError> {
     let bytes = s.as_bytes();
     if bytes.len() > MAX_STRING {
@@ -541,6 +569,7 @@ impl ClientControl {
             ClientControl::PairConfirm { .. } => ClientMessage::PairConfirm,
             ClientControl::ListApps => ClientMessage::ListApps,
             ClientControl::LaunchApp { .. } => ClientMessage::LaunchApp,
+            ClientControl::ArtRequest { .. } => ClientMessage::ArtRequest,
             ClientControl::Unhandled(_) => return None,
         })
     }
@@ -583,6 +612,10 @@ impl ClientControl {
                 b.extend_from_slice(&q.max_bitrate_hint.to_le_bytes());
             }
             ClientControl::LaunchApp { app_id } => b.extend_from_slice(&app_id.to_le_bytes()),
+            ClientControl::ArtRequest { app_id, digest } => {
+                b.extend_from_slice(&app_id.to_le_bytes());
+                b.extend_from_slice(digest);
+            }
             ClientControl::Resize {
                 width,
                 height,
@@ -652,6 +685,10 @@ impl ClientControl {
                 ClientControl::Quirks(DecoderQuirks::from_flags(r.u8()?, r.u32()?))
             }
             ClientMessage::LaunchApp => ClientControl::LaunchApp { app_id: r.u32()? },
+            ClientMessage::ArtRequest => ClientControl::ArtRequest {
+                app_id: r.u32()?,
+                digest: r.array::<16>()?,
+            },
             ClientMessage::Resize => ClientControl::Resize {
                 width: r.u32()?,
                 height: r.u32()?,
@@ -676,6 +713,8 @@ impl ServerControl {
         Some(match self {
             ServerControl::PairChallenge { .. } => ServerMessage::PairChallenge,
             ServerControl::AppList(_) => ServerMessage::AppList,
+            ServerControl::ArtChunk(_) => ServerMessage::ArtChunk,
+            ServerControl::LaunchResult { .. } => ServerMessage::LaunchResult,
             ServerControl::SessionConfig(_) => ServerMessage::SessionConfig,
             ServerControl::CodecPrivate(_) => ServerMessage::CodecPrivate,
             ServerControl::CursorShape(_) => ServerMessage::CursorShape,
@@ -701,15 +740,51 @@ impl ServerControl {
                 b.extend_from_slice(&request_id.to_le_bytes());
                 b.extend_from_slice(server_nonce);
             }
-            ServerControl::AppList(apps) => {
-                let count = u16::try_from(apps.len()).unwrap_or(u16::MAX);
+            ServerControl::AppList(page) => {
+                let count = u16::try_from(page.apps.len()).unwrap_or(u16::MAX);
+                b.extend_from_slice(&page.total.to_le_bytes());
+                b.extend_from_slice(&page.start.to_le_bytes());
                 b.extend_from_slice(&count.to_le_bytes());
-                for app in apps.iter().take(count as usize) {
+                for app in page.apps.iter().take(count as usize) {
                     b.extend_from_slice(&app.id.to_le_bytes());
                     if err.is_ok() {
                         err = put_str(b, &app.name);
                     }
+                    b.push(u8::from(app.art.is_some()));
+                    if let Some(art) = &app.art {
+                        b.extend_from_slice(&art.digest);
+                        b.extend_from_slice(&art.len.to_le_bytes());
+                        b.push(art.format as u8);
+                    }
                 }
+            }
+            ServerControl::ArtChunk(c) => {
+                b.extend_from_slice(&c.app_id.to_le_bytes());
+                b.extend_from_slice(&c.digest);
+                b.push(c.format as u8);
+                b.extend_from_slice(&c.total_len.to_le_bytes());
+                b.extend_from_slice(&c.offset.to_le_bytes());
+                if c.data.len() > ART_CHUNK_MAX {
+                    err = Err(ControlError::OutOfRange("art chunk data"));
+                } else {
+                    b.extend_from_slice(&(c.data.len() as u16).to_le_bytes());
+                    b.extend_from_slice(&c.data);
+                }
+            }
+            ServerControl::LaunchResult {
+                app_id,
+                ok,
+                message,
+            } => {
+                b.extend_from_slice(&app_id.to_le_bytes());
+                b.push(u8::from(*ok));
+                // A message too long for the wire is cut, not refused: the
+                // result matters more than the whole explanation.
+                let mut end = message.len().min(MAX_STRING);
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                err = put_str(b, &message[..end]);
             }
             ServerControl::SessionConfig(c) => {
                 b.extend_from_slice(&c.session_id.to_le_bytes());
@@ -807,16 +882,52 @@ impl ServerControl {
                 server_nonce: r.array::<NONCE_LEN>()?,
             },
             ServerMessage::AppList => {
+                let total = r.u16()?;
+                let start = r.u16()?;
                 let count = r.u16()?;
-                let mut apps = Vec::with_capacity(count as usize);
+                let mut apps = Vec::with_capacity(count.min(256) as usize);
                 for _ in 0..count {
-                    apps.push(AppListing {
-                        id: r.u32()?,
-                        name: r.string()?,
-                    });
+                    let id = r.u32()?;
+                    let name = r.string()?;
+                    let art = if r.u8()? & 1 != 0 {
+                        Some(ArtRef {
+                            digest: r.array::<16>()?,
+                            len: r.u32()?,
+                            format: ArtFormat::from_u8(r.u8()?)
+                                .ok_or(ControlError::OutOfRange("art format"))?,
+                        })
+                    } else {
+                        None
+                    };
+                    apps.push(AppListing { id, name, art });
                 }
-                ServerControl::AppList(apps)
+                ServerControl::AppList(AppPage { total, start, apps })
             }
+            ServerMessage::ArtChunk => {
+                let app_id = r.u32()?;
+                let digest = r.array::<16>()?;
+                let format =
+                    ArtFormat::from_u8(r.u8()?).ok_or(ControlError::OutOfRange("art format"))?;
+                let total_len = r.u32()?;
+                let offset = r.u32()?;
+                let len = r.u16()? as usize;
+                if len > ART_CHUNK_MAX {
+                    return Err(ControlError::OutOfRange("art chunk data"));
+                }
+                ServerControl::ArtChunk(ArtChunk {
+                    app_id,
+                    digest,
+                    format,
+                    total_len,
+                    offset,
+                    data: r.take(len)?.to_vec(),
+                })
+            }
+            ServerMessage::LaunchResult => ServerControl::LaunchResult {
+                app_id: r.u32()?,
+                ok: r.u8()? != 0,
+                message: r.string()?,
+            },
             ServerMessage::Bye => ServerControl::Bye,
             ServerMessage::SessionConfig => {
                 let session_id = r.u32()?;

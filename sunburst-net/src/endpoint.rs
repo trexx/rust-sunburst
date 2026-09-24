@@ -75,7 +75,7 @@ use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
 use sunburst_core::proto::{
     ClientControl, ClientMessage, Feedback, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN,
     MAX_PAYLOAD, Nack, PacketType, PadOutput, ReplayWindow, Rumble, Seq16, ServerControl,
-    SessionConfig, SessionKey,
+    SessionConfig, SessionKey, app_list_pages, chunk_art,
 };
 
 use crate::handler::{ControlHandler, Outbound};
@@ -84,6 +84,10 @@ use crate::reliable::{FRAME_HEADER_LEN, Incarnation, Reliable, ReliableError};
 /// Room for a control message once the common header, the reliable frame header
 /// and the MAC are accounted for.
 pub const MAX_CONTROL_PAYLOAD: usize = MAX_PAYLOAD - FRAME_HEADER_LEN - MAC_LEN;
+
+/// Control messages a client may have queued before an art request is refused.
+/// An image is at most ~512 chunks; a deeper queue means one is already going.
+const ART_QUEUE_LIMIT: usize = 64;
 
 /// How long a peer may go silent before its state is dropped.
 const IDLE_SECS: u64 = 120;
@@ -475,11 +479,41 @@ impl<H: ControlHandler> Endpoint<H> {
                 refresh_mhz,
             } => self.handler.on_resize(client, width, height, refresh_mhz),
             ClientControl::ListApps => {
+                // Paged: a list that did not fit one reliable frame used to be
+                // dropped whole, without a word.
                 let apps = self.handler.on_app_list();
-                self.send_to_client(client, &ServerControl::AppList(apps));
+                for page in app_list_pages(&apps, MAX_CONTROL_PAYLOAD) {
+                    self.send_to_client(client, &page);
+                }
             }
             ClientControl::LaunchApp { app_id } => {
-                let _ = self.handler.on_launch(app_id);
+                let result = self.handler.on_launch(app_id);
+                self.send_to_client(
+                    client,
+                    &ServerControl::LaunchResult {
+                        app_id,
+                        ok: result.is_ok(),
+                        message: result.err().unwrap_or_default(),
+                    },
+                );
+            }
+            ClientControl::ArtRequest { app_id, .. } => {
+                // Art rides the in-order control channel, so a transfer holds up
+                // whatever is queued behind it. The grid asks before any stream
+                // starts; a client whose queue is already deep is refused rather
+                // than stalled.
+                let deep = self
+                    .sessions
+                    .get(&client)
+                    .is_some_and(|s| s.pending_out.len() > ART_QUEUE_LIMIT);
+                if !deep {
+                    // Whatever the art is now; the chunks carry its digest, so a
+                    // client that asked for an older one learns the new one.
+                    let art = self.handler.on_art(app_id);
+                    for chunk in chunk_art(app_id, art.as_ref().map(|(r, b)| (r, &b[..]))) {
+                        self.send_to_client(client, &chunk);
+                    }
+                }
             }
             ClientControl::PadConnected {
                 pad_index,

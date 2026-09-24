@@ -9,6 +9,8 @@
 //! ```text
 //! fakeclient pair   --server 127.0.0.1:47811 [--max-bitrate-hint 150000]
 //! fakeclient apps   --server 127.0.0.1:47811
+//! fakeclient art    --server 127.0.0.1:47811 <app-id> --out cover.webp
+//! fakeclient launch --server 127.0.0.1:47811 <app-id>
 //! fakeclient input  --server 127.0.0.1:47811 [--script gamepad-sweep]
 //! ```
 //!
@@ -60,6 +62,14 @@ fn main() -> ExitCode {
             Err(e) => Err(e),
         },
         Some("apps") => apps(server, &secrets),
+        Some("art") => match app_id_arg(&refs) {
+            Ok(id) => art(server, &secrets, id, option(&refs, "--out")),
+            Err(e) => Err(e),
+        },
+        Some("launch") => match app_id_arg(&refs) {
+            Ok(id) => launch(server, &secrets, id),
+            Err(e) => Err(e),
+        },
         Some("input") => input(server, &secrets, option(&refs, "--script")),
         Some("stream") => stream_cmd(server, &secrets, &refs),
         _ => {
@@ -81,6 +91,8 @@ const USAGE: &str = "\
 usage:
   fakeclient pair   [--server host:port] [--state path] [--max-bitrate-hint KBPS]
   fakeclient apps   [--server host:port] [--state path]
+  fakeclient art    <app-id> [--out file] [--server host:port] [--state path]
+  fakeclient launch <app-id> [--server host:port] [--state path]
   fakeclient input  [--server host:port] [--state path] [--script name]
   fakeclient stream [--server host:port] [--state path] [--codecs hevc,av1]
                     [--out file.265|file.ivf] [--drop PCT] [--no-retransmit]
@@ -296,31 +308,145 @@ fn hello(client_nonce: [u8; NONCE_LEN]) -> ClientControl {
     })
 }
 
-fn apps(server: SocketAddr, state: &PathBuf) -> Result<(), String> {
-    let stored = load_state(state)?;
-    let mut client = ClientEndpoint::connect(server, Some(SessionKey::from_bytes(stored.secret)))
-        .map_err(|e| e.to_string())?;
+/// The app id: the first argument after the command that is not an option or
+/// an option's value.
+fn app_id_arg(refs: &[&str]) -> Result<u32, String> {
+    let mut rest = refs.iter().skip(1);
+    while let Some(arg) = rest.next() {
+        if arg.starts_with("--") {
+            rest.next();
+            continue;
+        }
+        return arg.parse().map_err(|e| format!("bad app id {arg}: {e}"));
+    }
+    Err("an app id is required".into())
+}
 
-    client
-        .send_control(&hello(generate_nonce()?))
-        .map_err(|e| e.to_string())?;
+/// A paired control connection, without `Hello`: listing, art and launching
+/// need no video session, and a `Hello` would start one.
+fn control(server: SocketAddr, state: &PathBuf) -> Result<ClientEndpoint, String> {
+    let stored = load_state(state)?;
+    ClientEndpoint::connect(server, Some(SessionKey::from_bytes(stored.secret)))
+        .map_err(|e| e.to_string())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn apps(server: SocketAddr, state: &PathBuf) -> Result<(), String> {
+    let mut client = control(server, state)?;
     client
         .send_control(&ClientControl::ListApps)
         .map_err(|e| e.to_string())?;
 
-    match await_message(&mut client, "the app list", Duration::from_secs(5))? {
-        ServerControl::AppList(apps) if apps.is_empty() => {
-            println!("(no applications configured)");
-        }
-        ServerControl::AppList(apps) => {
-            for app in apps {
-                println!("{:>4}  {}", app.id, app.name);
+    // Paged: collect until `total` have arrived.
+    let mut apps = Vec::new();
+    loop {
+        match await_message(&mut client, "the app list", Duration::from_secs(5))? {
+            ServerControl::AppList(page) => {
+                apps.extend(page.apps);
+                if apps.len() >= page.total as usize {
+                    break;
+                }
             }
+            other => return Err(format!("expected an app list, got {other:?}")),
         }
-        other => return Err(format!("expected an app list, got {other:?}")),
+    }
+    if apps.is_empty() {
+        println!("(no applications configured)");
+    }
+    for app in apps {
+        match app.art {
+            Some(a) => println!(
+                "{:>4}  {}  [art {:?} {} bytes {}]",
+                app.id,
+                app.name,
+                a.format,
+                a.len,
+                hex(&a.digest)
+            ),
+            None => println!("{:>4}  {}", app.id, app.name),
+        }
     }
     client.bye();
     Ok(())
+}
+
+fn art(server: SocketAddr, state: &PathBuf, app_id: u32, out: Option<&str>) -> Result<(), String> {
+    use sunburst_core::proto::art_digest;
+
+    let mut client = control(server, state)?;
+    client
+        .send_control(&ClientControl::ArtRequest {
+            app_id,
+            digest: [0; 16],
+        })
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    let (digest, format) = loop {
+        match await_message(&mut client, "the art", Duration::from_secs(10))? {
+            ServerControl::ArtChunk(c) if c.app_id == app_id => {
+                if c.total_len == 0 {
+                    client.bye();
+                    println!("app {app_id} has no art");
+                    return Ok(());
+                }
+                if c.offset as usize != bytes.len() {
+                    return Err(format!("chunk at {} after {} bytes", c.offset, bytes.len()));
+                }
+                bytes.extend_from_slice(&c.data);
+                if bytes.len() >= c.total_len as usize {
+                    break (c.digest, c.format);
+                }
+            }
+            _ => {}
+        }
+    };
+    client.bye();
+    if art_digest(&bytes) != digest {
+        return Err(format!(
+            "MISMATCH: {} bytes do not hash to {}",
+            bytes.len(),
+            hex(&digest)
+        ));
+    }
+    println!(
+        "{} bytes, {format:?}, digest {} (verified)",
+        bytes.len(),
+        hex(&digest)
+    );
+    if let Some(path) = out {
+        std::fs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+        println!("wrote {path}");
+    }
+    Ok(())
+}
+
+fn launch(server: SocketAddr, state: &PathBuf, app_id: u32) -> Result<(), String> {
+    let mut client = control(server, state)?;
+    client
+        .send_control(&ClientControl::LaunchApp { app_id })
+        .map_err(|e| e.to_string())?;
+    let result = loop {
+        if let ServerControl::LaunchResult {
+            app_id: id,
+            ok,
+            message,
+        } = await_message(&mut client, "the launch result", Duration::from_secs(10))?
+            && id == app_id
+        {
+            break if ok { Ok(()) } else { Err(message) };
+        }
+    };
+    client.bye();
+    match result {
+        Ok(()) => {
+            println!("launched {app_id}");
+            Ok(())
+        }
+        Err(message) => Err(format!("launch {app_id} failed: {message}")),
+    }
 }
 
 fn input(server: SocketAddr, state: &PathBuf, script: Option<&str>) -> Result<(), String> {

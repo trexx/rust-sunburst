@@ -284,7 +284,10 @@ Client → server:
   see Pairing below.**
 - `PairConfirm` — `request_id`, `tag`. Also unauthenticated.
 - `ListApps` — ask for the catalogue
-- `LaunchApp` — `app_id` from the last `AppList`
+- `LaunchApp` — `app_id` from the last `AppList`; answered by `LaunchResult`
+- `ArtRequest` — `u32 app_id, [16] digest`: send this app's box art. Ask for
+  one image at a time, only for a digest not already cached, and only before a
+  stream starts (see `ArtChunk`)
 - `Hello` — client capabilities, ABI, display info, `client_nonce`, `clock_offset_ns`,
   and `codecs`, a bitmask of what the client can decode (bit0 HEVC Main10,
   bit1 AV1 Main10, bit2 H.264 High 8-bit) from its `MediaCodecList` enumeration.
@@ -318,8 +321,48 @@ Client → server:
 
 Server → client:
 - `PairChallenge` — `request_id`, `server_nonce`. Unauthenticated.
-- `AppList` — `(app_id, name)` pairs. **Names and ids only:** box art is a later
-  phase, and a reliable control channel is the wrong carrier for image payloads.
+- `AppList` — one page of the catalogue. A long list does not fit one reliable
+  frame (1179 bytes of message), and used to be dropped whole without a word;
+  it is paged, and the client collects pages until it has `total` entries:
+
+  ```
+  u16  total           entries in the whole list
+  u16  start           index of this page's first entry
+  u16  count
+  -- count times:
+  u32  app_id
+  u8+  name            length-prefixed UTF-8
+  u8   flags           bit0: art follows
+  -- if art:
+  [16] digest          first 16 bytes of the image's BLAKE3 hash
+  u32  len             bytes
+  u8   format          0 PNG, 1 JPEG, 2 WebP
+  ```
+- `ArtChunk` — box art, chunked like `CursorShape`: every chunk repeats the
+  head and the in-order channel means the receiver appends.
+
+  ```
+  u32  app_id
+  [16] digest          of the whole image; verify before keeping it
+  u8   format
+  u32  total_len       0 = this app has no art
+  u32  offset
+  u16  len, bytes      at most 1024
+  ```
+
+  **Art rides the control channel, not HTTP.** The client already holds this
+  channel, authenticated with its pairing secret. The web API's bearer token
+  is the operator's, not the TV's, so fetching art over HTTP would need a
+  second, client-facing auth scheme. An image is at most 512 KiB, which is
+  ~500 chunks and a fraction of a second on a LAN. The one cost is
+  head-of-line blocking, since everything queued behind an image waits. The
+  grid fetches before any stream starts, one image at a time, and the server
+  refuses an `ArtRequest` while that client's control queue is deeper than 64.
+  The chunks always carry the *current* image, so a client that asked for an
+  older digest learns the new one. An image is named by its content, so the
+  client caches by digest and never fetches an unchanged image twice.
+- `LaunchResult` — `u32 app_id, u8 ok, u8+ message`: whether `LaunchApp` started
+  the app, and why not (the message is cut to 255 bytes, never refused).
 - `SessionConfig` — everything the client needs before the first frame. Sent
   once per session, signed with the pairing key (it carries the nonce the
   session key derives from):

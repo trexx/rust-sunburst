@@ -15,11 +15,12 @@
 //! [`on_input`]: ControlHandler::on_input
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{
-    AppListing, DecoderQuirks, Feedback, Hello, InputEvent, PadOutput, PairRequest, Rumble, Seq16,
-    ServerControl, SessionConfig, SessionKey, StreamCodec,
+    AppListing, ArtRef, DecoderQuirks, Feedback, Hello, InputEvent, PadOutput, PairRequest, Rumble,
+    Seq16, ServerControl, SessionConfig, SessionKey, StreamCodec,
 };
 
 /// Per-session stream settings the handler resolves before a session starts —
@@ -272,6 +273,13 @@ pub trait ControlHandler: Send {
     fn on_app_list(&mut self) -> Vec<AppListing>;
     fn on_launch(&mut self, app_id: u32) -> Result<(), String>;
 
+    /// An app's box art: what the listing says about it and the bytes. Default
+    /// none. Answered from memory — the endpoint thread also receives input,
+    /// and must not wait on a disk.
+    fn on_art(&mut self, _app_id: u32) -> Option<(ArtRef, Arc<[u8]>)> {
+        None
+    }
+
     /// An updated decoder-quirks report.
     fn on_quirks(&mut self, _client: u32, _quirks: DecoderQuirks) {}
 
@@ -358,6 +366,11 @@ pub struct Recording {
     /// `(client, pad_index, seq, opus payload)` for each pad-mic frame received.
     pub audio_ins: Vec<(u32, u8, Seq16, Vec<u8>)>,
     pub launches: Vec<u32>,
+    /// What `on_launch` fails with, if set.
+    pub launch_error: Option<String>,
+    /// Box art by app id, for `on_art`.
+    pub art: Vec<(u32, Arc<[u8]>)>,
+    pub art_requests: Vec<u32>,
     pub app_list_calls: usize,
     pub byes: Vec<u32>,
     pub stops: Vec<u32>,
@@ -386,6 +399,18 @@ impl Recording {
     #[must_use]
     pub fn with_apps(mut self, apps: Vec<AppListing>) -> Recording {
         self.apps = apps;
+        self
+    }
+
+    /// Box art `on_art` answers with, by app id.
+    pub fn with_art(mut self, app_id: u32, bytes: Vec<u8>) -> Recording {
+        self.art.push((app_id, bytes.into()));
+        self
+    }
+
+    /// Make every launch fail with `message`.
+    pub fn with_launch_error(mut self, message: &str) -> Recording {
+        self.launch_error = Some(message.into());
         self
     }
 
@@ -452,6 +477,10 @@ impl<H: ControlHandler> ControlHandler for std::sync::Arc<std::sync::Mutex<H>> {
 
     fn on_launch(&mut self, app_id: u32) -> Result<(), String> {
         self.lock().expect("not poisoned").on_launch(app_id)
+    }
+
+    fn on_art(&mut self, app_id: u32) -> Option<(ArtRef, Arc<[u8]>)> {
+        self.lock().expect("not poisoned").on_art(app_id)
     }
 
     fn on_input(&mut self, client: u32, seq: u32, event: InputEvent) {
@@ -566,7 +595,18 @@ impl ControlHandler for Recording {
 
     fn on_launch(&mut self, app_id: u32) -> Result<(), String> {
         self.launches.push(app_id);
-        Ok(())
+        match &self.launch_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn on_art(&mut self, app_id: u32) -> Option<(ArtRef, Arc<[u8]>)> {
+        self.art_requests.push(app_id);
+        self.art
+            .iter()
+            .find(|(id, _)| *id == app_id)
+            .and_then(|(_, bytes)| ArtRef::of(bytes).map(|r| (r, Arc::clone(bytes))))
     }
 
     fn on_input(&mut self, client: u32, seq: u32, event: InputEvent) {

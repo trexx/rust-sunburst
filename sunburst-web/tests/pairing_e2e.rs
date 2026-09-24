@@ -280,7 +280,7 @@ fn a_paired_client_lists_apps_and_sends_input() {
 
     let apps = h.wait("the app list", || {
         match client.recv_control().expect("recv") {
-            Some(ServerControl::AppList(apps)) => Some(apps),
+            Some(ServerControl::AppList(page)) => Some(page.apps),
             _ => None,
         }
     });

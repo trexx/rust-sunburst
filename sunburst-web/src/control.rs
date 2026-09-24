@@ -174,6 +174,7 @@ impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
             .map(|a| AppListing {
                 id: a.id,
                 name: a.name,
+                art: None,
             })
             .collect()
     }

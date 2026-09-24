@@ -22,6 +22,7 @@
 //! filter, but it lets unauthenticated traffic move the replay window, which is
 //! the one thing it must not be able to do. The MAC costs about 100ns.
 
+pub mod art;
 pub mod auth;
 pub mod color;
 pub mod control;
@@ -34,6 +35,10 @@ pub mod pairing;
 pub mod rumble;
 pub mod seq;
 
+pub use art::{
+    ART_CHUNK_MAX, ART_MAX_BYTES, AppPage, ArtChunk, ArtFormat, ArtRef, app_list_pages, art_digest,
+    chunk_art,
+};
 pub use auth::{MAC_LEN, NONCE_LEN, SessionKey};
 pub use color::{ColorInfo, cicp};
 pub use control::{

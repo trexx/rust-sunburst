@@ -86,6 +86,29 @@ fn codec_private(hdr: bool) -> CodecPrivate {
     }
 }
 
+fn app_page() -> AppPage {
+    AppPage {
+        total: 12,
+        start: 10,
+        apps: vec![
+            AppListing {
+                id: 0,
+                name: "Big Picture".into(),
+                art: None,
+            },
+            AppListing {
+                id: 4,
+                name: "Cyberpunk 2077".into(),
+                art: Some(ArtRef {
+                    digest: [0x11; 16],
+                    len: 300_000,
+                    format: ArtFormat::Jpeg,
+                }),
+            },
+        ],
+    }
+}
+
 fn round_trip_client(message: ClientControl) {
     let encoded = message.encode().expect("encode");
     let (decoded, used) = ClientControl::decode(&encoded).expect("decode");
@@ -119,6 +142,10 @@ fn every_implemented_client_message_round_trips() {
     round_trip_client(ClientControl::Quirks(quirks()));
     round_trip_client(ClientControl::ListApps);
     round_trip_client(ClientControl::LaunchApp { app_id: 7 });
+    round_trip_client(ClientControl::ArtRequest {
+        app_id: 7,
+        digest: [0xC3; 16],
+    });
     round_trip_client(ClientControl::RequestIdr);
     round_trip_client(ClientControl::Resize {
         width: 1920,
@@ -140,18 +167,26 @@ fn every_implemented_server_message_round_trips() {
         request_id: 5,
         server_nonce: [3; NONCE_LEN],
     });
-    round_trip_server(ServerControl::AppList(vec![
-        AppListing {
-            id: 0,
-            name: "Big Picture".into(),
-        },
-        AppListing {
-            id: 4,
-            name: "Cyberpunk 2077".into(),
-        },
-    ]));
+    round_trip_server(ServerControl::AppList(app_page()));
     round_trip_server(ServerControl::Bye);
-    round_trip_server(ServerControl::AppList(Vec::new()));
+    round_trip_server(ServerControl::AppList(AppPage {
+        total: 0,
+        start: 0,
+        apps: Vec::new(),
+    }));
+    round_trip_server(ServerControl::ArtChunk(ArtChunk {
+        app_id: 4,
+        digest: [0x5A; 16],
+        format: ArtFormat::Webp,
+        total_len: 3_000,
+        offset: 2_048,
+        data: vec![7; 952],
+    }));
+    round_trip_server(ServerControl::LaunchResult {
+        app_id: 4,
+        ok: false,
+        message: "an app is already running: 2".into(),
+    });
     round_trip_server(ServerControl::SessionConfig(session_config(true)));
     round_trip_server(ServerControl::SessionConfig(session_config(false)));
     // Audio absent must round-trip too, not just the present case the helper sets.
@@ -405,6 +440,7 @@ fn discriminants_are_pinned() {
     assert_eq!(ClientMessage::Bye as u8, 6);
     assert_eq!(ClientMessage::PairRequest as u8, 7);
     assert_eq!(ClientMessage::LaunchApp as u8, 10);
+    assert_eq!(ClientMessage::ArtRequest as u8, 11);
     assert_eq!(ServerMessage::SessionConfig as u8, 0);
     assert_eq!(ServerMessage::CodecPrivate as u8, 1);
     assert_eq!(ServerMessage::CursorShape as u8, 2);
@@ -412,6 +448,8 @@ fn discriminants_are_pinned() {
     assert_eq!(ServerMessage::SecureDesktop as u8, 4);
     assert_eq!(ServerMessage::PairChallenge as u8, 6);
     assert_eq!(ServerMessage::AppList as u8, 7);
+    assert_eq!(ServerMessage::ArtChunk as u8, 8);
+    assert_eq!(ServerMessage::LaunchResult as u8, 9);
 }
 
 #[test]
@@ -425,6 +463,7 @@ fn only_the_pairing_exchange_may_arrive_unauthenticated() {
         ClientMessage::Hello,
         ClientMessage::LaunchApp,
         ClientMessage::ListApps,
+        ClientMessage::ArtRequest,
         ClientMessage::Bye,
         ClientMessage::PadConnected,
         ClientMessage::RequestIdr,
@@ -463,6 +502,20 @@ fn truncation_is_refused_rather_than_panicking() {
             visible: true,
             input_seq: 3,
         },
+        ServerControl::AppList(app_page()),
+        ServerControl::ArtChunk(ArtChunk {
+            app_id: 1,
+            digest: [2; 16],
+            format: ArtFormat::Png,
+            total_len: 10,
+            offset: 0,
+            data: vec![3; 10],
+        }),
+        ServerControl::LaunchResult {
+            app_id: 1,
+            ok: true,
+            message: "ok".into(),
+        },
     ] {
         let encoded = message.encode().expect("encode");
         for len in 0..encoded.len() {
@@ -473,6 +526,37 @@ fn truncation_is_refused_rather_than_panicking() {
         }
         assert!(ServerControl::decode(&encoded).is_ok());
     }
+}
+
+#[test]
+fn an_oversized_art_chunk_is_refused_both_ways() {
+    let big = ServerControl::ArtChunk(ArtChunk {
+        app_id: 1,
+        digest: [0; 16],
+        format: ArtFormat::Png,
+        total_len: 5_000,
+        offset: 0,
+        data: vec![0; ART_CHUNK_MAX + 1],
+    });
+    assert!(big.encode().is_err());
+}
+
+#[test]
+fn a_long_launch_message_is_cut_not_refused() {
+    let long = "é".repeat(200); // 400 bytes of 2-byte characters
+    let encoded = ServerControl::LaunchResult {
+        app_id: 1,
+        ok: false,
+        message: long,
+    }
+    .encode()
+    .expect("a long message still encodes");
+    let (ServerControl::LaunchResult { message, .. }, _) =
+        ServerControl::decode(&encoded).expect("decode")
+    else {
+        panic!("not a launch result");
+    };
+    assert!(message.len() <= MAX_STRING && message.chars().all(|c| c == 'é'));
 }
 
 #[test]
