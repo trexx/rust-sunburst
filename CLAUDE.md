@@ -181,16 +181,16 @@ sunburst-android/  cdylib + JNI shim
 android/           Gradle project; Kotlin owns Activity + SurfaceView, and
                    forwards the input and platform queries with no NDK equivalent
 web/               Vite + React + TS management UI
-tools/             development tools. Kept, unlike spikes/.
-spikes/            Phase 0 throwaway. Deletable by design -- with one exception, below.
+tools/             development tools: fakeclient, probe-windows, check-phy.sh
 ```
 
-**The exception: `spikes/probe-windows` now holds the only working NvFBC code in
-the project** — `nvfbc.rs`, `tocuda.rs`, `cuda.rs`, `capture.rs`. It cost seven
-hardware runs to get right, and the keyed `CreateEx`, the V2-not-V3 setup struct,
-the vtable slot order and the CUDA teardown order are all things that were wrong
-at least once before they were right. **Promote it into `sunburst-capture` before
-deleting `spikes/`**, or that goes with it.
+**`tools/probe-windows` is the Phase 0 probe, kept.** Its NvFBC code (the keyed
+`CreateEx`, the V2-not-V3 setup struct, the vtable slot order, the CUDA teardown
+order — each wrong at least once before it was right) is promoted into
+`sunburst-capture`; the probe stays because it still holds the hardware
+harnesses nothing else has: NvFBC status/`NvFBC_Enable`, the NVML second-session
+query, the present→capture latency harness (`HARDWARE_TESTING.md` §7) and the
+direct-pad baseline (§8). `tools/check-phy.sh` is the §3 link-rate check.
 
 `sunburst-capture`, `-encode` and `-server` are `#![cfg(windows)]` at the crate
 root, so they compile to nothing on a Linux host. `sunburst-core`, `-net` and

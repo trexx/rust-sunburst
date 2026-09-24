@@ -35,6 +35,6 @@
   ],
   "ignorePaths": [
     "sunburst-gip-bridge/vendor/**",
-    "spikes/**"
+    "tools/probe-windows/**"
   ]
 }

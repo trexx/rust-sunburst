@@ -12,14 +12,12 @@ members = [
     "sunburst-android",
     "sunburst-gip-bridge",
 
-    # Phase 0 throwaway. A workspace member so it is type-checked in the same
-    # pass as everything else, and deleted with the rest of spikes/ when Phase 0
-    # closes.
-    "spikes/probe-windows",
-
-    # Development tools. Unlike spikes/, these are kept: the fake client is the
-    # only end-to-end test that runs without a Windows box or a TV.
+    # Development tools, kept. The fake client is the only end-to-end test that
+    # runs without a Windows box or a TV; the probe holds the hardware harnesses
+    # the checklist still runs (NvFBC status, NVML, present->capture latency, the
+    # direct-pad baseline).
     "tools/fakeclient",
+    "tools/probe-windows",
 ]
 
 [workspace.package]

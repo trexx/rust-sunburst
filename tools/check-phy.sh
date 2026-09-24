@@ -8,7 +8,7 @@
 # now against a problem that would otherwise be diagnosed as an encoder or
 # pacing bug somewhere in Phase 4.
 #
-# Usage: spikes/check-phy.sh [adb-serial]
+# Usage: tools/check-phy.sh [adb-serial]
 #
 #
 # Why this measures throughput instead of reading the negotiated rate

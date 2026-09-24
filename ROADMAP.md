@@ -11,11 +11,12 @@ phase's acceptance criteria pass.
 Throwaway code. The point is to resolve architecture-invalidating unknowns before
 committing to any of them.
 
-One piece is no longer throwaway: `spikes/probe-windows`'s NvFBC implementation
-is the only working copy in the project and has to be promoted into
-`sunburst-capture` in Phase 3 before this directory is deleted. **That promotion
-is done** (commit `dd805a7`), so `spikes/` is now deletable; the deletion itself
-is left as a deliberate step.
+The probe outlived the phase. Its NvFBC implementation was promoted into
+`sunburst-capture` (commit `dd805a7`), and the probe itself moved to
+`tools/probe-windows` rather than being deleted with `spikes/`: it still holds
+the hardware harnesses the checklist runs and nothing else has — NvFBC status
+probing, the NVML second-session query, the present→capture latency harness
+(§7) and the direct-pad baseline (§8).
 
 ### 0.1 NvFBC availability — **closed: available, GPU-resident, kept as an option**
 NVIDIA deprecated NvFBC on the Windows side of the Capture SDK and directs Windows
@@ -169,7 +170,7 @@ the actual TVs.
 - **DDA** backend: blocking `AcquireNextFrame` on a dedicated thread, release
   immediately after taking the texture reference.
 - **WGC** backend: free-threaded frame pool, `R16G16B16A16Float` for HDR.
-- **NvFBC** backend, opt-in: promoted out of `spikes/probe-windows`, keyed
+- **NvFBC** backend, opt-in: promoted out of the Phase 0 probe (now `tools/probe-windows`), keyed
   `CreateEx` → `NvFBCToCuda` → `cuGraphicsD3D11RegisterResource` so the trait
   still yields a D3D11 texture. Never selected automatically.
 - Backend selection: WGC on Win11, DDA on Win10, fall back to the other on

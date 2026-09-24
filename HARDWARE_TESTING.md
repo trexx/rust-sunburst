@@ -67,7 +67,7 @@ probe-windows --enable-nvfbc   # NvFBC_Enable: needs elevation, resets the drive
 Windows HDR off and once on. An idle desktop has produced two wrong conclusions
 in this investigation already; the probe now refuses to draw one instead.
 
-Run `spikes/probe-windows`. It answers more than the roadmap asked for, because
+Run `tools/probe-windows`. It answers more than the roadmap asked for, because
 the extra questions cost nothing once the encoder session is open and each one
 de-risks Phase 3.
 
@@ -436,7 +436,7 @@ threw — is an unambiguous answer. `FEATURE_LowLatency` remains the thing to tr
 ## 3. Phase 0.3 — Network PHY (env A and B)
 
 ```bash
-spikes/check-phy.sh [adb-serial]
+tools/check-phy.sh [adb-serial]
 ```
 
 - [x] **Shield: link is gigabit.** 216 Mbps measured, well past a 100Mbit PHY's
@@ -458,7 +458,7 @@ spikes/check-phy.sh [adb-serial]
 - [ ] Confirm the switch port agrees, not just the box — a single bad pair
       negotiates 100 and looks exactly like a hardware limit. **Deferred to
       whenever the box is actually wired**, since it cannot be checked before
-      there is a cable in it. Re-run `spikes/check-phy.sh` then: it will stop
+      there is a cable in it. Re-run `tools/check-phy.sh` then: it will stop
       warning about the missing ethernet interface, which is itself the signal
       that the number finally means what it says.
 - [ ] **If the Homatics is meant to run on Wi-Fi in production, that is a

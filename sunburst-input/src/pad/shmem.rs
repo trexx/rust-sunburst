@@ -2,7 +2,7 @@
 
 //! The driver's shared-memory contract — how a report reaches the driver.
 //!
-//! Cleaned up from `spikes/probe-windows/src/hidmaestro.rs`. The injector **owns**
+//! Cleaned up from `tools/probe-windows/src/hidmaestro.rs`. The injector **owns**
 //! the sections (it `CreateFileMapping`s them; the driver opens them once its
 //! device node exists), writes each input report under a seqlock, and rings a
 //! named event the driver's worker waits on. Output reports (the game's rumble /
