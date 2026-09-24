@@ -397,7 +397,14 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   acceleration curve to injected relative deltas. Compensating was considered and
   declined: the curve is undocumented and varies with pointer speed, and being
   subtly wrong reads as "the mouse feels off", which is close to unattributable.
-  One checkbox per install beats a guess that drifts.
+  One checkbox per install beats a guess that drifts. `disable_epp` does it for
+  the session, and also pins the pointer speed to 10 (1:1) so the only gain is
+  our own sensitivity. The client predicts its cursor overlay from that gain
+  (`SessionConfig.pointer_gain_milli`), and the server reports 0, "do not
+  predict", while EPP is on.
+- **Scale relative deltas with a carried remainder** (`keymap::MouseScaler`),
+  never by rounding each event. A slow mouse sends ±1: rounded, 0.5 comes out
+  as ±1 (full speed) and 1.5 as ±2.
 - Pads are HIDMaestro UMDF2 device nodes carrying reports built in Rust
   (`sunburst-input/src/pad/`), not ViGEmBus. That reversed the Phase 2 plan
   (`b7d971f`); `HARDWARE_TESTING.md` §8 keeps the reasoning.

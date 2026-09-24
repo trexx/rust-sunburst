@@ -66,6 +66,7 @@ fn session_config(hdr: bool) -> SessionConfig {
         qpc_freq_hz: 10_000_000,
         server_ns: -5,
         hello_delay_ns: 120_000_000,
+        pointer_gain_milli: 1_500,
     }
 }
 
@@ -194,6 +195,7 @@ fn every_implemented_server_message_round_trips() {
         x: 65_535,
         y: 0,
         visible: true,
+        input_seq: 0xDEAD_BEEF,
     });
     round_trip_server(ServerControl::SecureDesktop { active: true });
     round_trip_server(ServerControl::SecureDesktop { active: false });
@@ -455,6 +457,12 @@ fn truncation_is_refused_rather_than_panicking() {
         ServerControl::SessionConfig(session_config(true)),
         ServerControl::CodecPrivate(codec_private(true)),
         ServerControl::CodecPrivate(codec_private(false)),
+        ServerControl::CursorPosition {
+            x: 1,
+            y: 2,
+            visible: true,
+            input_seq: 3,
+        },
     ] {
         let encoded = message.encode().expect("encode");
         for len in 0..encoded.len() {

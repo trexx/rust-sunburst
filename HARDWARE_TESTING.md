@@ -1270,7 +1270,14 @@ instrumentation rows where latency is involved.
 - [ ] **Input tuning.** Mouse sensitivity scales injected relative deltas (1.0 is
       1:1); gamepad deadzone widens the neutral zone; the EPP toggle turns
       Enhanced Pointer Precision off for the session (verify in the OS mouse
-      settings) and restores it on disconnect.
+      settings) and restores it on disconnect. It also pins the pointer speed
+      slider to the middle (10) and puts it back afterwards; set it to 14 first
+      so a missed restore shows. At 0.5 and 1.5, slow motion should crawl at
+      half and 1.5× speed rather than moving at full speed: the scaler carries
+      the fraction, where rounding each event used to lose it.
+- [ ] **The reported gain matches.** `SessionConfig.pointer_gain_milli` is
+      1000 × sensitivity with the EPP toggle on, and 0 with EPP left on in the
+      OS (the client then stops predicting and follows the server).
 - [ ] **Client requests, clamped.** From the TV settings screen a codec request
       is honoured only if the device can decode it (else negotiation falls back);
       a bitrate ceiling only lowers the rate, never raises it past the server cap.

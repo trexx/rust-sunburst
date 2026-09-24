@@ -293,24 +293,69 @@ pub fn relative_action(dx: i16, dy: i16) -> MouseAction {
     }
 }
 
-/// Scale a relative mouse delta by a sensitivity multiplier, rounding and
-/// saturating to `i32` so a fast flick cannot wrap. `1.0` is 1:1.
-pub fn scale_delta(v: i16, sensitivity: f32) -> i32 {
-    if sensitivity == 1.0 {
-        return i32::from(v);
-    }
-    let scaled = (f32::from(v) * sensitivity).round();
-    scaled.clamp(i32::MIN as f32, i32::MAX as f32) as i32
+/// Scales relative mouse deltas by a sensitivity multiplier without losing
+/// motion. `1.0` is 1:1.
+///
+/// Rounding each event on its own is lossy in a way that is easy to feel: at
+/// 0.5, a slow mouse sending ±1 counts rounds every one of them back to ±1, so
+/// half-speed is full speed; at 1.5, ±1 becomes ±2 and slow motion runs a third
+/// fast. The fraction each event leaves is carried into the next, so the
+/// injected total tracks `sensitivity × Σdelta` to within one count at any
+/// speed. It is also what makes the client's own prediction of the pointer
+/// (which multiplies by the same gain) come out where the server does.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MouseScaler {
+    rx: f32,
+    ry: f32,
 }
 
-/// A relative-move action with the deltas scaled by `sensitivity`.
-pub fn relative_action_scaled(dx: i16, dy: i16, sensitivity: f32) -> MouseAction {
-    MouseAction {
-        flags: mouse_flags::MOVE,
-        data: 0,
-        dx: scale_delta(dx, sensitivity),
-        dy: scale_delta(dy, sensitivity),
+impl MouseScaler {
+    pub fn new() -> MouseScaler {
+        MouseScaler::default()
     }
+
+    /// The whole counts to inject for this delta at `sensitivity`.
+    pub fn scale(&mut self, dx: i16, dy: i16, sensitivity: f32) -> (i32, i32) {
+        if sensitivity == 1.0 {
+            return (i32::from(dx), i32::from(dy));
+        }
+        let x = carry(&mut self.rx, dx, sensitivity);
+        let y = carry(&mut self.ry, dy, sensitivity);
+        (x, y)
+    }
+
+    /// A relative-move action for this delta.
+    pub fn relative_action(&mut self, dx: i16, dy: i16, sensitivity: f32) -> MouseAction {
+        let (dx, dy) = self.scale(dx, dy, sensitivity);
+        MouseAction {
+            flags: mouse_flags::MOVE,
+            data: 0,
+            dx,
+            dy,
+        }
+    }
+}
+
+/// One axis: add the scaled delta to the carried fraction, emit the whole part
+/// (toward zero, saturating so a flick cannot wrap), keep the rest.
+fn carry(rem: &mut f32, v: i16, sensitivity: f32) -> i32 {
+    let total = *rem + f32::from(v) * sensitivity;
+    let whole = total.trunc();
+    *rem = total - whole;
+    whole.clamp(i32::MIN as f32, i32::MAX as f32) as i32
+}
+
+/// Windows' pointer-speed multiplier for relative moves with Enhanced Pointer
+/// Precision **off**: the Control Panel slider's 1–20 (`SPI_GETMOUSESPEED`),
+/// 10 being 1:1. With EPP on there is no such number — the gain depends on the
+/// speed of the motion — which is why the server only reports a gain when EPP is
+/// off.
+pub fn pointer_speed_multiplier(speed: u32) -> f32 {
+    const TABLE: [f32; 20] = [
+        0.03125, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5, 1.75, 2.0,
+        2.25, 2.5, 2.75, 3.0, 3.25, 3.5,
+    ];
+    TABLE[(speed.clamp(1, 20) - 1) as usize]
 }
 
 /// Apply a radial deadzone to a stick: if the pair's magnitude is within
@@ -604,14 +649,57 @@ mod tests {
 
     #[test]
     fn sensitivity_scales_and_1_0_is_identity() {
-        assert_eq!(scale_delta(100, 1.0), 100);
-        assert_eq!(scale_delta(-100, 1.0), -100);
-        assert_eq!(scale_delta(100, 2.0), 200);
-        assert_eq!(scale_delta(100, 0.5), 50);
+        let mut m = MouseScaler::new();
+        assert_eq!(m.scale(100, -100, 1.0), (100, -100));
+        assert_eq!(m.scale(100, 0, 2.0), (200, 0));
+        assert_eq!(m.scale(100, 0, 0.5), (50, 0));
         // A big flick scaled up stays exact in i32 rather than wrapping i16.
-        assert_eq!(scale_delta(30_000, 4.0), 120_000);
-        let a = relative_action_scaled(-50, 20, 2.0);
+        assert_eq!(m.scale(30_000, 0, 4.0), (120_000, 0));
+        let a = m.relative_action(-50, 20, 2.0);
+        assert_eq!(a.flags, mouse_flags::MOVE);
         assert_eq!((a.dx, a.dy), (-100, 40));
+    }
+
+    #[test]
+    fn slow_motion_keeps_its_fraction() {
+        // A slow mouse sends ±1. Rounded per event, 0.5 gave ±1 (full speed)
+        // and 1.5 gave ±2; carried, the total is the scaled total.
+        for sensitivity in [0.5f32, 0.75, 1.5, 2.25] {
+            for sign in [1i16, -1] {
+                let mut m = MouseScaler::new();
+                let mut total = 0i32;
+                for _ in 0..1000 {
+                    total += m.scale(sign, 0, sensitivity).0;
+                }
+                let want = f32::from(sign) * 1000.0 * sensitivity;
+                assert!(
+                    (total as f32 - want).abs() <= 1.0,
+                    "{sensitivity} x {sign}: {total} vs {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_axes_carry_separately_and_a_reversal_is_symmetric() {
+        let mut m = MouseScaler::new();
+        assert_eq!(m.scale(1, -1, 0.5), (0, 0));
+        assert_eq!(m.scale(1, -1, 0.5), (1, -1));
+        // Back the other way: the carried halves cancel rather than lurch.
+        assert_eq!(m.scale(-1, 1, 0.5), (0, 0));
+        assert_eq!(m.scale(-1, 1, 0.5), (-1, 1));
+    }
+
+    #[test]
+    fn pointer_speed_ten_is_one_to_one() {
+        assert_eq!(pointer_speed_multiplier(10), 1.0);
+        assert_eq!(pointer_speed_multiplier(6), 0.5);
+        assert_eq!(pointer_speed_multiplier(14), 2.0);
+        assert_eq!(pointer_speed_multiplier(1), 0.03125);
+        assert_eq!(pointer_speed_multiplier(20), 3.5);
+        // Out-of-range readings clamp rather than index out of bounds.
+        assert_eq!(pointer_speed_multiplier(0), 0.03125);
+        assert_eq!(pointer_speed_multiplier(99), 3.5);
     }
 
     #[test]

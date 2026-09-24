@@ -532,7 +532,8 @@ impl<H: ControlHandler> Endpoint<H> {
             session.replay.accept(packet.input_seq)
         };
         if fresh {
-            self.handler.on_input(client, packet.event);
+            self.handler
+                .on_input(client, packet.input_seq, packet.event);
         }
     }
 

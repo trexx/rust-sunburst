@@ -397,6 +397,12 @@ pub struct SessionConfig {
     /// subtract it from its measured round trip: `offset ≈ server_ns −
     /// t_hello_sent − (rtt − hello_delay_ns) / 2`.
     pub hello_delay_ns: u32,
+    /// How far the server's pointer moves per relative mouse count the client
+    /// sends, in server pixels × 1000: the mouse sensitivity times Windows'
+    /// pointer-speed multiplier. What a client needs to move its own cursor
+    /// overlay from its own input. `0` means do not predict — Enhanced Pointer
+    /// Precision is on, and its curve is not something to guess at.
+    pub pointer_gain_milli: u16,
 }
 
 /// Pixel format of a [`CursorChunk`]. One value today; a byte on the wire so a
@@ -483,6 +489,11 @@ pub enum ServerControl {
         x: u16,
         y: u16,
         visible: bool,
+        /// The newest mouse input (`InputPacket.input_seq`) the server had
+        /// applied when it sampled the pointer, or 0 for none. A client that
+        /// predicts its cursor from its own input replays what came after this
+        /// on top of the position.
+        input_seq: u32,
     },
     /// Capture is unavailable (UAC prompt, lock screen, DRM). The client shows
     /// a placeholder rather than the last frame; `active: false` ends it.
@@ -725,6 +736,7 @@ impl ServerControl {
                     b.push(a.channels);
                     b.extend_from_slice(&a.frame_samples.to_le_bytes());
                 }
+                b.extend_from_slice(&c.pointer_gain_milli.to_le_bytes());
             }
             ServerControl::CodecPrivate(c) => {
                 b.push(c.codec as u8);
@@ -763,10 +775,16 @@ impl ServerControl {
                     b.extend_from_slice(&c.data);
                 }
             }
-            ServerControl::CursorPosition { x, y, visible } => {
+            ServerControl::CursorPosition {
+                x,
+                y,
+                visible,
+                input_seq,
+            } => {
                 b.extend_from_slice(&x.to_le_bytes());
                 b.extend_from_slice(&y.to_le_bytes());
                 b.push(u8::from(*visible));
+                b.extend_from_slice(&input_seq.to_le_bytes());
             }
             ServerControl::SecureDesktop { active } => b.push(u8::from(*active)),
             ServerControl::Bye | ServerControl::Unhandled(_) => {}
@@ -828,6 +846,7 @@ impl ServerControl {
                 } else {
                     None
                 };
+                let pointer_gain_milli = r.u16()?;
                 ServerControl::SessionConfig(SessionConfig {
                     session_id,
                     codec,
@@ -844,6 +863,7 @@ impl ServerControl {
                     qpc_freq_hz,
                     server_ns,
                     hello_delay_ns,
+                    pointer_gain_milli,
                 })
             }
             ServerMessage::CodecPrivate => {
@@ -909,6 +929,7 @@ impl ServerControl {
                 x: r.u16()?,
                 y: r.u16()?,
                 visible: r.u8()? != 0,
+                input_seq: r.u32()?,
             },
             ServerMessage::SecureDesktop => ServerControl::SecureDesktop {
                 active: r.u8()? != 0,

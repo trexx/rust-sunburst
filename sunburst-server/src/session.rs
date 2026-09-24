@@ -125,6 +125,7 @@ struct Active {
 pub struct SessionManager {
     socket: UdpSocket,
     sessions: Arc<Sessions>,
+    input: Arc<sunburst_input::inject::Stats>,
     active: Option<Active>,
     next_session_id: u32,
 }
@@ -134,10 +135,17 @@ impl SessionManager {
     /// shared port. `sessions` is shared with the `Host` for the UI. All stream
     /// config now arrives per session via `session_start`'s [`SessionSettings`]
     /// (the handler resolves it live from the effective config).
-    pub fn new(socket: UdpSocket, sessions: Arc<Sessions>) -> SessionManager {
+    /// `input` is the injector's counters, whose `mouse_seq` the cursor
+    /// reports alongside each position.
+    pub fn new(
+        socket: UdpSocket,
+        sessions: Arc<Sessions>,
+        input: Arc<sunburst_input::inject::Stats>,
+    ) -> SessionManager {
         SessionManager {
             socket,
             sessions,
+            input,
             active: None,
             next_session_id: 1,
         }
@@ -151,6 +159,22 @@ impl SessionManager {
             }
             self.sessions.set_active(None);
         }
+    }
+}
+
+/// The pointer gain to report: server pixels per client mouse count, × 1000.
+/// The sensitivity times Windows' pointer-speed multiplier, read after the EPP
+/// guard has (or has not) done its work. `0`, "do not predict", when EPP is on:
+/// its gain depends on how fast the mouse moves, and a client guessing at it
+/// would be corrected every report.
+fn pointer_gain_milli(sensitivity_milli: u32) -> u16 {
+    match display::pointer_state() {
+        Some((false, speed)) => {
+            let gain =
+                sensitivity_milli as f32 * sunburst_input::keymap::pointer_speed_multiplier(speed);
+            gain.round().clamp(0.0, f32::from(u16::MAX)) as u16
+        }
+        _ => 0,
     }
 }
 
@@ -259,6 +283,9 @@ impl StreamControl for SessionManager {
         });
         let display_guard = DisplayGuard::apply(want_hdr, resolution);
         let epp_guard = settings.disable_epp.then(EppGuard::disable);
+        let pointer_gain_milli = pointer_gain_milli(settings.mouse_sensitivity_milli);
+        // The client numbers input from 1 in each session.
+        self.input.mouse_seq.store(0, Ordering::Release);
 
         let output = match settings.capture_output {
             Some(i) => OutputSelect::Index(i),
@@ -424,6 +451,7 @@ impl StreamControl for SessionManager {
             qpc_freq_hz: qpc_freq_hz(),
             server_ns: now_ns(),
             hello_delay_ns: 0,
+            pointer_gain_milli,
         })
     }
 
@@ -533,6 +561,9 @@ impl StreamControl for SessionManager {
         // Cursor: the shape (reliably) whenever it changes, the position when
         // it changes, at most ~10/s for motion. The client renders it, so it
         // never rides the video and never re-encodes.
+        // Read before sampling: every move up to this seq was handed to
+        // SendInput before the position below was read.
+        let input_seq = self.input.mouse_seq.load(Ordering::Acquire);
         let update = a.cursor.poll();
         for chunk in update.shape {
             out.push(Outbound::Control {
@@ -543,7 +574,12 @@ impl StreamControl for SessionManager {
         if let Some((x, y, visible)) = a.cursor_throttle.offer(update.position, now_ms()) {
             out.push(Outbound::Control {
                 client: a.client,
-                message: ServerControl::CursorPosition { x, y, visible },
+                message: ServerControl::CursorPosition {
+                    x,
+                    y,
+                    visible,
+                    input_seq,
+                },
             });
         }
 

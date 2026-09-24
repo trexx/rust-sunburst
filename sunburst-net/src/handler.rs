@@ -65,6 +65,9 @@ pub struct SessionSettings {
     pub audio_complexity: u8,
     /// Turn Enhanced Pointer Precision off (server-side) for the session.
     pub disable_epp: bool,
+    /// The injector's mouse sensitivity × 1000, so the manager can tell the
+    /// client the pointer gain. Milli, not `f32`, so the settings stay `Eq`.
+    pub mouse_sensitivity_milli: u32,
 }
 
 /// Which capture backend the session should use (mirrors the web config, kept
@@ -128,7 +131,10 @@ impl Default for InputSettings {
 }
 
 pub trait InputSink: Send {
-    fn inject(&mut self, client: u32, event: InputEvent);
+    /// One verified, fresh input event. `seq` is its `InputPacket.input_seq`,
+    /// which a sink that applies mouse motion reports back (see
+    /// `ServerControl::CursorPosition::input_seq`).
+    fn inject(&mut self, client: u32, seq: u32, event: InputEvent);
 
     /// Apply input tuning (mouse sensitivity, deadzone). Default no-op — tests
     /// and `NoInput` ignore it.
@@ -154,7 +160,7 @@ pub trait InputSink: Send {
 pub struct NoInput;
 
 impl InputSink for NoInput {
-    fn inject(&mut self, _client: u32, _event: InputEvent) {}
+    fn inject(&mut self, _client: u32, _seq: u32, _event: InputEvent) {}
 }
 
 /// The video-session half of what the endpoint drives, kept separate from
@@ -286,7 +292,7 @@ pub trait ControlHandler: Send {
     fn session_stop(&mut self, _client: u32) {}
 
     /// Where `sunburst-input` attaches on Windows.
-    fn on_input(&mut self, client: u32, event: InputEvent);
+    fn on_input(&mut self, client: u32, seq: u32, event: InputEvent);
 
     /// A client connected / disconnected a pad. Default no-op — a handler that
     /// manages virtual controllers (the Windows one) forwards these to its
@@ -340,6 +346,8 @@ pub struct Recording {
     pub pair_confirms: Vec<(u32, [u8; TAG_LEN])>,
     pub hellos: Vec<(u32, SocketAddr, Hello)>,
     pub inputs: Vec<(u32, InputEvent)>,
+    /// The `input_seq` of each entry in `inputs`.
+    pub input_seqs: Vec<u32>,
     pub nacks: Vec<(u32, Seq16, Vec<u8>)>,
     pub feedbacks: Vec<(u32, Feedback)>,
     pub quirks: Vec<(u32, DecoderQuirks)>,
@@ -446,8 +454,10 @@ impl<H: ControlHandler> ControlHandler for std::sync::Arc<std::sync::Mutex<H>> {
         self.lock().expect("not poisoned").on_launch(app_id)
     }
 
-    fn on_input(&mut self, client: u32, event: InputEvent) {
-        self.lock().expect("not poisoned").on_input(client, event);
+    fn on_input(&mut self, client: u32, seq: u32, event: InputEvent) {
+        self.lock()
+            .expect("not poisoned")
+            .on_input(client, seq, event);
     }
 
     fn on_quirks(&mut self, client: u32, quirks: DecoderQuirks) {
@@ -559,8 +569,9 @@ impl ControlHandler for Recording {
         Ok(())
     }
 
-    fn on_input(&mut self, client: u32, event: InputEvent) {
+    fn on_input(&mut self, client: u32, seq: u32, event: InputEvent) {
         self.inputs.push((client, event));
+        self.input_seqs.push(seq);
     }
 
     fn on_quirks(&mut self, client: u32, quirks: DecoderQuirks) {

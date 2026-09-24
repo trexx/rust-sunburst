@@ -36,8 +36,8 @@ use windows::Win32::Graphics::Gdi::{
     ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    SPI_GETMOUSE, SPI_SETMOUSE, SPIF_SENDCHANGE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SystemParametersInfoW,
+    SPI_GETMOUSE, SPI_GETMOUSESPEED, SPI_SETMOUSE, SPI_SETMOUSESPEED, SPIF_SENDCHANGE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
 };
 use windows::core::PCWSTR;
 
@@ -339,64 +339,114 @@ impl Drop for VirtualDisplay {
     }
 }
 
-/// Turns Enhanced Pointer Precision (mouse acceleration) off for a session and
-/// restores the prior state on drop.
+/// Turns Enhanced Pointer Precision (mouse acceleration) off for a session,
+/// pins the pointer speed to 1:1, and restores both on drop.
 ///
 /// EPP is the third value of the system `MOUSE` parameters (the acceleration
 /// flag); `SPI_SETMOUSE` with it zeroed disables the acceleration curve that
-/// CLAUDE.md warns makes injected relative deltas feel wrong. Opt-in
-/// (`disable_epp`); otherwise the OS setting is left exactly as the user has it.
+/// CLAUDE.md warns makes injected relative deltas feel wrong. The pointer speed
+/// (`SPI_SETMOUSESPEED`, 1–20) is pinned to 10, which with EPP off is exactly
+/// 1:1: one injected count is one pixel, so the only gain between the client's
+/// mouse and the server's pointer is our own sensitivity, and a client
+/// predicting its cursor multiplies by exactly that. Opt-in (`disable_epp`);
+/// otherwise the OS settings are left exactly as the user has them.
 pub struct EppGuard {
     /// The `[threshold1, threshold2, acceleration]` to restore, if we changed it.
-    restore: Option<[i32; 3]>,
+    restore_mouse: Option<[i32; 3]>,
+    /// The pointer speed to restore, if we changed it.
+    restore_speed: Option<u32>,
+}
+
+/// The pointer speed at which Windows moves one pixel per count (EPP off).
+const ONE_TO_ONE_SPEED: u32 = 10;
+
+fn get_mouse() -> Option<[i32; 3]> {
+    let mut params = [0i32; 3];
+    // SAFETY: SPI_GETMOUSE fills a 3-element i32 array via `pvparam`.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSE,
+            0,
+            Some(params.as_mut_ptr().cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .ok()
+    .map(|()| params)
+}
+
+fn set_mouse(mut params: [i32; 3]) {
+    // SAFETY: SPI_SETMOUSE reads the 3-element array; SENDCHANGE notifies apps.
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSE,
+            0,
+            Some(params.as_mut_ptr().cast()),
+            SPIF_SENDCHANGE,
+        );
+    }
+}
+
+fn get_speed() -> Option<u32> {
+    let mut speed = 0u32;
+    // SAFETY: SPI_GETMOUSESPEED writes one integer through `pvparam`.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSESPEED,
+            0,
+            Some((&mut speed as *mut u32).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .ok()
+    .map(|()| speed)
+}
+
+fn set_speed(speed: u32) {
+    // SAFETY: SPI_SETMOUSESPEED takes the value itself in `pvparam`, not a
+    // pointer to it; nothing is dereferenced.
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_SETMOUSESPEED,
+            0,
+            Some(speed as usize as *mut core::ffi::c_void),
+            SPIF_SENDCHANGE,
+        );
+    }
+}
+
+/// The pointer's current `(acceleration on, speed)`, as the gain reported to
+/// the client is computed from. `None` if either cannot be read.
+pub fn pointer_state() -> Option<(bool, u32)> {
+    Some((get_mouse()?[2] != 0, get_speed()?))
 }
 
 impl EppGuard {
-    /// Disable EPP now (if on), returning a guard that restores it on drop.
+    /// Disable EPP and pin the speed now (each only if not already so),
+    /// returning a guard that restores whatever it changed on drop.
     pub fn disable() -> EppGuard {
-        let mut params = [0i32; 3];
-        // SAFETY: SPI_GETMOUSE fills a 3-element i32 array via `pvparam`.
-        let read = unsafe {
-            SystemParametersInfoW(
-                SPI_GETMOUSE,
-                0,
-                Some(params.as_mut_ptr().cast()),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            )
-        };
-        if read.is_err() || params[2] == 0 {
-            // Query failed, or acceleration already off — nothing to restore.
-            return EppGuard { restore: None };
-        }
-        let mut off = params;
-        off[2] = 0;
-        // SAFETY: SPI_SETMOUSE reads the 3-element array; SENDCHANGE notifies apps.
-        unsafe {
-            let _ = SystemParametersInfoW(
-                SPI_SETMOUSE,
-                0,
-                Some(off.as_mut_ptr().cast()),
-                SPIF_SENDCHANGE,
-            );
-        }
+        let restore_mouse = get_mouse().filter(|p| p[2] != 0).inspect(|params| {
+            let mut off = *params;
+            off[2] = 0;
+            set_mouse(off);
+        });
+        let restore_speed = get_speed()
+            .filter(|&s| s != ONE_TO_ONE_SPEED)
+            .inspect(|_| set_speed(ONE_TO_ONE_SPEED));
         EppGuard {
-            restore: Some(params),
+            restore_mouse,
+            restore_speed,
         }
     }
 }
 
 impl Drop for EppGuard {
     fn drop(&mut self) {
-        if let Some(mut params) = self.restore {
-            // SAFETY: restoring the exact array we read at construction.
-            unsafe {
-                let _ = SystemParametersInfoW(
-                    SPI_SETMOUSE,
-                    0,
-                    Some(params.as_mut_ptr().cast()),
-                    SPIF_SENDCHANGE,
-                );
-            }
+        if let Some(params) = self.restore_mouse {
+            set_mouse(params);
+        }
+        if let Some(speed) = self.restore_speed {
+            set_speed(speed);
         }
     }
 }

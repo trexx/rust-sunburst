@@ -713,6 +713,7 @@ fn session_config() -> SessionConfig {
         qpc_freq_hz: 10_000_000,
         server_ns: 0,
         hello_delay_ns: 0,
+        pointer_gain_milli: 0,
     }
 }
 
@@ -773,7 +774,12 @@ fn hello_offers_a_session_and_input_switches_to_the_session_key() {
         })
         .expect("send");
     server.wait_for("session-key input", |r| r.inputs.len() == 1);
-    server.recording(|r| assert_eq!(r.inputs[0].0, 3));
+    server.recording(|r| {
+        assert_eq!(r.inputs[0].0, 3);
+        // The handler sees the packet's sequence, which the injector reports
+        // back with the cursor position.
+        assert_eq!(r.input_seqs, vec![1]);
+    });
 }
 
 #[test]

@@ -342,6 +342,9 @@ Server → client:
   u32  sample_rate     48000
   u8   channels        2
   u16  frame_samples   samples per channel per packet (240 = 5 ms at 48 kHz)
+  u16  pointer_gain_milli   server pixels per relative mouse count, × 1000:
+                            the mouse sensitivity times Windows' pointer-speed
+                            multiplier. 0 = do not predict (EPP is on)
   ```
 
   `flags` bits 1–2 say what the server will *actually do*, which is the quirks
@@ -396,6 +399,10 @@ Server → client:
   server's observation of the pointer. It is sent when that changes: at once
   for visibility, at most every 100 ms for motion, and never while the pointer
   is still, so a stopped pointer's resting place always lands within 100 ms.
+  Then `u32 input_seq`: the newest mouse `InputPacket.input_seq` the server had
+  handed to `SendInput` when it sampled the pointer (0 for none). A client that
+  moves its overlay from its own input replays its moves after `input_seq` on
+  top of this position rather than snapping back to it.
 - `SecureDesktop` — `u8 active`. Capture unavailable (UAC, lock screen, DRM);
   the client shows a placeholder rather than a frozen frame, and `active = 0`
   ends it.

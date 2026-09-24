@@ -374,7 +374,7 @@ fn run_inner(
                     callbacks.cursor_shape(&bgra, w, h, hx, hy);
                 }
             }
-            Some(Inbound::Control(ServerControl::CursorPosition { x, y, visible })) => {
+            Some(Inbound::Control(ServerControl::CursorPosition { x, y, visible, .. })) => {
                 callbacks.cursor_position(x as i32, y as i32, visible);
             }
             Some(Inbound::Audio(pkt)) => {

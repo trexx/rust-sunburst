@@ -66,7 +66,7 @@ impl Drop for Temp {
 struct RecordedInput(Arc<Mutex<Vec<(u32, InputEvent)>>>);
 
 impl InputSink for RecordedInput {
-    fn inject(&mut self, client: u32, event: InputEvent) {
+    fn inject(&mut self, client: u32, _seq: u32, event: InputEvent) {
         self.0.lock().expect("not poisoned").push((client, event));
     }
 }

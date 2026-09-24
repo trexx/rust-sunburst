@@ -75,7 +75,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // of the very same socket while the endpoint owns it for receive.
     let socket = UdpSocket::bind(stream_addr)?;
     let stream_socket = socket.try_clone()?;
-    let session_mgr = SessionManager::new(stream_socket, sessions);
+    let session_mgr = SessionManager::new(stream_socket, sessions, Arc::clone(injector.stats()));
 
     let handler = WebHandler::new(Arc::clone(&state), injector, session_mgr);
     let mut endpoint = Endpoint::from_socket(socket, handler)?;

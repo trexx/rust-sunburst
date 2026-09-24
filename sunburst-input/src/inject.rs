@@ -30,7 +30,7 @@
 //! either.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,7 +47,10 @@ use crate::pad::{device, gip, install, registry, shmem};
 /// What crosses the channel to the injector thread. The pad sections live on that
 /// one thread, so pad lifecycle rides the same channel as input.
 enum Msg {
-    Input(InputEvent),
+    Input {
+        seq: u32,
+        event: InputEvent,
+    },
     Config(InputSettings),
     PadConnected {
         client: u32,
@@ -96,6 +99,12 @@ pub struct Stats {
     pub reattached: AtomicU64,
     /// Switches that could not be followed — the secure desktop, normally.
     pub attach_failed: AtomicU64,
+    /// The newest `input_seq` whose relative mouse motion has been handed to
+    /// `SendInput`. The cursor poller reads it *before* sampling the pointer and
+    /// reports it with the position, so a client predicting its cursor knows
+    /// which of its moves the position already includes. Reset per session,
+    /// since a client numbers input from 1 in each.
+    pub mouse_seq: AtomicU32,
 }
 
 pub struct Injector {
@@ -149,8 +158,8 @@ impl Injector {
 }
 
 impl InputSink for Injector {
-    fn inject(&mut self, _client: u32, event: InputEvent) {
-        self.send(Msg::Input(event));
+    fn inject(&mut self, _client: u32, seq: u32, event: InputEvent) {
+        self.send(Msg::Input { seq, event });
     }
 
     fn configure(&mut self, settings: InputSettings) {
@@ -237,6 +246,7 @@ fn run(
     let mut modifiers = Modifiers::new();
     let mut pads: [Option<PadState>; MAX_PADS as usize] = std::array::from_fn(|_| None);
     let mut settings = InputSettings::default();
+    let mut mouse = keymap::MouseScaler::new();
     let started = Instant::now();
     let mut last_ensure = started - DESKTOP_POLL;
 
@@ -244,13 +254,21 @@ fn run(
         match rx.recv_timeout(OUTPUT_POLL) {
             Ok(Msg::Config(s)) => settings = s,
             // Gamepad goes to shared memory, not the desktop.
-            Ok(Msg::Input(InputEvent::Gamepad(state))) => {
-                submit_gamepad(&mut pads, &state, settings.gamepad_deadzone)
-            }
-            Ok(Msg::Input(event)) => {
+            Ok(Msg::Input {
+                event: InputEvent::Gamepad(state),
+                ..
+            }) => submit_gamepad(&mut pads, &state, settings.gamepad_deadzone),
+            Ok(Msg::Input { seq, event }) => {
                 desktop.ensure(stats);
                 last_ensure = Instant::now();
-                apply(event, &mut modifiers, stats, settings.mouse_sensitivity);
+                apply(
+                    seq,
+                    event,
+                    &mut modifiers,
+                    &mut mouse,
+                    stats,
+                    settings.mouse_sensitivity,
+                );
             }
             Ok(Msg::PadConnected {
                 client,
@@ -466,7 +484,14 @@ fn build_pad_output(
     }
 }
 
-fn apply(event: InputEvent, modifiers: &mut Modifiers, stats: &Stats, mouse_sensitivity: f32) {
+fn apply(
+    seq: u32,
+    event: InputEvent,
+    modifiers: &mut Modifiers,
+    mouse: &mut keymap::MouseScaler,
+    stats: &Stats,
+    mouse_sensitivity: f32,
+) {
     match event {
         InputEvent::KeyDown { vk, modifiers: m } => {
             for action in modifiers.resolve(vk, true, m) {
@@ -479,10 +504,11 @@ fn apply(event: InputEvent, modifiers: &mut Modifiers, stats: &Stats, mouse_sens
             }
         }
         InputEvent::MouseMove(MouseMotion::Relative { dx, dy }) => {
-            send_mouse(
-                keymap::relative_action_scaled(dx, dy, mouse_sensitivity),
-                stats,
-            );
+            send_mouse(mouse.relative_action(dx, dy, mouse_sensitivity), stats);
+            // Release: a reader that sees this seq also sees that the move was
+            // handed to SendInput. (Windows applies it to the pointer shortly
+            // after, which the client tolerates.)
+            stats.mouse_seq.fetch_max(seq, Ordering::Release);
         }
         InputEvent::MouseMove(MouseMotion::Absolute { x, y }) => {
             send_mouse(keymap::absolute_action(x, y), stats);

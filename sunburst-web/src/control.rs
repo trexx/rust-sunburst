@@ -127,6 +127,9 @@ impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
             audio_fec: e.audio_fec,
             audio_complexity: e.audio_complexity,
             disable_epp: self.state.input_config().disable_epp,
+            mouse_sensitivity_milli: (self.state.input_config().mouse_sensitivity * 1000.0)
+                .round()
+                .max(0.0) as u32,
         };
         // Push the input tuning to the injector (mouse sensitivity / deadzone are
         // applied live; EPP is handled by the session guard via `settings`).
@@ -179,9 +182,9 @@ impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
         self.state.launch(app_id)
     }
 
-    fn on_input(&mut self, client: u32, event: InputEvent) {
+    fn on_input(&mut self, client: u32, seq: u32, event: InputEvent) {
         self.state.touch_last_seen(client, unix_now());
-        self.input.inject(client, event);
+        self.input.inject(client, seq, event);
     }
 
     fn on_pad_connected(&mut self, client: u32, pad_index: u8, pad_type: u8, capabilities: u16) {
