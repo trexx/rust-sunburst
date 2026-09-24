@@ -16,8 +16,8 @@ use jni::objects::{GlobalRef, JValue};
 use ndk::native_window::NativeWindow;
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{
-    CursorChunk, Feedback, Hello, InputPacket, Seq16, ServerControl, StreamCodec,
-    pairing::NONCE_LEN,
+    ClientControl, CodecPrivate, CursorChunk, Feedback, Hello, InputPacket, Seq16, ServerControl,
+    StreamCodec, pairing::NONCE_LEN,
 };
 use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
@@ -26,6 +26,7 @@ use sunburst_net::{
 use crate::decode::Decoder;
 use crate::input_map::{ClientInput, InputAccumulator};
 use crate::pad::{PadOutputRouter, PadSink};
+use crate::reconfig::{Change, KeyframeGate, classify};
 use sunburst_core::proto::input::GamepadState;
 use sunburst_core::proto::padoutput::PadOutput;
 use sunburst_core::proto::rumble::Rumble;
@@ -66,6 +67,11 @@ fn mono_ns() -> i64 {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
     ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64
+}
+
+/// [`mono_ns`] in milliseconds, for the control-plane timers.
+fn mono_ms() -> u64 {
+    (mono_ns() / 1_000_000) as u64
 }
 
 /// Upcalls into the Kotlin activity from the client thread (attached to the JVM
@@ -232,7 +238,7 @@ fn run_inner(
 
     // Await the negotiation: SessionConfig then CodecPrivate.
     let mut config = None;
-    let mut csd: Option<(StreamCodec, Vec<u8>)> = None;
+    let mut csd: Option<CodecPrivate> = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while (config.is_none() || csd.is_none()) && !stop.load(Ordering::Relaxed) {
         if Instant::now() >= deadline {
@@ -250,25 +256,23 @@ fn run_inner(
                 config = Some(c);
             }
             Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
-                csd = Some((cp.codec, cp.data));
+                csd = Some(cp);
             }
             Some(_) => {}
             None => client.tick().map_err(|e| e.to_string())?,
         }
     }
     let config = config.ok_or("no SessionConfig")?;
-    let (_, csd0) = csd.ok_or("no CodecPrivate")?;
+    // The build the decoder runs on. Each later CodecPrivate is compared with
+    // it; one that changes what the decoder sees reconfigures it.
+    let mut current = csd.ok_or("no CodecPrivate")?;
     let fps = (config.fps_mhz.max(1000) / 1000) as i32;
 
-    let decoder = Decoder::new(
-        config.codec,
-        config.width as i32,
-        config.height as i32,
-        fps,
-        &csd0,
-        config.hdr,
-        window,
-    )?;
+    let mut decoder = Decoder::new(&current, fps, window)?;
+    // Closed until a keyframe of the current build arrives. The server's
+    // startup IDR went out during negotiation, so the gate asks for one at once.
+    let mut gate = KeyframeGate::new(current.first_frame, mono_ms());
+    let mut last_fed: Option<Seq16> = None;
 
     // Audio routing: 0 TV only, 1 pad headset only, 2 both.
     let route_tv = prefs.audio_route != 1;
@@ -350,6 +354,21 @@ fn run_inner(
                     Accept::Ignored => {}
                 }
             }
+            // A rebuild on the server (AccessLost, an HDR<->SDR flip).
+            Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
+                if classify(&current, &cp) == Change::Reconfigure {
+                    log::info!(
+                        "reconfiguring the decoder for build at frame {}: {}x{} {:?}",
+                        cp.first_frame.0,
+                        cp.width,
+                        cp.height,
+                        cp.color
+                    );
+                    decoder.reconfigure(&cp, fps, window)?;
+                    gate.close(cp.first_frame, last_fed, mono_ms());
+                }
+                current = cp;
+            }
             Some(Inbound::Control(ServerControl::CursorShape(c))) => {
                 if let Some((bgra, w, h, hx, hy)) = cursor.push(&c) {
                     callbacks.cursor_shape(&bgra, w, h, hx, hy);
@@ -390,14 +409,29 @@ fn run_inner(
                 }
             }
             let fid = rel.frame.frame_id.0 as u32;
-            if let Some(n) = reassembler.copy_into(&rel.frame, &mut out) {
+            // Complete frames the decoder cannot use (the previous build's, or a
+            // P-frame before this build's keyframe) are dropped here, not
+            // NACK-abandoned: the server's references are right, and the
+            // keyframe the gate waits for re-anchors the decoder.
+            if gate.admit(rel.frame.frame_id, rel.frame.keyframe)
+                && let Some(n) = reassembler.copy_into(&rel.frame, &mut out)
+            {
                 match decoder.feed(&out[..n], pts_us, fid) {
-                    Ok(true) => pts_us += frame_interval_us,
+                    Ok(true) => {
+                        pts_us += frame_interval_us;
+                        last_fed = Some(rel.frame.frame_id);
+                    }
                     Ok(false) => log::warn!("decoder input full; dropped frame {fid}"),
                     Err(e) => log::error!("feed: {e}"),
                 }
             }
             reassembler.release(rel.frame);
+        }
+
+        // Waiting on a keyframe: ask for one (at once, then on a retry
+        // interval) until it arrives.
+        if gate.tick(mono_ms()) {
+            let _ = client.send_control(&ClientControl::RequestIdr);
         }
 
         // Present whatever the decoder has finished, at the next vsync.

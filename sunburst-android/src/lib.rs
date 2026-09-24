@@ -38,6 +38,7 @@ pub mod input_map;
 pub mod mic;
 pub mod pad;
 pub mod pin;
+pub mod reconfig;
 
 #[cfg(target_os = "android")]
 pub use jni_bridge::*;

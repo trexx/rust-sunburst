@@ -16,66 +16,98 @@ use ndk::media::media_codec::{
 };
 use ndk::native_window::NativeWindow;
 use sunburst_core::instr::{self, Stage};
-use sunburst_core::proto::{HdrMastering, StreamCodec};
+use sunburst_core::proto::{CodecPrivate, StreamCodec};
 
 use crate::hdr_static_info::hdr_static_info;
+use crate::reconfig::media_color_keys;
 
 /// A configured, started decoder rendering to a Surface.
 pub struct Decoder {
     codec: MediaCodec,
 }
 
+fn mime(codec: StreamCodec) -> &'static str {
+    match codec {
+        StreamCodec::Hevc => "video/hevc",
+        StreamCodec::Av1 => "video/av01",
+        StreamCodec::H264 => "video/avc",
+    }
+}
+
+/// The format one encoder build needs: its size and `csd-0` (HEVC/H.264
+/// parameter sets in Annex-B, or the AV1 av1C record), the low-latency keys,
+/// and its colour. The colour keys are set for SDR too, explicitly BT.709, so a
+/// decoder never guesses; HDR adds the ST 2086 static info when the build
+/// carries it (it rides in the bitstream as well).
+fn format_for(cp: &CodecPrivate, fps: i32) -> MediaFormat {
+    let mut fmt = MediaFormat::new();
+    fmt.set_str("mime", mime(cp.codec));
+    fmt.set_i32("width", i32::from(cp.width));
+    fmt.set_i32("height", i32::from(cp.height));
+    fmt.set_buffer("csd-0", &cp.data);
+    // Low-latency decode: no reorder buffering. KEY_LOW_LATENCY landed at
+    // API 30, this project's floor. Priority 0 = realtime; a high operating
+    // rate tells the codec to run flat out.
+    fmt.set_i32("low-latency", 1);
+    fmt.set_i32("priority", 0);
+    fmt.set_i32("operating-rate", fps.max(60) * 2);
+
+    if let Some((standard, transfer, range)) = media_color_keys(&cp.color) {
+        fmt.set_i32("color-standard", standard);
+        fmt.set_i32("color-transfer", transfer);
+        fmt.set_i32("color-range", range);
+    }
+    if cp.color.is_pq()
+        && let Some(m) = &cp.hdr
+    {
+        fmt.set_buffer("hdr-static-info", &hdr_static_info(m));
+    }
+    fmt
+}
+
 impl Decoder {
-    /// Build and start a decoder for `codec` at `width`×`height`, fed `csd0`
-    /// (HEVC VPS/SPS/PPS Annex-B, or the AV1 av1C record) and rendering into
+    /// Build and start a decoder for one encoder build, rendering into
     /// `surface`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        codec: StreamCodec,
-        width: i32,
-        height: i32,
-        fps: i32,
-        csd0: &[u8],
-        hdr: Option<HdrMastering>,
-        surface: &NativeWindow,
-    ) -> Result<Decoder, String> {
-        let mime = match codec {
-            StreamCodec::Hevc => "video/hevc",
-            StreamCodec::Av1 => "video/av01",
-            StreamCodec::H264 => "video/avc",
-        };
-        let mut fmt = MediaFormat::new();
-        fmt.set_str("mime", mime);
-        fmt.set_i32("width", width);
-        fmt.set_i32("height", height);
-        fmt.set_buffer("csd-0", csd0);
-        // Low-latency decode: no reorder buffering. KEY_LOW_LATENCY landed at
-        // API 30, this project's floor. Priority 0 = realtime; a high operating
-        // rate tells the codec to run flat out.
-        fmt.set_i32("low-latency", 1);
-        fmt.set_i32("priority", 0);
-        fmt.set_i32("operating-rate", fps.max(60) * 2);
-
-        // HDR10: BT.2020 primaries, PQ transfer, and the mastering metadata when
-        // the server supplied it. (It rides in the bitstream too; this is the
-        // out-of-band copy MediaCodec/​the display can also read.)
-        if let Some(m) = hdr {
-            const COLOR_STANDARD_BT2020: i32 = 6;
-            const COLOR_TRANSFER_ST2084: i32 = 6;
-            const COLOR_RANGE_LIMITED: i32 = 2;
-            fmt.set_i32("color-standard", COLOR_STANDARD_BT2020);
-            fmt.set_i32("color-transfer", COLOR_TRANSFER_ST2084);
-            fmt.set_i32("color-range", COLOR_RANGE_LIMITED);
-            fmt.set_buffer("hdr-static-info", &hdr_static_info(&m));
-        }
-
+    pub fn new(cp: &CodecPrivate, fps: i32, surface: &NativeWindow) -> Result<Decoder, String> {
+        let mime = mime(cp.codec);
         let codec =
             MediaCodec::from_decoder_type(mime).ok_or_else(|| format!("no decoder for {mime}"))?;
         codec
-            .configure(&fmt, Some(surface), MediaCodecDirection::Decoder)
+            .configure(
+                &format_for(cp, fps),
+                Some(surface),
+                MediaCodecDirection::Decoder,
+            )
             .map_err(|e| format!("configure: {e}"))?;
         codec.start().map_err(|e| format!("start: {e}"))?;
         Ok(Decoder { codec })
+    }
+
+    /// Reconfigure for a new build of the same codec: stop, configure, start,
+    /// on the same codec instance and surface. A fresh instance if that fails.
+    ///
+    /// This allocates (a `MediaFormat`, the codec's buffers). It is the client's
+    /// twin of the server rebuilding its encoder, and happens only when a build
+    /// changed what the decoder sees: an HDR↔SDR flip or a new capture size.
+    pub fn reconfigure(
+        &mut self,
+        cp: &CodecPrivate,
+        fps: i32,
+        surface: &NativeWindow,
+    ) -> Result<(), String> {
+        let _ = self.codec.stop();
+        let reused = self
+            .codec
+            .configure(
+                &format_for(cp, fps),
+                Some(surface),
+                MediaCodecDirection::Decoder,
+            )
+            .and_then(|()| self.codec.start());
+        if reused.is_err() {
+            *self = Decoder::new(cp, fps, surface)?;
+        }
+        Ok(())
     }
 
     /// Queue one access unit for decode, tagged `pts_us`. Returns `false` if no

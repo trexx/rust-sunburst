@@ -500,6 +500,14 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
 - Gate `PerformanceHintManager` (API 31) behind a version check. Real win on the
   Amlogic's small cores.
 - Enumerate `MediaCodecList` at startup. Never assume a codec exists.
+- **Configure the decoder from each `CodecPrivate`, not once.** The server
+  re-sends it after every encoder rebuild, and an HDR↔SDR flip of the desktop
+  changes the stream's colour mid-session. `reconfig::classify` decides whether
+  a rebuild changed anything the decoder sees; the `KeyframeGate` drops frames
+  older than the build's `first_frame` and holds everything until a keyframe of
+  it, asking for one when that IDR was already spent on the old configuration.
+  It also covers the session's start: the startup IDR goes out during
+  negotiation and is always lost.
 
 **Pads (Phase 8, `sunburst-gip-bridge`)**
 - **GIP is vendored, not authored.** The xow/xone C++ (MT7612U radio + GIP +

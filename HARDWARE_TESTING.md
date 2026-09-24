@@ -1095,12 +1095,23 @@ server on the 4070, wired LAN.
 - [ ] **Streams and decodes.** 4K60 to the `SurfaceView`: HEVC on the Shield, AV1
       on the Homatics. Watch for the av1C silent-failure (configures, outputs
       nothing) — a black screen with no decoder error is that.
-      **Known gap, found on the box through fakeclient (`a29873f`):** the server's
-      startup IDR arrives during negotiation, and the Android client drops it
-      without ever sending `RequestIdr`. With an infinite GOP it may sit black
-      until something forces a keyframe, so a black screen is that before it is
-      av1C. The fix is the per-encoder-build `CodecPrivate` work (a keyframe gate
-      and a startup `RequestIdr`).
+- [ ] **The first picture arrives without help.** The server's startup IDR goes
+      out during negotiation and is lost (found through fakeclient, `a29873f`).
+      The Android client used to drop it and never ask again, so with an
+      infinite GOP it could sit black. Its keyframe gate now starts closed and
+      sends `RequestIdr` at once, retrying every 500 ms until a keyframe lands.
+      Confirm the picture appears within about a second of connecting, on both
+      TVs.
+- [ ] **An HDR↔SDR flip reconfigures the decoder.** Toggle Windows HDR
+      mid-session (Win+Alt+B). The server rebuilds and re-sends `CodecPrivate`
+      with the new colour; the client logs "reconfiguring the decoder", the panel
+      follows into or out of HDR, and the picture resumes after one IDR with no
+      frozen frame and no garbage. The frames of the old build are dropped by
+      `first_frame`, not decoded wrongly.
+- [ ] **An `AccessLost` with identical headers does not.** Alt-tab through a
+      fullscreen game: the server rebuilds, the new `CodecPrivate` matches, and
+      the client carries on without reconfiguring (no log line, no extra IDR
+      request).
 - [ ] **HDR end to end.** `Display.HdrCapabilities` positive, the panel enters
       HDR, colours and highlights correct, no UI-text chroma fringing.
       `SessionConfig.hdr` now carries the output's mastering, read after the HDR
@@ -1209,6 +1220,9 @@ kernel. Set the server codec preference (or a per-app override) to H.264.
 - [ ] **Negotiate + decode.** A client offering `video/avc` negotiates H.264 and
       decodes it; HEVC/AV1 still negotiate when preferred; auto never picks H.264
       over an HDR codec.
+- [ ] **`CodecPrivate` reports BT.709 8-bit** for every H.264 build (fakeclient
+      prints it and flags anything else as `MISMATCH:`), and the client sets
+      those colour keys.
 - [ ] **Correct 8-bit SDR** (BT.709 colours, no cast) on the DDA/WGC path. On the
       NvFBC path too (the vendored `argb_to_nv12` / `argb_to_nv12_tonemap` PTX).
 - [ ] **Tonemapping.** With the desktop in HDR, an H.264 stream still looks right
@@ -1237,6 +1251,8 @@ instrumentation rows where latency is involved.
       reproduces the OS default (WGC on Win11, DDA on Win10). Backends measure
       within the §7 half-millisecond of each other; NvFBC is the 1.2–1.5 ms-worse
       resilience path, as documented — confirm it is not silently the default.
+      On an HDR desktop, NvFBC's `CodecPrivate` now carries mastering (read from
+      the primary output); it used to carry none, and neither did its SEI.
 - [~] **Slices / IDR / DPB / fps cap.** `slices` counts **units per frame for
       every codec** (HEVC/H.264 slices, AV1 tiles; 0 = the default 4, which is 4
       slices or a 2×2 grid). Verified for AV1: `slices=64` gives 56 tile groups
