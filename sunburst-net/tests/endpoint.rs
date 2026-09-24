@@ -868,7 +868,7 @@ fn an_unauthenticated_nack_is_dropped() {
 fn a_control_burst_larger_than_the_window_is_queued_and_delivered_in_order() {
     // A cursor bitmap is several reliable messages; a burst can exceed the
     // window (8..16). None may be dropped, and order must hold.
-    use sunburst_core::proto::StreamCodec;
+    use sunburst_core::proto::{CodecPrivate, ColorInfo, StreamCodec};
     use sunburst_net::Outbound;
 
     let server = Server::start(Recording::new().with_key(2, key(1)));
@@ -889,10 +889,15 @@ fn a_control_burst_larger_than_the_window_is_queued_and_delivered_in_order() {
         for i in 0..N {
             rec.outbound.push(Outbound::Control {
                 client: 2,
-                message: ServerControl::CodecPrivate {
+                message: ServerControl::CodecPrivate(CodecPrivate {
                     codec: StreamCodec::Hevc,
                     data: vec![i],
-                },
+                    width: 3840,
+                    height: 2160,
+                    first_frame: Seq16(i.into()),
+                    color: ColorInfo::SDR_709_10,
+                    hdr: None,
+                }),
             });
         }
     }
@@ -901,7 +906,8 @@ fn a_control_burst_larger_than_the_window_is_queued_and_delivered_in_order() {
     let mut got = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while got.len() < N as usize {
-        if let Some(ServerControl::CodecPrivate { data, .. }) = client.recv_control().expect("recv")
+        if let Some(ServerControl::CodecPrivate(CodecPrivate { data, .. })) =
+            client.recv_control().expect("recv")
         {
             got.push(data[0]);
         }

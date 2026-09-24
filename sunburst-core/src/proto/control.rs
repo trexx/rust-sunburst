@@ -26,8 +26,9 @@
 //! carries it in pieces. Every chunk repeats the shape's head, and the channel
 //! delivers in order, so the receiver appends and never has to reorder.
 
-pub use super::color::HdrMastering;
+pub use super::color::{ColorInfo, HdrMastering};
 use super::pairing::{NONCE_LEN, TAG_LEN};
+use super::seq::Seq16;
 
 /// Bytes of envelope before the payload.
 pub const ENVELOPE_LEN: usize = 3;
@@ -316,6 +317,34 @@ pub fn negotiate_codec(prefer: Option<StreamCodec>, client_codecs: u8) -> Option
     }
 }
 
+/// What one encoder build produces, for the decoder to be configured from.
+///
+/// Sent when the encoder is built and **again after every rebuild** (an
+/// `AccessLost`, an HDR↔SDR flip), and authoritative for the frames from
+/// `first_frame` on. `SessionConfig` says what the server expects at the start
+/// of a session; this says what each build actually produces. The colour path
+/// follows the captured desktop, and the desktop can change under a session, so
+/// this is the carrier that stays true.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CodecPrivate {
+    pub codec: StreamCodec,
+    /// HEVC VPS/SPS/PPS or H.264 SPS/PPS (Annex-B), or the AV1 av1C record
+    /// (`csd-0`). PROTOCOL.md flags av1C as a silent-failure point — a wrong
+    /// record configures fine and outputs nothing — so the bytes are the
+    /// encoder's own, never re-derived here.
+    pub data: Vec<u8>,
+    /// The encoded picture, in pixels: the captured output's size, which is not
+    /// necessarily the size the client asked for in `Hello`.
+    pub width: u16,
+    pub height: u16,
+    /// The frame id of the IDR that opens this build. Anything older belongs to
+    /// the previous build and must not reach a decoder configured for this one.
+    pub first_frame: Seq16,
+    pub color: ColorInfo,
+    /// ST 2086 mastering, when the build is PQ and the display reported it.
+    pub hdr: Option<HdrMastering>,
+}
+
 /// Opus audio parameters for the session, present when the server streams sound.
 ///
 /// Opus needs no per-stream codec-private blob — the decoder is configured from
@@ -443,14 +472,9 @@ pub enum ServerControl {
     },
     AppList(Vec<AppListing>),
     SessionConfig(SessionConfig),
-    /// The decoder configuration: HEVC VPS/SPS/PPS (Annex-B), or the AV1 av1C
-    /// record (`csd-0`). PROTOCOL.md flags av1C as a silent-failure point — a
-    /// wrong record configures fine and outputs nothing — so the bytes are the
-    /// encoder's own, never re-derived here.
-    CodecPrivate {
-        codec: StreamCodec,
-        data: Vec<u8>,
-    },
+    /// One encoder build's configuration. Sent when the encoder is built and
+    /// again after every rebuild; see [`CodecPrivate`].
+    CodecPrivate(CodecPrivate),
     CursorShape(CursorChunk),
     /// Sent when the server-observed pointer position should override the
     /// client's own — a warp, or a switch into absolute mode. Throttled.
@@ -642,7 +666,7 @@ impl ServerControl {
             ServerControl::PairChallenge { .. } => ServerMessage::PairChallenge,
             ServerControl::AppList(_) => ServerMessage::AppList,
             ServerControl::SessionConfig(_) => ServerMessage::SessionConfig,
-            ServerControl::CodecPrivate { .. } => ServerMessage::CodecPrivate,
+            ServerControl::CodecPrivate(_) => ServerMessage::CodecPrivate,
             ServerControl::CursorShape(_) => ServerMessage::CursorShape,
             ServerControl::CursorPosition { .. } => ServerMessage::CursorPosition,
             ServerControl::SecureDesktop { .. } => ServerMessage::SecureDesktop,
@@ -702,14 +726,25 @@ impl ServerControl {
                     b.extend_from_slice(&a.frame_samples.to_le_bytes());
                 }
             }
-            ServerControl::CodecPrivate { codec, data } => {
-                b.push(*codec as u8);
-                match u16::try_from(data.len()) {
+            ServerControl::CodecPrivate(c) => {
+                b.push(c.codec as u8);
+                match u16::try_from(c.data.len()) {
                     Ok(len) => {
                         b.extend_from_slice(&len.to_le_bytes());
-                        b.extend_from_slice(data);
+                        b.extend_from_slice(&c.data);
                     }
                     Err(_) => err = Err(ControlError::OutOfRange("codec private data")),
+                }
+                b.extend_from_slice(&c.width.to_le_bytes());
+                b.extend_from_slice(&c.height.to_le_bytes());
+                b.extend_from_slice(&c.first_frame.0.to_le_bytes());
+                b.push(c.color.primaries);
+                b.push(c.color.transfer);
+                b.push(c.color.matrix);
+                b.push(u8::from(c.color.full_range) | u8::from(c.hdr.is_some()) << 1);
+                b.push(c.color.bit_depth);
+                if let Some(h) = &c.hdr {
+                    put_mastering(b, h);
                 }
             }
             ServerControl::CursorShape(c) => {
@@ -815,10 +850,35 @@ impl ServerControl {
                 let codec =
                     StreamCodec::from_u8(r.u8()?).ok_or(ControlError::OutOfRange("codec"))?;
                 let len = r.u16()? as usize;
-                ServerControl::CodecPrivate {
+                let data = r.take(len)?.to_vec();
+                let width = r.u16()?;
+                let height = r.u16()?;
+                let first_frame = Seq16(r.u16()?);
+                let primaries = r.u8()?;
+                let transfer = r.u8()?;
+                let matrix = r.u8()?;
+                let flags = r.u8()?;
+                let bit_depth = r.u8()?;
+                let hdr = if flags & 2 != 0 {
+                    Some(read_mastering(&mut r)?)
+                } else {
+                    None
+                };
+                ServerControl::CodecPrivate(CodecPrivate {
                     codec,
-                    data: r.take(len)?.to_vec(),
-                }
+                    data,
+                    width,
+                    height,
+                    first_frame,
+                    color: ColorInfo {
+                        primaries,
+                        transfer,
+                        matrix,
+                        full_range: flags & 1 != 0,
+                        bit_depth,
+                    },
+                    hdr,
+                })
             }
             ServerMessage::CursorShape => {
                 let shape_id = r.u32()?;
@@ -874,7 +934,7 @@ fn split_envelope(buf: &[u8]) -> Result<(u8, &[u8], usize), ControlError> {
 
 /// Bounds-checked forward reader, so every payload is not its own set of index
 /// arithmetic waiting to panic on a hostile packet.
-/// The 24-byte ST 2086 block, as `SessionConfig` and `CodecPrivate` both carry
+/// The 28-byte ST 2086 block, as `SessionConfig` and `CodecPrivate` both carry
 /// it: R, G, B, white `[x, y]` as u16, then max and min luminance as u32, then
 /// MaxCLL and MaxFALL as u16. One writer and one reader, so the two messages
 /// cannot drift apart.

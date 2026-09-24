@@ -38,8 +38,8 @@ pub use auth::{MAC_LEN, NONCE_LEN, SessionKey};
 pub use color::{ColorInfo, cicp};
 pub use control::{
     AppListing, AudioParams, CURSOR_CHUNK_MAX, CURSOR_FORMAT_BGRA32, ClientControl, ClientMessage,
-    CursorChunk, DecoderQuirks, HdrMastering, Hello, PairRequest, ServerControl, ServerMessage,
-    SessionConfig, StreamCodec, codecs, negotiate_codec,
+    CodecPrivate, CursorChunk, DecoderQuirks, HdrMastering, Hello, PairRequest, ServerControl,
+    ServerMessage, SessionConfig, StreamCodec, codecs, negotiate_codec,
 };
 pub use feedback::{FEEDBACK_BODY_LEN, Feedback};
 pub use header::{Flags, HEADER_LEN, Header, MAX_PAYLOAD, PacketType};

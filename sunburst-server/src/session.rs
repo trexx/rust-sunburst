@@ -21,8 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sunburst_capture::OutputSelect;
 use sunburst_core::proto::{
-    AudioParams, DecoderQuirks, Feedback, Hello, Nack, Seq16, ServerControl, SessionConfig,
-    StreamCodec, negotiate_codec,
+    AudioParams, CodecPrivate, DecoderQuirks, Feedback, Hello, Nack, Seq16, ServerControl,
+    SessionConfig, StreamCodec, negotiate_codec,
 };
 use sunburst_encode::encoder::Codec;
 use sunburst_net::{
@@ -492,10 +492,15 @@ impl StreamControl for SessionManager {
             a.headers_sent = true;
             out.push(Outbound::Control {
                 client: a.client,
-                message: ServerControl::CodecPrivate {
+                message: ServerControl::CodecPrivate(CodecPrivate {
                     codec: a.codec,
                     data: headers.sequence,
-                },
+                    width: headers.width as u16,
+                    height: headers.height as u16,
+                    first_frame: headers.first_frame,
+                    color: headers.color,
+                    hdr: headers.hdr,
+                }),
             });
         }
 

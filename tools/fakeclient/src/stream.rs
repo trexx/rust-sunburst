@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use sunburst_core::instr::{self, Collector, Stage};
 use sunburst_core::proto::{
-    ClientControl, Feedback, Hello, Seq16, ServerControl, StreamCodec, pairing::NONCE_LEN,
+    ClientControl, CodecPrivate, Feedback, Hello, Seq16, ServerControl, SessionConfig, StreamCodec,
+    cicp, pairing::NONCE_LEN,
 };
 use sunburst_net::{
     Accept, ClientEndpoint, Inbound, JitterBuffer, OwdGradient, Reassembler, TickUnwrap,
@@ -56,6 +57,74 @@ fn describe_steps(steps_ms: &[f64], interval_ms: f64) -> Option<String> {
 /// sequence-header OBU it wraps. A record that disagrees is CLAUDE.md's silent
 /// failure — the decoder configures and then outputs nothing — so this is
 /// checked on every AV1 run rather than trusted.
+/// One line per encoder build: what `CodecPrivate` says the build encodes,
+/// checked against itself and, for the first build, against `SessionConfig`.
+/// A `MISMATCH:` line is a server bug the client would otherwise configure a
+/// decoder around.
+fn describe_build(n: u32, cp: &CodecPrivate, session: Option<&SessionConfig>) -> String {
+    let c = &cp.color;
+    let name = |v: u8, table: &[(u8, &'static str)]| {
+        table
+            .iter()
+            .find(|(k, _)| *k == v)
+            .map_or_else(|| format!("#{v}"), |(_, n)| (*n).to_string())
+    };
+    let primaries = name(
+        c.primaries,
+        &[
+            (cicp::PRIMARIES_BT709, "BT.709"),
+            (cicp::PRIMARIES_BT2020, "BT.2020"),
+        ],
+    );
+    let transfer = name(
+        c.transfer,
+        &[(cicp::TRANSFER_BT709, "BT.709"), (cicp::TRANSFER_PQ, "PQ")],
+    );
+    let matrix = name(
+        c.matrix,
+        &[
+            (cicp::MATRIX_BT709, "BT.709"),
+            (cicp::MATRIX_BT2020_NCL, "2020NCL"),
+        ],
+    );
+    let mut line = format!(
+        "build #{n}: {:?} {}x{} {primaries}/{transfer}/{matrix} {} {}-bit, first frame {}",
+        cp.codec,
+        cp.width,
+        cp.height,
+        if c.full_range { "full" } else { "limited" },
+        c.bit_depth,
+        cp.first_frame.0,
+    );
+    if let Some(m) = &cp.hdr {
+        line += &format!(
+            ", mastering R{:?} G{:?} B{:?} W{:?} {}/{} nits, CLL {}/{}",
+            m.primaries[0],
+            m.primaries[1],
+            m.primaries[2],
+            m.white,
+            m.max_luminance / 10_000,
+            f64::from(m.min_luminance) / 10_000.0,
+            m.max_cll,
+            m.max_fall,
+        );
+    }
+    if let Err(why) = c.check(cp.codec, cp.hdr.as_ref()) {
+        line += &format!("\nMISMATCH: {why}");
+    }
+    if let Some(s) = session {
+        if s.codec != cp.codec {
+            line += &format!("\nMISMATCH: SessionConfig says {:?}", s.codec);
+        }
+        // The handshake's mastering is advisory, but it should agree with the
+        // first build unless the desktop changed in between.
+        if s.hdr != cp.hdr {
+            line += "\nnote: SessionConfig's mastering differs from the first build's";
+        }
+    }
+    line
+}
+
 fn describe_av1c(record: &[u8]) -> String {
     use sunburst_core::codec::av1::parse_sequence_header;
     if record.len() < 4 || record[0] != 0x81 {
@@ -129,7 +198,8 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
 
     // Await the session negotiation.
     let mut config = None;
-    let mut headers: Option<(StreamCodec, Vec<u8>)> = None;
+    let mut headers: Option<CodecPrivate> = None;
+    let mut builds = 0u32;
     let deadline = Instant::now() + Duration::from_secs(5);
     while (config.is_none() || headers.is_none()) && Instant::now() < deadline {
         match client.recv().map_err(|e| e.to_string())? {
@@ -144,11 +214,13 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
                 );
                 config = Some(c);
             }
-            Some(Inbound::Control(ServerControl::CodecPrivate { codec, data })) => {
-                if codec == StreamCodec::Av1 {
-                    println!("{}", describe_av1c(&data));
+            Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
+                builds += 1;
+                println!("{}", describe_build(builds, &cp, config.as_ref()));
+                if cp.codec == StreamCodec::Av1 {
+                    println!("{}", describe_av1c(&cp.data));
                 }
-                headers = Some((codec, data));
+                headers = Some(cp);
             }
             Some(_) => {}
             None => client.tick().map_err(|e| e.to_string())?,
@@ -176,8 +248,8 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
                 let mut w = std::io::BufWriter::new(
                     std::fs::File::create(path).map_err(|e| e.to_string())?,
                 );
-                if let Some((_, data)) = &headers {
-                    w.write_all(data).map_err(|e| e.to_string())?;
+                if let Some(cp) = &headers {
+                    w.write_all(&cp.data).map_err(|e| e.to_string())?;
                 }
                 Sink::Annexb(w)
             }
@@ -279,6 +351,14 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
             // The stub receiver has no pad to drive; count rumble/pad-output with
             // the rest of the ignored control traffic.
             Some(Inbound::Rumble(_)) | Some(Inbound::PadOutput(_)) => {}
+            // A rebuild (AccessLost, an HDR<->SDR flip): say what changed.
+            Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
+                builds += 1;
+                println!("{}", describe_build(builds, &cp, None));
+                if cp.codec == StreamCodec::Av1 {
+                    println!("{}", describe_av1c(&cp.data));
+                }
+            }
             Some(Inbound::Control(_)) | Some(Inbound::Other) => {}
             None => client.tick().map_err(|e| e.to_string())?,
         }

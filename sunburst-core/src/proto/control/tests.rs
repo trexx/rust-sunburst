@@ -69,6 +69,22 @@ fn session_config(hdr: bool) -> SessionConfig {
     }
 }
 
+fn codec_private(hdr: bool) -> CodecPrivate {
+    CodecPrivate {
+        codec: StreamCodec::Hevc,
+        data: vec![0, 0, 0, 1, 0x40, 0x01, 0x0C],
+        width: 3840,
+        height: 2160,
+        first_frame: Seq16(65_530),
+        color: if hdr {
+            ColorInfo::HDR10
+        } else {
+            ColorInfo::SDR_709_10
+        },
+        hdr: hdr.then(|| session_config(true).hdr.expect("the fixture is HDR")),
+    }
+}
+
 fn round_trip_client(message: ClientControl) {
     let encoded = message.encode().expect("encode");
     let (decoded, used) = ClientControl::decode(&encoded).expect("decode");
@@ -141,14 +157,17 @@ fn every_implemented_server_message_round_trips() {
     let mut no_audio = session_config(true);
     no_audio.audio = None;
     round_trip_server(ServerControl::SessionConfig(no_audio));
-    round_trip_server(ServerControl::CodecPrivate {
-        codec: StreamCodec::Hevc,
-        data: vec![0, 0, 0, 1, 0x40, 0x01, 0x0C],
-    });
-    round_trip_server(ServerControl::CodecPrivate {
-        codec: StreamCodec::Av1,
+    round_trip_server(ServerControl::CodecPrivate(codec_private(true)));
+    round_trip_server(ServerControl::CodecPrivate(codec_private(false)));
+    round_trip_server(ServerControl::CodecPrivate(CodecPrivate {
+        codec: StreamCodec::H264,
         data: Vec::new(),
-    });
+        color: ColorInfo {
+            full_range: true,
+            ..ColorInfo::SDR_709_8
+        },
+        ..codec_private(false)
+    }));
     round_trip_server(ServerControl::CursorShape(CursorChunk {
         shape_id: 7,
         width: 32,
@@ -430,16 +449,33 @@ fn truncation_is_refused_rather_than_panicking() {
     }
     assert!(ClientControl::decode(&encoded).is_ok());
 
-    let encoded = ServerControl::SessionConfig(session_config(true))
+    // Every prefix must be refused: each appended field is required, not
+    // silently defaulted.
+    for message in [
+        ServerControl::SessionConfig(session_config(true)),
+        ServerControl::CodecPrivate(codec_private(true)),
+        ServerControl::CodecPrivate(codec_private(false)),
+    ] {
+        let encoded = message.encode().expect("encode");
+        for len in 0..encoded.len() {
+            assert!(
+                ServerControl::decode(&encoded[..len]).is_err(),
+                "a {len}-byte prefix decoded"
+            );
+        }
+        assert!(ServerControl::decode(&encoded).is_ok());
+    }
+}
+
+#[test]
+fn codec_private_carries_the_mastering_only_when_flagged() {
+    let with = ServerControl::CodecPrivate(codec_private(true))
         .encode()
         .expect("encode");
-    for len in 0..encoded.len() {
-        assert!(
-            ServerControl::decode(&encoded[..len]).is_err(),
-            "a {len}-byte prefix decoded"
-        );
-    }
-    assert!(ServerControl::decode(&encoded).is_ok());
+    let without = ServerControl::CodecPrivate(codec_private(false))
+        .encode()
+        .expect("encode");
+    assert_eq!(with.len() - without.len(), 28, "one ST 2086 block");
 }
 
 #[test]

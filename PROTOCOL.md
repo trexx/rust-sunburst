@@ -349,11 +349,34 @@ Server → client:
   fields are what make `clock_offset_ns` derivable: the client subtracts
   `hello_delay_ns` from its measured Hello→SessionConfig round trip, so server
   processing time (building the encoder) does not inflate the estimate.
-- `CodecPrivate` — `u8 codec, u16 len, bytes`: VPS/SPS/PPS (Annex-B) or the
-  av1C record. Sent after `SessionConfig` and **again after any encoder
-  rebuild**. Client cannot configure MediaCodec without this. **av1C
-  construction is a known silent-failure point:** wrong record means the decoder
-  configures successfully and outputs nothing.
+- `CodecPrivate` — one encoder build's configuration. Sent after
+  `SessionConfig` and **again after every encoder rebuild** (an `AccessLost`,
+  an HDR↔SDR flip of the captured desktop). The client cannot configure
+  MediaCodec without it. **av1C construction is a known silent-failure point:**
+  a wrong record means the decoder configures successfully and outputs nothing.
+
+  ```
+  u8   codec
+  u16  len, bytes      VPS/SPS/PPS or SPS/PPS (Annex-B), or the av1C record
+  u16  width, u16 height   the encoded picture: the captured output, which is
+                           not necessarily Hello's size
+  u16  first_frame     frame id of the IDR that opens this build
+  u8   primaries, u8 transfer, u8 matrix   CICP (ISO/IEC 23091-2):
+                           BT.709 = 1/1/1, BT.2020 PQ = 9/16/9
+  u8   flags           bit0 full_range, bit1 mastering follows
+  u8   bit_depth       8 (H.264) or 10 (HEVC, AV1)
+  -- if bit1: the same 28-byte ST 2086 block as SessionConfig
+  ```
+
+  **`SessionConfig.hdr` is the server's expectation; `CodecPrivate` is the
+  truth for each build.** The colour path follows the captured desktop's real
+  HDR state per frame, so a session that starts SDR can turn HDR and back. A
+  client configures (and reconfigures) its decoder from each `CodecPrivate`
+  whose headers, size or colour differ from the last. It drops frames older
+  than `first_frame`: the IDR usually outruns this message on the video path,
+  so `first_frame` is what separates the old build's frames from the new
+  one's. The fields are appended and required; client and server deploy
+  together, and there is no version byte.
 - `CursorShape` — for client-side cursor rendering. A bitmap is larger than one
   reliable message, so it is **chunked**; every chunk repeats the head, and the
   in-order channel means the receiver appends and never reorders:

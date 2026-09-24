@@ -249,8 +249,8 @@ fn run_inner(
                 );
                 config = Some(c);
             }
-            Some(Inbound::Control(ServerControl::CodecPrivate { codec, data })) => {
-                csd = Some((codec, data));
+            Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
+                csd = Some((cp.codec, cp.data));
             }
             Some(_) => {}
             None => client.tick().map_err(|e| e.to_string())?,

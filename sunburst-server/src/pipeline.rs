@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use sunburst_capture::cuda::{CuContext, CuDevicePtr};
 use sunburst_capture::{CaptureError, Frame, OutputSelect, TextureFormat, select};
 use sunburst_core::instr::{self, Stage};
-use sunburst_core::proto::{Header, Nack, Seq16};
+use sunburst_core::proto::{ColorInfo, HdrMastering, Header, Nack, Seq16};
 use sunburst_encode::convert::{ConvertOutput, Converter};
 use sunburst_encode::cuda_convert::CudaConverter;
 use sunburst_encode::encoder::{Codec, ColorSpace, Encoder, EncoderConfig, PicRequest};
@@ -140,14 +140,41 @@ impl StreamShared {
     }
 }
 
-/// The codec's out-of-band configuration for the client — HEVC VPS/SPS/PPS or an
-/// AV1 `av1C` record. Emitted once when the encoder is built (and again after a
-/// rebuild); the client needs it before any frame, so it travels the reliable
-/// control channel.
+/// One encoder build, described for the client: the codec's out-of-band
+/// configuration (HEVC VPS/SPS/PPS, H.264 SPS/PPS, or an AV1 `av1C` record) and
+/// what the build encodes. Emitted when the encoder is built and again after
+/// every rebuild; the client needs it before any frame of that build, so it
+/// travels the reliable control channel as `CodecPrivate`.
 #[derive(Clone, Debug)]
 pub struct CodecHeaders {
     pub codec: Codec,
     pub sequence: Vec<u8>,
+    /// The encoded picture: the captured output's size.
+    pub width: u32,
+    pub height: u32,
+    pub color: ColorInfo,
+    pub hdr: Option<HdrMastering>,
+    /// The frame id the build's opening IDR will carry.
+    pub first_frame: Seq16,
+}
+
+/// What a fresh build encodes, as [`build_and_convert`] configured it.
+struct Built {
+    width: u32,
+    height: u32,
+    color: ColorInfo,
+    hdr: Option<HdrMastering>,
+}
+
+/// The colour description a build signals, from the codec and the colorimetry
+/// the encoder was given. H.264 is 8-bit; HEVC and AV1 are 10-bit in both
+/// colour spaces.
+fn color_info(codec: Codec, color: ColorSpace) -> ColorInfo {
+    match (codec, color) {
+        (Codec::H264, _) => ColorInfo::SDR_709_8,
+        (_, ColorSpace::Bt709) => ColorInfo::SDR_709_10,
+        (_, ColorSpace::Bt2020Pq) => ColorInfo::HDR10,
+    }
 }
 
 /// A running stream. Dropping it (or [`stop`](Self::stop)) tears the threads down.
@@ -527,7 +554,7 @@ fn gpu_loop(
             0 => params.bitrate_kbps,
             t => t,
         };
-        let (input, first_build) = build_and_convert(
+        let (input, built) = build_and_convert(
             &mut spine,
             &nvenc,
             params,
@@ -537,7 +564,7 @@ fn gpu_loop(
             live_kbps,
         )?;
         instr::record(Stage::ColorConvert, fid.0 as u32);
-        if first_build {
+        if let Some(built) = built {
             // The encoder now runs at `live_kbps`; without this, an unchanged
             // target would never be re-applied and `reconfigure_bitrate`'s
             // equal-value early return would hide the mismatch.
@@ -554,6 +581,14 @@ fn gpu_loop(
             let _ = headers.send(CodecHeaders {
                 codec: params.codec,
                 sequence,
+                width: built.width,
+                height: built.height,
+                color: built.color,
+                hdr: built.hdr,
+                // Ids advance only on encode, and the next encode is this
+                // build's forced IDR, whichever frame (this one, or a held one)
+                // it turns out to be.
+                first_frame: st.frame_id,
             });
         }
         let surface = Surface { input, qpc };
@@ -581,7 +616,7 @@ fn gpu_loop(
 }
 
 /// Build the spine on the first frame and convert this frame to a P010 input
-/// pointer. Returns `(input, first_build)`.
+/// pointer. Returns the input, and what was built if this frame built it.
 fn build_and_convert<'a>(
     spine: &mut Option<Spine<'a>>,
     nvenc: &'a Nvenc,
@@ -590,7 +625,7 @@ fn build_and_convert<'a>(
     frame: Frame,
     current_color: &mut Option<ConvertOutput>,
     bitrate_kbps: u32,
-) -> Result<(*mut c_void, bool), String> {
+) -> Result<(*mut c_void, Option<Built>), String> {
     let mut ecfg = EncoderConfig::new(params.codec, params.width, params.height);
     ecfg.fps = params.fps;
     // The rate controller's current target, not the session's starting one: a
@@ -646,7 +681,7 @@ fn build_and_convert<'a>(
                 return Err("spine is not D3D11".into());
             };
             let surface = converter.convert(&tf.texture, w, h)?;
-            Ok((surface.as_raw(), first))
+            Ok((surface.as_raw(), first.then(|| built(&ecfg))))
         }
         Frame::Cuda(cf) => {
             let (w, h) = (cf.meta.width, cf.meta.height);
@@ -667,8 +702,18 @@ fn build_and_convert<'a>(
                 return Err("spine is not CUDA".into());
             };
             let surface: CuDevicePtr = converter.convert(cf.device_ptr, cf.pitch as u32)?;
-            Ok((surface as *mut c_void, first))
+            Ok((surface as *mut c_void, first.then(|| built(&ecfg))))
         }
+    }
+}
+
+/// What an encoder built from `ecfg` produces.
+fn built(ecfg: &EncoderConfig) -> Built {
+    Built {
+        width: ecfg.width,
+        height: ecfg.height,
+        color: color_info(ecfg.codec, ecfg.color),
+        hdr: ecfg.hdr,
     }
 }
 
