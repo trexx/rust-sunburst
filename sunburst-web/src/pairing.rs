@@ -34,7 +34,8 @@
 //! pairing is only possible while explicitly armed from the UI, the window is
 //! short, the arming is single-use, and PIN attempts are capped.
 
-use sunburst_core::proto::pairing::{confirm_tag, derive_secret, tags_match};
+use sunburst_core::proto::PairOutcome;
+use sunburst_core::proto::pairing::{PAIRING_WINDOW_SECS, confirm_tag, derive_secret, tags_match};
 
 use crate::client::{PairedClient, QuirksRecord};
 use crate::random;
@@ -42,8 +43,9 @@ use crate::random;
 pub use sunburst_core::proto::pairing::TAG_LEN;
 
 /// How long an arming stays open. Long enough to walk to the TV, short enough
-/// that the window is not simply left open.
-pub const WINDOW_SECS: u64 = 90;
+/// that the window is not simply left open. Core's, because the client bounds
+/// its wait for the result by the same number.
+pub const WINDOW_SECS: u64 = PAIRING_WINDOW_SECS;
 
 /// PIN attempts per pending request before it is discarded.
 ///
@@ -108,6 +110,10 @@ pub struct Pairing {
     armed: Option<Armed>,
     pending: Vec<Pending>,
     next_request_id: u32,
+    /// How requests ended, waiting to be told to the clients that sent them
+    /// (`PairResult`). Every way a request leaves `pending` lands here, so a
+    /// client is never left waiting on a request the server has forgotten.
+    results: Vec<(u32, PairOutcome)>,
 }
 
 struct Armed {
@@ -131,13 +137,34 @@ impl Pairing {
             server_nonce: random::nonce()?,
             expires_at,
         });
-        self.pending.clear();
+        self.reject_pending();
         Ok(expires_at)
     }
 
     pub fn disarm(&mut self) {
         self.armed = None;
-        self.pending.clear();
+        self.reject_pending();
+    }
+
+    /// Record how a request ended, for its client. The one outcome the state
+    /// machine cannot record itself is `Accepted`: that waits until the new
+    /// client has been saved, which is the caller's to do.
+    pub fn announce(&mut self, request_id: u32, outcome: PairOutcome) {
+        self.results.push((request_id, outcome));
+    }
+
+    /// The outcomes recorded since the last call. Expiry is noticed here too,
+    /// so a client whose window ran out hears so rather than timing out.
+    pub fn take_results(&mut self, now: u64) -> Vec<(u32, PairOutcome)> {
+        self.drop_if_expired(now);
+        std::mem::take(&mut self.results)
+    }
+
+    /// Drop every pending request, telling each client it was rejected.
+    fn reject_pending(&mut self) {
+        for p in self.pending.drain(..) {
+            self.results.push((p.id, PairOutcome::Rejected));
+        }
     }
 
     pub fn is_armed(&self, now: u64) -> bool {
@@ -229,10 +256,18 @@ impl Pairing {
             let pending = &mut self.pending[index];
             pending.attempts += 1;
             let remaining = MAX_PIN_ATTEMPTS.saturating_sub(pending.attempts);
+            let id = pending.id;
             if remaining == 0 {
                 self.pending.remove(index);
+                self.results.push((id, PairOutcome::Rejected));
                 return Err(PairingError::TooManyAttempts);
             }
+            self.results.push((
+                id,
+                PairOutcome::WrongPin {
+                    remaining: u8::try_from(remaining).unwrap_or(u8::MAX),
+                },
+            ));
             // The arming survives, so a typo costs a retype rather than a walk
             // back to the TV.
             return Err(PairingError::WrongPin { remaining });
@@ -240,7 +275,9 @@ impl Pairing {
 
         let pending = self.pending.remove(index);
         self.armed = None;
-        self.pending.clear();
+        // Anyone else who asked in this window lost; the winner's `Accepted`
+        // is announced by the caller once the client is saved.
+        self.reject_pending();
 
         Ok(PairedClient {
             id: client_id,
@@ -257,7 +294,7 @@ impl Pairing {
     fn drop_if_expired(&mut self, now: u64) {
         if self.armed.as_ref().is_some_and(|a| a.expires_at <= now) {
             self.armed = None;
-            self.pending.clear();
+            self.reject_pending();
         }
     }
 }
@@ -494,6 +531,86 @@ mod tests {
         assert_eq!(
             p.receive_confirm(99, [0; TAG_LEN], NOW),
             Err(PairingError::UnknownRequest(99))
+        );
+    }
+
+    // ------------------------------------------------ what the client is told
+
+    /// A request with the client's confirmation recorded; its id.
+    fn confirmed_request(p: &mut Pairing, pin: &str) -> u32 {
+        let (id, nonce) = p.receive_request(request(), NOW).expect("request");
+        p.receive_confirm(id, client_side(pin, &[7; 16], &nonce), NOW)
+            .expect("confirm");
+        id
+    }
+
+    #[test]
+    fn a_wrong_pin_is_announced_with_the_attempts_left() {
+        let mut p = Pairing::new();
+        p.arm(NOW).expect("arm");
+        let id = confirmed_request(&mut p, "12345678");
+        let _ = p.confirm(id, "00000000", 1, NOW);
+        assert_eq!(
+            p.take_results(NOW),
+            vec![(id, PairOutcome::WrongPin { remaining: 4 })]
+        );
+        assert!(p.take_results(NOW).is_empty(), "announced once, not twice");
+    }
+
+    #[test]
+    fn running_out_of_attempts_is_announced_as_a_rejection() {
+        let mut p = Pairing::new();
+        p.arm(NOW).expect("arm");
+        let id = confirmed_request(&mut p, "12345678");
+        for _ in 0..MAX_PIN_ATTEMPTS {
+            let _ = p.confirm(id, "00000000", 1, NOW);
+        }
+        assert_eq!(
+            p.take_results(NOW).last(),
+            Some(&(id, PairOutcome::Rejected))
+        );
+    }
+
+    #[test]
+    fn success_leaves_the_acceptance_to_the_caller_and_rejects_the_rest() {
+        // `Accepted` waits until the client is saved, which `confirm` does not
+        // do; the other device that asked in the same window has lost.
+        let mut p = Pairing::new();
+        p.arm(NOW).expect("arm");
+        let winner = confirmed_request(&mut p, "12345678");
+        let loser = confirmed_request(&mut p, "12345678");
+        p.confirm(winner, "12345678", 1, NOW).expect("pin");
+        assert_eq!(p.take_results(NOW), vec![(loser, PairOutcome::Rejected)]);
+    }
+
+    #[test]
+    fn disarming_and_re_arming_reject_what_was_pending() {
+        let mut p = Pairing::new();
+        p.arm(NOW).expect("arm");
+        let first = confirmed_request(&mut p, "12345678");
+        p.arm(NOW).expect("re-arm");
+        let second = confirmed_request(&mut p, "12345678");
+        p.disarm();
+        assert_eq!(
+            p.take_results(NOW),
+            vec![
+                (first, PairOutcome::Rejected),
+                (second, PairOutcome::Rejected)
+            ]
+        );
+    }
+
+    #[test]
+    fn expiry_is_announced_when_results_are_taken() {
+        // Nothing else looks at the clock while the TV waits, so taking the
+        // results is what notices the window closing.
+        let mut p = Pairing::new();
+        p.arm(NOW).expect("arm");
+        let id = confirmed_request(&mut p, "12345678");
+        assert!(p.take_results(NOW + WINDOW_SECS - 1).is_empty());
+        assert_eq!(
+            p.take_results(NOW + WINDOW_SECS),
+            vec![(id, PairOutcome::Rejected)]
         );
     }
 }

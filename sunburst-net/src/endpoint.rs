@@ -63,6 +63,13 @@
 //! without a MAC. They are processed only while the handler reports pairing
 //! armed, only for those two kinds, and dropped silently otherwise. Those peers
 //! are tracked by address, because they have no identity yet.
+//!
+//! The `PairResult` that ends a request usually goes out as the arming closes —
+//! a successful pairing closes it. So a peer already tracked keeps being heard
+//! while unarmed, for its acks alone: otherwise the result is retransmitted at
+//! a client whose acknowledgements are being thrown away. Nothing it sends is
+//! acted on until pairing is armed again, and an address not already tracked
+//! is still dropped.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -74,8 +81,8 @@ use sunburst_core::proto::pairing::NONCE_LEN;
 use sunburst_core::proto::rumble::RUMBLE_BODY_LEN;
 use sunburst_core::proto::{
     ClientControl, ClientMessage, Feedback, Flags, HEADER_LEN, Header, InputPacket, MAC_LEN,
-    MAX_PAYLOAD, Nack, PacketType, PadOutput, ReplayWindow, Rumble, Seq16, ServerControl,
-    SessionConfig, SessionKey, app_list_pages, chunk_art,
+    MAX_PAYLOAD, Nack, PacketType, PadOutput, PairOutcome, ReplayWindow, Rumble, Seq16,
+    ServerControl, SessionConfig, SessionKey, app_list_pages, chunk_art,
 };
 
 use crate::handler::{ControlHandler, Outbound};
@@ -145,6 +152,9 @@ impl Session {
 struct Pending {
     reliable: Reliable,
     last_seen_ms: u64,
+    /// The request this peer was challenged for, so its `PairResult` can find
+    /// it. `None` until the challenge has gone out.
+    request_id: Option<u32>,
 }
 
 pub struct Endpoint<H: ControlHandler> {
@@ -407,17 +417,24 @@ impl<H: ControlHandler> Endpoint<H> {
             return;
         }
 
-        if !self.handler.pairing_armed(now) {
+        // Unarmed, only a peer already pairing is heard, and only so its acks
+        // retire the `PairResult` (see the module docs).
+        let armed = self.handler.pairing_armed(now);
+        if !armed && !self.pending.contains_key(&from) {
             return;
         }
 
         let entry = self.pending.entry(from).or_insert_with(|| Pending {
             reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
             last_seen_ms: now_ms,
+            request_id: None,
         });
         entry.last_seen_ms = now_ms;
         let messages = entry.reliable.on_frame(body);
 
+        if !armed {
+            return;
+        }
         for message in messages {
             self.on_unauthenticated(&message, from, now);
         }
@@ -439,6 +456,9 @@ impl<H: ControlHandler> Endpoint<H> {
             ClientControl::PairRequest(request) => {
                 if let Some((request_id, server_nonce)) = self.handler.on_pair_request(request, now)
                 {
+                    if let Some(peer) = self.pending.get_mut(&from) {
+                        peer.request_id = Some(request_id);
+                    }
                     self.send_pending(
                         from,
                         &ServerControl::PairChallenge {
@@ -695,6 +715,26 @@ impl<H: ControlHandler> Endpoint<H> {
         self.transmit(to, &frame, None, PacketType::Control);
     }
 
+    /// Tell the peer that sent `request_id` how it ended. A request no tracked
+    /// peer holds — it went idle, or was never challenged here — goes nowhere.
+    fn send_pair_result(&mut self, request_id: u32, outcome: PairOutcome) {
+        let Some(to) = self
+            .pending
+            .iter()
+            .find(|(_, peer)| peer.request_id == Some(request_id))
+            .map(|(addr, _)| *addr)
+        else {
+            return;
+        };
+        self.send_pending(
+            to,
+            &ServerControl::PairResult {
+                request_id,
+                outcome,
+            },
+        );
+    }
+
     fn transmit(&self, to: SocketAddr, body: &[u8], key: Option<&SessionKey>, kind: PacketType) {
         let header = Header {
             packet_type: kind,
@@ -764,6 +804,10 @@ impl<H: ControlHandler> Endpoint<H> {
                 Outbound::Control { client, message } => self.send_to_client(client, &message),
                 Outbound::Rumble { client, rumble } => self.send_rumble(client, &rumble),
                 Outbound::PadOutput { client, output } => self.send_pad_output(client, &output),
+                Outbound::PairResult {
+                    request_id,
+                    outcome,
+                } => self.send_pair_result(request_id, outcome),
             }
         }
     }

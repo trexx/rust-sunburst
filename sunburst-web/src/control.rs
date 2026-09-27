@@ -209,11 +209,18 @@ impl<S: InputSink, T: StreamControl> ControlHandler for WebHandler<S, T> {
     }
 
     /// Everything the server originates since the last tick: the injector's
-    /// rumble and pad output, plus the session manager's `CodecPrivate`, cursor
-    /// updates and `SecureDesktop`.
+    /// rumble and pad output, the session manager's `CodecPrivate`, cursor
+    /// updates and `SecureDesktop`, and how pair requests ended — decided in
+    /// the web UI, told to the TV here.
     fn drain_outbound(&mut self) -> Vec<Outbound> {
         let mut out = self.input.drain_outbound();
         out.append(&mut self.stream.drain_outbound());
+        out.extend(self.state.take_pair_results(unix_now()).into_iter().map(
+            |(request_id, outcome)| Outbound::PairResult {
+                request_id,
+                outcome,
+            },
+        ));
         out
     }
 }

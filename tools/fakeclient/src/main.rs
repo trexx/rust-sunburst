@@ -16,6 +16,8 @@
 //!
 //! Pairing prints the PIN it generated. Type that into the web UI — it is never
 //! transmitted, and both ends derive the same secret from it independently.
+//! It waits for the server's `PairResult` and saves the secret only once the
+//! server has accepted it.
 
 mod ivf;
 mod stream;
@@ -28,11 +30,14 @@ use std::time::{Duration, Instant};
 
 use sunburst_core::proto::codecs;
 use sunburst_core::proto::input::buttons;
-use sunburst_core::proto::pairing::{NONCE_LEN, PIN_DIGITS, confirm_tag, derive_secret};
+use sunburst_core::proto::pairing::{
+    NONCE_LEN, PAIRING_WINDOW_SECS, PIN_DIGITS, accepted_tag, confirm_tag, derive_secret,
+    tags_match,
+};
 use sunburst_core::proto::{
     Battery, ClientControl, DecoderQuirks, Finger, GamepadState, Hello, Imu, InputEvent,
-    InputPacket, MouseButton, MouseMotion, PairRequest, ServerControl, SessionKey, StreamCodec,
-    Touchpad,
+    InputPacket, MouseButton, MouseMotion, PairOutcome, PairRequest, ServerControl, SessionKey,
+    StreamCodec, Touchpad,
 };
 use sunburst_net::ClientEndpoint;
 
@@ -271,7 +276,39 @@ fn pair(server: SocketAddr, state: &PathBuf, hint_kbps: Option<u32>) -> Result<(
     println!("    PIN: {pin}");
     println!();
     println!("Type that into the web UI to finish pairing.");
-    println!("Secret stored at {}", state.display());
+
+    // Nothing is paired until the PIN is typed, so wait to be told — and save
+    // only an acceptance that proves itself, since the result carries no MAC.
+    let deadline = Instant::now() + Duration::from_secs(PAIRING_WINDOW_SECS);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("the PIN was not entered in time".into());
+        }
+        let message = await_message(&mut client, "the pair result", remaining)?;
+        let ServerControl::PairResult {
+            request_id: id,
+            outcome,
+        } = message
+        else {
+            continue;
+        };
+        if id != request_id {
+            continue;
+        }
+        match outcome {
+            PairOutcome::Accepted { tag } if tags_match(&tag, &accepted_tag(&secret)) => break,
+            // Not from a server holding this secret; keep waiting for the real one.
+            PairOutcome::Accepted { .. } => {}
+            PairOutcome::WrongPin { remaining } => {
+                println!("Wrong PIN, {remaining} attempt(s) left.");
+            }
+            PairOutcome::Rejected => {
+                return Err("pairing was cancelled or closed in the web UI".into());
+            }
+        }
+    }
+
     save_state(
         state,
         &State {
@@ -279,9 +316,10 @@ fn pair(server: SocketAddr, state: &PathBuf, hint_kbps: Option<u32>) -> Result<(
             next_input_seq: 1,
         },
     )?;
+    println!("Paired. Secret stored at {}", state.display());
 
-    // Keep answering for a moment so the confirmation is acknowledged rather
-    // than retransmitted at a client that has already exited.
+    // Keep answering for a moment so the result is acknowledged rather than
+    // retransmitted at a client that has already exited.
     let until = Instant::now() + Duration::from_secs(2);
     while Instant::now() < until {
         let _ = client.recv_control();

@@ -16,9 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sunburst_core::proto::pairing::{NONCE_LEN, confirm_tag, derive_secret};
+use sunburst_core::proto::pairing::{
+    NONCE_LEN, accepted_tag, confirm_tag, derive_secret, tags_match,
+};
 use sunburst_core::proto::{
-    ClientControl, GamepadState, InputEvent, InputPacket, PairRequest, ServerControl, SessionKey,
+    ClientControl, GamepadState, InputEvent, InputPacket, PairOutcome, PairRequest, ServerControl,
+    SessionKey,
 };
 use sunburst_net::{ClientEndpoint, Endpoint};
 use sunburst_web::api::{ApiRequest, AppState, dispatch};
@@ -138,8 +141,9 @@ impl Drop for Harness {
     }
 }
 
-/// Everything a client does to pair, returning the secret it derived.
-fn pair(h: &Harness, client: &mut ClientEndpoint) -> [u8; 32] {
+/// Everything a client does to pair, returning the request id it was
+/// challenged with and the secret it derived.
+fn pair(h: &Harness, client: &mut ClientEndpoint) -> (u32, [u8; 32]) {
     let client_nonce = [11u8; NONCE_LEN];
     client
         .send_control(&ClientControl::PairRequest(PairRequest {
@@ -181,7 +185,31 @@ fn pair(h: &Harness, client: &mut ClientEndpoint) -> [u8; 32] {
             .filter(|p| p["awaiting_client"] == false)
             .map(|_| ())
     });
-    secret
+    (request_id, secret)
+}
+
+/// The `PairResult` the server sends once the web UI has decided, acked so the
+/// server stops resending it.
+fn pair_result(h: &Harness, client: &mut ClientEndpoint) -> (u32, PairOutcome) {
+    h.wait("the pair result", || {
+        let result = match client.recv_control().expect("recv") {
+            Some(ServerControl::PairResult {
+                request_id,
+                outcome,
+            }) => Some((request_id, outcome)),
+            _ => None,
+        };
+        client.tick().expect("tick");
+        result
+    })
+}
+
+fn type_pin(h: &Harness, request_id: u32, pin: &str) -> u16 {
+    h.api(ApiRequest::post(
+        "/api/pair/confirm",
+        serde_json::json!({"request_id": request_id, "pin": pin}),
+    ))
+    .status
 }
 
 #[test]
@@ -190,13 +218,13 @@ fn a_client_pairs_over_udp_and_is_then_trusted() {
     assert_eq!(h.api(ApiRequest::post("/api/pair/arm", ())).status, 200);
 
     let mut client = ClientEndpoint::connect(h.udp, None).expect("connect");
-    let secret = pair(&h, &mut client);
+    let (request_id, secret) = pair(&h, &mut client);
 
     // The PIN is typed into the web UI. It never went near the wire — the server
     // is deriving from what a person entered, and the tags have to agree.
     let confirmed = h.api(ApiRequest::post(
         "/api/pair/confirm",
-        serde_json::json!({"request_id": 0, "pin": PIN, "name": "Living room"}),
+        serde_json::json!({"request_id": request_id, "pin": PIN, "name": "Living room"}),
     ));
     assert_eq!(
         confirmed.status,
@@ -218,6 +246,15 @@ fn a_client_pairs_over_udp_and_is_then_trusted() {
         Some(secret),
         "the derived secrets differ"
     );
+
+    // And the TV hears it, with a tag only the same secret produces — the
+    // result has no MAC, so the tag is what it believes.
+    let (id, outcome) = pair_result(&h, &mut client);
+    assert_eq!(id, request_id);
+    let PairOutcome::Accepted { tag } = outcome else {
+        panic!("expected an acceptance, got {outcome:?}");
+    };
+    assert!(tags_match(&tag, &accepted_tag(&secret)));
 }
 
 #[test]
@@ -225,13 +262,14 @@ fn a_wrong_pin_leaves_the_client_unpaired_and_the_arming_alive() {
     let h = Harness::new("wrongpin");
     h.api(ApiRequest::post("/api/pair/arm", ()));
     let mut client = ClientEndpoint::connect(h.udp, None).expect("connect");
-    pair(&h, &mut client);
+    let (request_id, secret) = pair(&h, &mut client);
 
-    let refused = h.api(ApiRequest::post(
-        "/api/pair/confirm",
-        serde_json::json!({"request_id": 0, "pin": "00000000"}),
-    ));
-    assert_eq!(refused.status, 403);
+    assert_eq!(type_pin(&h, request_id, "00000000"), 403);
+    // The TV hears the typo, so it can say so and keep the PIN up.
+    assert_eq!(
+        pair_result(&h, &mut client),
+        (request_id, PairOutcome::WrongPin { remaining: 4 })
+    );
 
     let clients: Vec<PublicClient> = h
         .api(ApiRequest::get("/api/clients"))
@@ -240,14 +278,55 @@ fn a_wrong_pin_leaves_the_client_unpaired_and_the_arming_alive() {
     assert!(clients.is_empty());
 
     // A typo costs an attempt, not the walk back to the TV.
+    assert_eq!(type_pin(&h, request_id, PIN), 201);
     assert_eq!(
-        h.api(ApiRequest::post(
-            "/api/pair/confirm",
-            serde_json::json!({"request_id": 0, "pin": PIN}),
-        ))
-        .status,
-        201
+        pair_result(&h, &mut client),
+        (
+            request_id,
+            PairOutcome::Accepted {
+                tag: accepted_tag(&secret)
+            }
+        )
     );
+}
+
+#[test]
+fn disarming_tells_the_waiting_client_it_was_rejected() {
+    let h = Harness::new("disarm");
+    h.api(ApiRequest::post("/api/pair/arm", ()));
+    let mut client = ClientEndpoint::connect(h.udp, None).expect("connect");
+    let (request_id, _) = pair(&h, &mut client);
+
+    assert_eq!(h.api(ApiRequest::post("/api/pair/disarm", ())).status, 204);
+    assert_eq!(
+        pair_result(&h, &mut client),
+        (request_id, PairOutcome::Rejected)
+    );
+}
+
+#[test]
+fn a_second_device_pairs_after_the_first() {
+    // Request ids count up for the life of the server. A client that assumed
+    // its request was 0 paired only the first device after a restart; its
+    // confirmation for any later request matched nothing.
+    let h = Harness::new("second");
+    for n in 0..2u32 {
+        h.api(ApiRequest::post("/api/pair/arm", ()));
+        let mut client = ClientEndpoint::connect(h.udp, None).expect("connect");
+        let (request_id, secret) = pair(&h, &mut client);
+        assert_eq!(request_id, n, "request ids are not reused");
+        assert_eq!(type_pin(&h, request_id, PIN), 201);
+        assert!(matches!(
+            pair_result(&h, &mut client),
+            (id, PairOutcome::Accepted { tag }) if id == request_id
+                && tags_match(&tag, &accepted_tag(&secret))
+        ));
+    }
+    let clients: Vec<PublicClient> = h
+        .api(ApiRequest::get("/api/clients"))
+        .parse()
+        .expect("clients");
+    assert_eq!(clients.len(), 2);
 }
 
 #[test]
@@ -256,11 +335,8 @@ fn a_paired_client_lists_apps_and_sends_input() {
     h.api(ApiRequest::post("/api/pair/arm", ()));
 
     let mut pairing_client = ClientEndpoint::connect(h.udp, None).expect("connect");
-    let secret = pair(&h, &mut pairing_client);
-    h.api(ApiRequest::post(
-        "/api/pair/confirm",
-        serde_json::json!({"request_id": 0, "pin": PIN}),
-    ));
+    let (request_id, secret) = pair(&h, &mut pairing_client);
+    assert_eq!(type_pin(&h, request_id, PIN), 201);
 
     // An app added through the web UI has to be visible over the control
     // channel, or the two halves have diverged on what exists.
@@ -361,11 +437,8 @@ fn a_revoked_client_stops_being_able_to_send_input() {
     h.api(ApiRequest::post("/api/pair/arm", ()));
 
     let mut pairing_client = ClientEndpoint::connect(h.udp, None).expect("connect");
-    let secret = pair(&h, &mut pairing_client);
-    h.api(ApiRequest::post(
-        "/api/pair/confirm",
-        serde_json::json!({"request_id": 0, "pin": PIN}),
-    ));
+    let (request_id, secret) = pair(&h, &mut pairing_client);
+    assert_eq!(type_pin(&h, request_id, PIN), 201);
 
     let mut client =
         ClientEndpoint::connect(h.udp, Some(SessionKey::from_bytes(secret))).expect("connect");

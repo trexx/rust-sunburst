@@ -25,7 +25,9 @@ use crate::metrics::MetricsRecord;
 use crate::pairing::{Pairing, PairingError};
 use crate::random;
 use crate::store::{Store, StoreError};
-use sunburst_core::proto::{ART_MAX_BYTES, ArtFormat, ArtRef, SessionKey};
+use sunburst_core::proto::{
+    ART_MAX_BYTES, ArtFormat, ArtRef, PairOutcome, SessionKey, accepted_tag,
+};
 
 /// Request, reduced to what routing actually needs.
 #[derive(Clone, Debug, Default)]
@@ -304,6 +306,16 @@ impl AppState {
             .expect("not poisoned")
             .pairing
             .receive_confirm(request_id, tag, now);
+    }
+
+    /// How pair requests ended since the last call, for the control channel to
+    /// tell the clients waiting on them (`PairResult`).
+    pub fn take_pair_results(&self, now: u64) -> Vec<(u32, PairOutcome)> {
+        self.inner
+            .lock()
+            .expect("not poisoned")
+            .pairing
+            .take_results(now)
     }
 
     /// Every paired client's session key.
@@ -647,17 +659,26 @@ fn confirm(state: &AppState, req: &ApiRequest, now: u64) -> ApiResponse {
     }
 
     let public = paired.public();
+    let accepted = PairOutcome::Accepted {
+        tag: accepted_tag(&paired.secret),
+    };
     inner.next_client_id += 1;
     inner.clients.push(paired);
 
     if let Err(e) = state.store.save_clients(&inner.clients) {
         // Roll back rather than report a pairing that will not survive a
         // restart. A device that appears paired and is not is worse than one
-        // that visibly failed to pair.
+        // that visibly failed to pair — and the TV is told so too, since the
+        // request was spent either way.
         inner.clients.pop();
         inner.next_client_id -= 1;
+        inner
+            .pairing
+            .announce(body.request_id, PairOutcome::Rejected);
         return ApiResponse::error(500, e);
     }
+    // Only now, with the client saved, may the TV believe it is paired.
+    inner.pairing.announce(body.request_id, accepted);
     ApiResponse::json(201, &public)
 }
 

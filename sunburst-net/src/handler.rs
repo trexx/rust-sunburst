@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use sunburst_core::proto::pairing::{NONCE_LEN, TAG_LEN};
 use sunburst_core::proto::{
-    AppListing, ArtRef, DecoderQuirks, Feedback, Hello, InputEvent, PadOutput, PairRequest, Rumble,
-    Seq16, ServerControl, SessionConfig, SessionKey, StreamCodec,
+    AppListing, ArtRef, DecoderQuirks, Feedback, Hello, InputEvent, PadOutput, PairOutcome,
+    PairRequest, Rumble, Seq16, ServerControl, SessionConfig, SessionKey, StreamCodec,
 };
 
 /// Per-session stream settings the handler resolves before a session starts —
@@ -106,6 +106,13 @@ pub enum Outbound {
     /// Unreliable, latest-wins rich pad output (packet type 7): motors, adaptive
     /// triggers, LED. Same reasoning as [`Outbound::Rumble`], for rich pads.
     PadOutput { client: u32, output: PadOutput },
+    /// How a pair request ended. Addressed by request id, not client: the peer
+    /// has no identity yet, and the endpoint alone knows which address sent the
+    /// request. Reliable, on the unauthenticated pairing channel.
+    PairResult {
+        request_id: u32,
+        outcome: PairOutcome,
+    },
 }
 
 /// Where authenticated input goes once it has been verified.

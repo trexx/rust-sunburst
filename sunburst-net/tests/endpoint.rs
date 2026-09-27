@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use sunburst_core::proto::pairing::{NONCE_LEN, confirm_tag, derive_secret};
 use sunburst_core::proto::{
-    AppListing, ClientControl, GamepadState, Hello, InputEvent, InputPacket, PairRequest, Seq16,
-    ServerControl, SessionKey,
+    AppListing, ClientControl, GamepadState, Hello, InputEvent, InputPacket, PairOutcome,
+    PairRequest, Seq16, ServerControl, SessionKey,
 };
 use sunburst_net::endpoint::ClientEndpoint;
 use sunburst_net::{Endpoint, Recording};
@@ -174,6 +174,119 @@ fn a_full_pairing_exchange_completes_over_the_wire() {
         assert_eq!(r.pair_confirms[0].0, request_id);
         assert_eq!(r.pair_confirms[0].1, confirm_tag(&secret));
     });
+}
+
+/// Send a pair request and wait for its challenge; the request id.
+fn challenged(server: &Server, client: &mut ClientEndpoint) -> u32 {
+    client.send_control(&pair_request()).expect("send");
+    server.wait_for("the pair request", |r| !r.pair_requests.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(ServerControl::PairChallenge { request_id, .. }) =
+            client.recv_control().expect("recv")
+        {
+            return request_id;
+        }
+        client.tick().expect("tick");
+        assert!(Instant::now() < deadline, "no challenge arrived");
+    }
+}
+
+/// Wait for a `PairResult`, acknowledging as it goes.
+fn pair_result(client: &mut ClientEndpoint) -> Option<(u32, PairOutcome)> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Some(ServerControl::PairResult {
+            request_id,
+            outcome,
+        }) = client.recv_control().expect("recv")
+        {
+            client.tick().expect("ack");
+            return Some((request_id, outcome));
+        }
+        client.tick().expect("tick");
+    }
+    None
+}
+
+fn push_result(server: &Server, request_id: u32, outcome: PairOutcome) {
+    use sunburst_net::Outbound;
+    server
+        .recording
+        .lock()
+        .expect("not poisoned")
+        .outbound
+        .push(Outbound::PairResult {
+            request_id,
+            outcome,
+        });
+}
+
+#[test]
+fn a_pair_result_reaches_the_peer_that_sent_the_request() {
+    // The result is addressed by request id: the peer has no client id yet,
+    // and only the endpoint knows which address asked.
+    let server = Server::start(Recording::new().armed());
+    let mut client = ClientEndpoint::connect(server.addr, None).expect("connect");
+    let request_id = challenged(&server, &mut client);
+
+    let outcome = PairOutcome::WrongPin { remaining: 4 };
+    push_result(&server, request_id, outcome);
+    assert_eq!(pair_result(&mut client), Some((request_id, outcome)));
+}
+
+#[test]
+fn a_pair_result_for_an_unknown_request_goes_nowhere() {
+    let server = Server::start(Recording::new().armed());
+    let mut client = ClientEndpoint::connect(server.addr, None).expect("connect");
+    let request_id = challenged(&server, &mut client);
+
+    push_result(&server, request_id + 1, PairOutcome::Rejected);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        client.recv_control().expect("recv").is_none(),
+        "a result for someone else's request was delivered"
+    );
+}
+
+#[test]
+fn once_unarmed_a_pairing_peer_is_heard_for_its_acks_alone() {
+    // A successful pairing closes the arming, and the result goes out after.
+    // If the client's ack were dropped as unarmed traffic, the server would
+    // resend the result until it gave the peer up.
+    let server = Server::start(Recording::new().armed());
+    let mut client = ClientEndpoint::connect(server.addr, None).expect("connect");
+    let request_id = challenged(&server, &mut client);
+
+    server.recording.lock().expect("not poisoned").armed = false;
+    let outcome = PairOutcome::Accepted { tag: [3; 8] };
+    push_result(&server, request_id, outcome);
+    assert_eq!(pair_result(&mut client), Some((request_id, outcome)));
+
+    // Acked, so nothing more arrives — a resend would, within a few
+    // retransmit periods (200 ms each).
+    client
+        .socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("timeout");
+    let quiet_until = Instant::now() + Duration::from_millis(800);
+    let mut buf = [0u8; 2048];
+    while Instant::now() < quiet_until {
+        assert!(
+            client.socket.recv(&mut buf).is_err(),
+            "the server kept resending an acknowledged result"
+        );
+    }
+
+    // Heard, but not obeyed: nothing is acted on while unarmed.
+    client
+        .send_control(&ClientControl::PairConfirm {
+            request_id,
+            tag: [0; 8],
+        })
+        .expect("send");
+    std::thread::sleep(Duration::from_millis(200));
+    server.recording(|r| assert!(r.pair_confirms.is_empty()));
 }
 
 #[test]

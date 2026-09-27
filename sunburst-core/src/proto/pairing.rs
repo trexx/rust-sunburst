@@ -41,11 +41,20 @@ pub const NONCE_LEN: usize = 16;
 /// attack gets to grind.
 pub const PIN_DIGITS: usize = 8;
 
+/// How long an arming stays open, in seconds. Long enough to walk to the TV,
+/// short enough that the window is not simply left open.
+///
+/// Here rather than only in the server's state machine because a client waits
+/// on it too: once it has confirmed, the PIN has to be typed within this, so it
+/// bounds how long the client waits for the `PairResult`.
+pub const PAIRING_WINDOW_SECS: u64 = 90;
+
 /// Domain separators. Versioned: if the inputs ever change, these change with
 /// them, so old and new peers fail to agree rather than agreeing on a key one of
 /// them computed differently.
 const DERIVE_CONTEXT: &str = "sunburst pairing v1";
 const CONFIRM_MESSAGE: &[u8] = b"sunburst pair confirm v1";
+const ACCEPTED_MESSAGE: &[u8] = b"sunburst pair accepted v1";
 
 /// The long-lived secret. Both ends compute this independently.
 ///
@@ -70,6 +79,20 @@ pub fn derive_secret(
 /// derives a candidate from whatever was typed and compares tags.
 pub fn confirm_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
     let full = blake3::keyed_hash(secret, CONFIRM_MESSAGE);
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&full.as_bytes()[..TAG_LEN]);
+    tag
+}
+
+/// The server's proof, in `PairResult`, that the PIN was typed correctly.
+///
+/// The result travels without a MAC — the client has no key the server has
+/// agreed to until this very message — so an acceptance carries a tag only a
+/// server holding the same secret can produce. Its own message, not
+/// [`confirm_tag`]'s: the confirm tag crossed the wire in the clear, and a
+/// listener could otherwise echo it back as a forged acceptance.
+pub fn accepted_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
+    let full = blake3::keyed_hash(secret, ACCEPTED_MESSAGE);
     let mut tag = [0u8; TAG_LEN];
     tag.copy_from_slice(&full.as_bytes()[..TAG_LEN]);
     tag
@@ -133,6 +156,23 @@ mod tests {
         let server = [9; NONCE_LEN];
         let right = confirm_tag(&derive_secret("12345678", &client, &server));
         let wrong = confirm_tag(&derive_secret("87654321", &client, &server));
+        assert!(!tags_match(&right, &wrong));
+    }
+
+    #[test]
+    fn the_accepted_tag_is_not_the_confirm_tag() {
+        // The confirm tag crossed the wire in the clear; if the two agreed, a
+        // listener could replay it as the server's acceptance.
+        let secret = derive_secret("12345678", &[7; NONCE_LEN], &[9; NONCE_LEN]);
+        assert!(!tags_match(&accepted_tag(&secret), &confirm_tag(&secret)));
+    }
+
+    #[test]
+    fn the_accepted_tag_depends_on_the_secret() {
+        let client = [7; NONCE_LEN];
+        let server = [9; NONCE_LEN];
+        let right = accepted_tag(&derive_secret("12345678", &client, &server));
+        let wrong = accepted_tag(&derive_secret("87654321", &client, &server));
         assert!(!tags_match(&right, &wrong));
     }
 

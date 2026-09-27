@@ -321,6 +321,21 @@ Client → server:
 
 Server → client:
 - `PairChallenge` — `request_id`, `server_nonce`. Unauthenticated.
+- `PairResult` — how a pair request ended, once the web UI has decided.
+  Unauthenticated, like the challenge; an acceptance proves itself with `tag`
+  (see Pairing below). Fixed size, the unused fields zero:
+
+  ```
+  u32  request_id      from the PairChallenge
+  u8   status          0 accepted, 1 wrong PIN, 2 rejected
+  u8   remaining       PIN attempts left (status 1 only)
+  [8]  tag             BLAKE3::keyed_hash(secret, "sunburst pair accepted v1")[..8]
+                       (status 0 only)
+  ```
+
+  Rejected means the request is gone: disarmed, re-armed, expired, another
+  device paired first in the same window, attempts exhausted, or the new
+  client could not be saved.
 - `AppList` — one page of the catalogue. A long list does not fit one reliable
   frame (1179 bytes of message), and used to be dropped whole without a word;
   it is paged, and the client collects pages until it has `total` entries:
@@ -499,6 +514,28 @@ Sequence:
 4. User types the PIN. The server derives a candidate secret and compares tags.
    A mismatch costs an attempt, not the arming — a typo should not mean walking
    back to the TV.
+5. The server sends `PairResult` to the address that sent the request: wrong
+   PIN (with attempts left) as each typo happens, then accepted — only once the
+   new client is saved — or rejected. The client keeps the PIN on screen until
+   then, bounded by the 90-second window. It stores the secret only on an
+   acceptance whose `tag` matches its own `BLAKE3::keyed_hash(secret,
+   "sunburst pair accepted v1")[..8]`.
+
+**Why the acceptance carries a tag.** The result has no MAC — the key it would
+use is the one it announces — so a forged "accepted" would leave a TV holding a
+secret the server never stored, looking paired and unable to do anything. Only a
+server that derived the same secret, i.e. was given the right PIN, can produce
+the tag. Its message differs from the confirm tag's because the confirm tag
+crossed the wire in the clear: with one message, a listener could echo it back.
+The negative results are not tagged; forging one only makes a TV stop waiting,
+which dropping its packets would do as well.
+
+**A pairing peer is heard after the arming closes, for its acks alone.** Success
+closes the arming, and the acceptance goes out after it. An address the endpoint
+is already tracking as a pairing peer keeps having its reliable frames processed
+while unarmed, so its ack retires the result; nothing it sends is acted on
+until pairing is armed again, and an address not already tracked is still
+dropped.
 
 **What this is not.** It is not a key exchange. Anyone who captures a pairing
 exchange *and* one later authenticated packet can grind the eight-digit PIN

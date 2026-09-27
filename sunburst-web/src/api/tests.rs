@@ -707,6 +707,52 @@ fn a_full_pairing_produces_a_listed_client() {
 }
 
 #[test]
+fn the_tv_is_told_it_is_paired_with_a_tag_over_the_secret() {
+    let h = Harness::new("pairresult");
+    h.send(ApiRequest::post("/api/pair/arm", ()));
+    let id = client_pairs(&h, "12345678", [7; 16], "Shield");
+    let r = h.send(ApiRequest::post(
+        "/api/pair/confirm",
+        serde_json::json!({"request_id": id, "pin": "12345678"}),
+    ));
+    assert_eq!(r.status, 201, "{}", body_text(&r));
+
+    let secret = h.state.client_secret(1).expect("secret stored");
+    assert_eq!(
+        h.state.take_pair_results(NOW),
+        vec![(
+            id,
+            PairOutcome::Accepted {
+                tag: accepted_tag(&secret)
+            }
+        )]
+    );
+}
+
+#[test]
+fn a_pairing_that_cannot_be_saved_is_announced_as_rejected() {
+    // The client is rolled back, so the TV must not be told it is paired:
+    // it would keep a secret the server no longer has.
+    let h = Harness::new("pairsavefail");
+    h.send(ApiRequest::post("/api/pair/arm", ()));
+    let id = client_pairs(&h, "12345678", [7; 16], "Shield");
+
+    // A non-empty directory where the clients file goes: the rename fails.
+    let blocker = h.state.store.clients_path();
+    std::fs::create_dir_all(blocker.join("occupied")).expect("blocker");
+
+    let r = h.send(ApiRequest::post(
+        "/api/pair/confirm",
+        serde_json::json!({"request_id": id, "pin": "12345678"}),
+    ));
+    assert_eq!(r.status, 500, "{}", body_text(&r));
+    assert_eq!(
+        h.state.take_pair_results(NOW),
+        vec![(id, PairOutcome::Rejected)]
+    );
+}
+
+#[test]
 fn a_client_can_be_renamed_at_confirm_time() {
     let h = Harness::new("pairname");
     h.send(ApiRequest::post("/api/pair/arm", ()));

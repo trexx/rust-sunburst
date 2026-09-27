@@ -167,6 +167,18 @@ fn every_implemented_server_message_round_trips() {
         request_id: 5,
         server_nonce: [3; NONCE_LEN],
     });
+    for outcome in [
+        PairOutcome::Accepted {
+            tag: [0xA5; TAG_LEN],
+        },
+        PairOutcome::WrongPin { remaining: 3 },
+        PairOutcome::Rejected,
+    ] {
+        round_trip_server(ServerControl::PairResult {
+            request_id: 7,
+            outcome,
+        });
+    }
     round_trip_server(ServerControl::AppList(app_page()));
     round_trip_server(ServerControl::Bye);
     round_trip_server(ServerControl::AppList(AppPage {
@@ -450,6 +462,7 @@ fn discriminants_are_pinned() {
     assert_eq!(ServerMessage::AppList as u8, 7);
     assert_eq!(ServerMessage::ArtChunk as u8, 8);
     assert_eq!(ServerMessage::LaunchResult as u8, 9);
+    assert_eq!(ServerMessage::PairResult as u8, 10);
 }
 
 #[test]
@@ -474,7 +487,61 @@ fn only_the_pairing_exchange_may_arrive_unauthenticated() {
         assert!(!kind.is_pre_pairing(), "{kind:?} must require a MAC");
     }
     assert!(ServerMessage::PairChallenge.is_pre_pairing());
+    assert!(ServerMessage::PairResult.is_pre_pairing());
     assert!(!ServerMessage::AppList.is_pre_pairing());
+}
+
+#[test]
+fn a_pair_result_is_fixed_size_whatever_the_outcome() {
+    // u32 id, status, remaining, tag — the unused fields zero, not absent.
+    for outcome in [
+        PairOutcome::Accepted { tag: [1; TAG_LEN] },
+        PairOutcome::WrongPin { remaining: 4 },
+        PairOutcome::Rejected,
+    ] {
+        let encoded = ServerControl::PairResult {
+            request_id: 1,
+            outcome,
+        }
+        .encode()
+        .expect("encode");
+        assert_eq!(
+            encoded.len(),
+            ENVELOPE_LEN + 4 + 1 + 1 + TAG_LEN,
+            "{outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pair_result_with_an_unknown_status_is_refused() {
+    let mut encoded = ServerControl::PairResult {
+        request_id: 1,
+        outcome: PairOutcome::Rejected,
+    }
+    .encode()
+    .expect("encode");
+    encoded[ENVELOPE_LEN + 4] = 9;
+    assert_eq!(
+        ServerControl::decode(&encoded),
+        Err(ControlError::OutOfRange("pair result status"))
+    );
+}
+
+#[test]
+fn a_truncated_pair_result_is_refused() {
+    let encoded = ServerControl::PairResult {
+        request_id: 1,
+        outcome: PairOutcome::WrongPin { remaining: 2 },
+    }
+    .encode()
+    .expect("encode");
+    // Shorten the payload and its declared length together, so the reader
+    // (not the envelope) is what notices.
+    let mut short = encoded[..encoded.len() - 1].to_vec();
+    let len = u16::from_le_bytes([short[1], short[2]]) - 1;
+    short[1..3].copy_from_slice(&len.to_le_bytes());
+    assert_eq!(ServerControl::decode(&short), Err(ControlError::Truncated));
 }
 
 #[test]

@@ -103,6 +103,7 @@ pub enum ServerMessage {
     AppList = 7,
     ArtChunk = 8,
     LaunchResult = 9,
+    PairResult = 10,
 }
 
 impl ClientMessage {
@@ -149,12 +150,16 @@ impl ServerMessage {
             7 => ServerMessage::AppList,
             8 => ServerMessage::ArtChunk,
             9 => ServerMessage::LaunchResult,
+            10 => ServerMessage::PairResult,
             _ => return None,
         })
     }
 
     pub const fn is_pre_pairing(self) -> bool {
-        matches!(self, ServerMessage::PairChallenge)
+        matches!(
+            self,
+            ServerMessage::PairChallenge | ServerMessage::PairResult
+        )
     }
 }
 
@@ -484,12 +489,35 @@ pub enum ClientControl {
     Unhandled(u8),
 }
 
+/// How the server resolved a pair request (see `ServerControl::PairResult`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairOutcome {
+    /// The PIN typed into the web UI matched, and the client is stored.
+    /// `tag` is [`accepted_tag`](super::pairing::accepted_tag) over the
+    /// secret: the client checks it before believing it is paired, because
+    /// this channel carries no MAC.
+    Accepted { tag: [u8; TAG_LEN] },
+    /// A PIN was typed and did not match. The request survives with
+    /// `remaining` attempts.
+    WrongPin { remaining: u8 },
+    /// The request is gone — disarmed, re-armed, expired, another device
+    /// paired first, attempts exhausted, or the pairing could not be saved.
+    Rejected,
+}
+
 /// A decoded server → client message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerControl {
     PairChallenge {
         request_id: u32,
         server_nonce: [u8; NONCE_LEN],
+    },
+    /// How a pair request ended, sent once the web UI has decided it. Rides
+    /// the unauthenticated pairing channel like `PairChallenge`; an acceptance
+    /// proves itself with a tag only the same secret produces.
+    PairResult {
+        request_id: u32,
+        outcome: PairOutcome,
     },
     /// One page of the app list; see [`app_list_pages`](super::art::app_list_pages).
     AppList(AppPage),
@@ -712,6 +740,7 @@ impl ServerControl {
     pub const fn kind(&self) -> Option<ServerMessage> {
         Some(match self {
             ServerControl::PairChallenge { .. } => ServerMessage::PairChallenge,
+            ServerControl::PairResult { .. } => ServerMessage::PairResult,
             ServerControl::AppList(_) => ServerMessage::AppList,
             ServerControl::ArtChunk(_) => ServerMessage::ArtChunk,
             ServerControl::LaunchResult { .. } => ServerMessage::LaunchResult,
@@ -739,6 +768,21 @@ impl ServerControl {
             } => {
                 b.extend_from_slice(&request_id.to_le_bytes());
                 b.extend_from_slice(server_nonce);
+            }
+            ServerControl::PairResult {
+                request_id,
+                outcome,
+            } => {
+                // Fixed size: status, remaining, tag — the unused fields zero.
+                let (status, remaining, tag) = match *outcome {
+                    PairOutcome::Accepted { tag } => (0u8, 0u8, tag),
+                    PairOutcome::WrongPin { remaining } => (1, remaining, [0; TAG_LEN]),
+                    PairOutcome::Rejected => (2, 0, [0; TAG_LEN]),
+                };
+                b.extend_from_slice(&request_id.to_le_bytes());
+                b.push(status);
+                b.push(remaining);
+                b.extend_from_slice(&tag);
             }
             ServerControl::AppList(page) => {
                 let count = u16::try_from(page.apps.len()).unwrap_or(u16::MAX);
@@ -881,6 +925,22 @@ impl ServerControl {
                 request_id: r.u32()?,
                 server_nonce: r.array::<NONCE_LEN>()?,
             },
+            ServerMessage::PairResult => {
+                let request_id = r.u32()?;
+                let status = r.u8()?;
+                let remaining = r.u8()?;
+                let tag = r.array::<TAG_LEN>()?;
+                let outcome = match status {
+                    0 => PairOutcome::Accepted { tag },
+                    1 => PairOutcome::WrongPin { remaining },
+                    2 => PairOutcome::Rejected,
+                    _ => return Err(ControlError::OutOfRange("pair result status")),
+                };
+                ServerControl::PairResult {
+                    request_id,
+                    outcome,
+                }
+            }
             ServerMessage::AppList => {
                 let total = r.u16()?;
                 let start = r.u16()?;
