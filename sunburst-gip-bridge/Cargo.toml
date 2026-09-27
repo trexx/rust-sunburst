@@ -19,7 +19,7 @@ log = "0.4"
 # cross-compiles to both Android ABIs and is host-tested against known vectors.
 sha2 = "0.10"
 hmac = "0.12"
-rsa = "0.9"
+rsa = "0.9.10"
 p256 = { version = "0.13", features = ["ecdh"] }
 # `OsRng`, an OS CSPRNG implementing the `rand_core` traits `rsa`/`p256` want.
 rand_core = { version = "0.6", features = ["getrandom"] }
