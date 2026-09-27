@@ -15,7 +15,7 @@ workspace = true
 # grow a second tick source next to the one the whole project measures with.
 sunburst-core.workspace = true
 
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

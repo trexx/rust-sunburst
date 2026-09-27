@@ -24,7 +24,7 @@ log = "0.4"
 [target.'cfg(windows)'.dependencies]
 # WASAPI loopback capture: IAudioClient3 + IAudioCaptureClient off the default
 # render endpoint, selected through IMMDeviceEnumerator.
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Media_Audio",
