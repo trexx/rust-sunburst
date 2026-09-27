@@ -15,13 +15,23 @@ import kotlin.concurrent.thread
 /**
  * Pairing from the TV. The client generates a PIN and shows it; the user arms
  * pairing in the web UI and types the PIN there. The handshake (PairRequest ->
- * PairChallenge -> PairConfirm, deriving the secret) runs in Rust; on success
- * the derived secret and server address are stored in app-private prefs.
+ * PairChallenge -> PairConfirm, deriving the secret) runs in Rust, and so does
+ * the wait for the server's PairResult: the PIN stays on screen until the
+ * server has accepted it, a wrong PIN is reported as it is typed, and only an
+ * accepted secret is stored in app-private prefs.
+ *
+ * Finishes with RESULT_OK once paired; anything else (Back) is RESULT_CANCELED,
+ * which the launcher reads as "leave". Opened from Settings to re-pair, the old
+ * pairing stays until a new one succeeds.
  *
  * A plain programmatic layout — no res/layout — so the foundation carries no UI
  * resources it does not need.
  */
 class PairActivity : Activity() {
+    private lateinit var status: TextView
+    /** A `nativePair` is running on a worker thread. UI thread only. */
+    private var waiting = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
@@ -42,7 +52,7 @@ class PairActivity : Activity() {
             hint = "server host (or host:port)"
         }
         val pinView = label("").apply { textSize = 40f }
-        val status = label("Arm pairing in the web UI, then press Pair.")
+        status = label("Arm pairing in the web UI, then press Pair.")
         val pairButton = Button(this).apply { text = "Pair" }
 
         root.addView(label("Sunburst — pair this device"))
@@ -53,43 +63,51 @@ class PairActivity : Activity() {
         setContentView(root)
 
         pairButton.setOnClickListener {
-            val (host, port) = parseHost(hostEntry.text.toString())
+            val (host, port) = Pairing.parseHost(hostEntry.text.toString())
             val pin = nativeGenPin()
             if (pin.isEmpty()) {
                 status.text = "could not generate a PIN"
                 return@setOnClickListener
             }
             pinView.text = "PIN: $pin"
-            status.text = "pairing… type the PIN into the web UI"
+            status.text = "Type this PIN into the web UI (Clients → pending)."
             pairButton.isEnabled = false
+            waiting = true
             thread {
-                val secret = nativePair(host, port, pin)
+                val result = nativePair(host, port, pin)
                 runOnUiThread {
+                    waiting = false
                     pairButton.isEnabled = true
-                    if (secret.isNotEmpty()) {
+                    if (Pairing.isSecret(result)) {
                         prefs.edit()
-                            .putString("secret_hex", secret)
+                            .putString("secret_hex", result)
                             .putString("server_host", host)
                             .putInt("server_port", port)
                             .apply()
                         status.text = "paired"
+                        setResult(RESULT_OK)
                         finish()
                     } else {
-                        status.text = "pairing failed — arm the web UI and try again"
+                        pinView.text = ""
+                        status.text = "Pairing failed: $result. Arm the web UI and press Pair again."
                     }
                 }
             }
         }
     }
 
-    private fun parseHost(entry: String): Pair<String, Int> {
-        val trimmed = entry.trim()
-        val idx = trimmed.lastIndexOf(':')
-        return if (idx > 0) {
-            val port = trimmed.substring(idx + 1).toIntOrNull() ?: 47811
-            Pair(trimmed.substring(0, idx), port)
-        } else {
-            Pair(trimmed, 47811)
+    override fun onDestroy() {
+        super.onDestroy()
+        // Leaving mid-wait (Back) ends the wait rather than leaving a worker
+        // listening for a PIN nobody can see any more.
+        if (waiting) nativeCancelPair()
+    }
+
+    /** Called by `nativePair`, on its worker thread, for each wrong PIN typed. */
+    @Suppress("unused")
+    fun onWrongPin(remaining: Int) {
+        runOnUiThread {
+            status.text = "Wrong PIN typed — $remaining attempt(s) left. Check the digits against this screen."
         }
     }
 
@@ -100,6 +118,7 @@ class PairActivity : Activity() {
 
     private external fun nativeGenPin(): String
     private external fun nativePair(host: String, port: Int, pin: String): String
+    private external fun nativeCancelPair()
 
     companion object {
         init {
