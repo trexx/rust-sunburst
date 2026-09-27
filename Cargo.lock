@@ -1240,7 +1240,6 @@ dependencies = [
  "sunburst-core",
  "thiserror 2.0.20",
  "windows",
- "windows-core",
 ]
 
 [[package]]

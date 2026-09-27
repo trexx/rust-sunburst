@@ -33,16 +33,10 @@
       "groupName": "github actions"
     },
     {
-      "description": "windows-rs is the whole FFI surface of seven crates (capture, encode, audio, input, net, server, probe-windows). One PR, every version, so the workspace never builds two copies.",
+      "description": "windows-rs is the whole FFI surface of seven crates (capture, encode, audio, input, net, server, probe-windows). One PR, every version, so the workspace never builds two copies. windows-core is reached only through windows::core, so it follows windows via the lockfile rather than needing a rule of its own.",
       "matchManagers": ["cargo"],
       "matchPackageNames": ["windows"],
       "groupName": "windows-rs"
-    },
-    {
-      "description": "sunburst-net names windows-core directly for PSTR, which it hands to windows' WSABUF, so it must stay on the line `windows` itself depends on. windows-core versions independently (0.100 shipped with windows still at 0.62), so Renovate cannot follow it; bump it by hand in the windows-rs PR.",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["windows-core"],
-      "enabled": false
     },
     {
       "description": "The Rust crypto stack behind sunburst-gip-bridge implements the pad security handshake. Its own PR, never auto-merged.",

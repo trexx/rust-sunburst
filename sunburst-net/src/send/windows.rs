@@ -28,7 +28,7 @@ use windows::Win32::Networking::WinSock::{
     IPPROTO_UDP, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKET, UDP_SEND_MSG_SIZE,
     WSABUF, WSAMSG, WSASendMsg,
 };
-use windows_core::PSTR;
+use windows::core::PSTR;
 
 use super::Sender;
 
