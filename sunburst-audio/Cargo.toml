@@ -19,7 +19,7 @@ sunburst-core.workspace = true
 # host-tested, and only the WASAPI modules are gated, the same split
 # `sunburst-input` uses for its keymap.
 unsafe-libopus.workspace = true
-log = "0.4"
+log = "0.4.34"
 
 [target.'cfg(windows)'.dependencies]
 # WASAPI loopback capture: IAudioClient3 + IAudioCaptureClient off the default

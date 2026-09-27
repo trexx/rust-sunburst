@@ -37,7 +37,7 @@ sunburst-input = { path = "sunburst-input" }
 sunburst-audio = { path = "sunburst-audio" }
 sunburst-gip-bridge = { path = "sunburst-gip-bridge" }
 
-blake3 = { version = "1.8", default-features = false, features = ["std"] }
+blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
 
 # libopus transpiled to pure Rust (c2rust). Pure Rust so the Opus encoder (server)
 # and decoder (client) cross-compile to Windows and both Android ABIs with no C
@@ -47,22 +47,22 @@ unsafe-libopus = "0.2"
 
 # Control plane only. CLAUDE.md permits tokio in sunburst-server; sunburst-web is
 # the same plane and never sits between the frame path and anything.
-tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "process"] }
-hyper = { version = "1.11", default-features = false, features = ["server", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "process"] }
+hyper = { version = "1.11.1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 # hyper 1.x moved body helpers out of the core crate. Collecting a request body
 # by hand means writing an async Body impl, which is the one part of this that
 # is genuinely easy to get subtly wrong.
-http-body-util = "0.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+http-body-util = "0.1.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 # The admin token and the pairing PIN both have to be unguessable, so they need
 # the OS CSPRNG rather than a hash of the clock. This is the crate `rand` itself
 # uses underneath, without the distribution machinery we have no use for.
-getrandom = "0.4"
+getrandom = "0.4.3"
 subtle = "2.6"
-thiserror = "2.0"
+thiserror = "2.0.21"
 
 [workspace.lints.rust]
 # The FFI crates are largely unsafe transcription; making every unsafe operation
