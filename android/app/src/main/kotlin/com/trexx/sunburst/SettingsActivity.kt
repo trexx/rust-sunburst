@@ -2,11 +2,13 @@
 package com.trexx.sunburst
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
 /**
@@ -21,6 +23,11 @@ import android.widget.TextView
  * centre key, which is the only interaction a TV remote does comfortably; there
  * are no text fields to type into. A plain programmatic layout, like
  * [PairActivity], so the foundation carries no UI resources it does not need.
+ *
+ * Also where the TV re-pairs: with a different server, or with the same one
+ * after it was reinstalled or this TV was removed from it. The old pairing is
+ * kept until a new one succeeds, so backing out of the pair screen loses
+ * nothing.
  */
 class SettingsActivity : Activity() {
     // Codec request: prefs int -1 = auto, else a StreamCodec discriminant.
@@ -42,6 +49,7 @@ class SettingsActivity : Activity() {
     private var perfHint = true
     private var audioRouteIdx = 2 // TV + pad
     private var padVolumeIdx = 4 // 100%
+    private lateinit var serverLabel: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -138,6 +146,15 @@ class SettingsActivity : Activity() {
         }, lp())
         root.addView(pairStatus, lp())
 
+        serverLabel = TextView(this).apply { textSize = 14f }
+        root.addView(serverLabel, lp())
+        root.addView(Button(this).apply {
+            text = "Pair with a server…"
+            setOnClickListener {
+                startActivity(Intent(this@SettingsActivity, PairActivity::class.java))
+            }
+        }, lp())
+
         root.addView(Button(this).apply {
             text = "Save and close"
             setOnClickListener {
@@ -155,8 +172,21 @@ class SettingsActivity : Activity() {
         }, lp())
 
         refresh()
-        setContentView(root)
+        // Scrolls, following D-pad focus: the list outgrows a TV screen.
+        setContentView(ScrollView(this).apply { addView(root) })
         codecButton.requestFocus()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Back from the pair screen, which may have changed the server.
+        val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
+        serverLabel.text = if (prefs.getString("secret_hex", "")!!.isEmpty()) {
+            "Not paired with a server."
+        } else {
+            val host = prefs.getString("server_host", "")
+            "Paired with $host:${prefs.getInt("server_port", Pairing.DEFAULT_PORT)}"
+        }
     }
 
     private fun bitrateLabel(kbps: Int): String =

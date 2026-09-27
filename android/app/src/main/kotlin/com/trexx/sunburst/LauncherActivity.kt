@@ -27,7 +27,8 @@ import kotlin.concurrent.thread
  * The launcher screen: the server's apps as a D-pad grid of box art. Choosing
  * one launches it on the server, then streams; the first tile, Desktop, streams
  * without launching anything. Menu opens settings; an unpaired device goes to
- * pairing first.
+ * pairing first, and backing out of that leaves the app — there is nothing an
+ * unpaired device can show here.
  *
  * The catalogue and the launch are Rust (`launcher.rs`), over the same paired
  * control channel the stream uses. Launching *before* the stream connects is
@@ -108,14 +109,23 @@ class LauncherActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        val prefs = getSharedPreferences("sunburst", MODE_PRIVATE)
-        val secret = prefs.getString("secret_hex", "")!!
-        if (secret.isEmpty()) {
-            startActivity(Intent(this, PairActivity::class.java))
+        if (isFinishing) return
+        if (!paired()) {
+            startActivityForResult(Intent(this, PairActivity::class.java), REQUEST_PAIR)
             return
         }
         refresh()
     }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        // Back out of pairing, still unpaired: leave, rather than let onResume
+        // open the pair screen again and trap Back in a loop.
+        if (requestCode == REQUEST_PAIR && resultCode != RESULT_OK && !paired()) finish()
+    }
+
+    private fun paired() =
+        getSharedPreferences("sunburst", MODE_PRIVATE).getString("secret_hex", "")!!.isNotEmpty()
 
     override fun onDestroy() {
         super.onDestroy()
@@ -152,7 +162,11 @@ class LauncherActivity : Activity() {
                 busy = false
                 tiles = Catalogue.parse(flat)
                 status.text = when {
-                    flat == null -> "Could not reach the server; Desktop still streams."
+                    // The server drops a key it does not know without a word,
+                    // so a removed TV looks exactly like an unreachable server.
+                    flat == null ->
+                        "Could not reach the server. If this TV was removed from it, " +
+                            "re-pair from Settings (Menu)."
                     tiles.size == 1 -> "No apps configured on the server."
                     else -> ""
                 }
@@ -250,6 +264,7 @@ class LauncherActivity : Activity() {
     private external fun nativeLaunch(host: String, port: Int, secretHex: String, appId: Int): String
 
     companion object {
+        private const val REQUEST_PAIR = 1
         private const val TILE_W_DP = 160
         private const val SPACING_DP = 24
 

@@ -44,13 +44,14 @@
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:label="Sunburst" />
 
-        <!-- Pairing screen, opened by the stream activity when unpaired. -->
+        <!-- Pairing screen: opened by the grid when unpaired, and from Settings
+             to re-pair. -->
         <activity
             android:name=".PairActivity"
             android:exported="false"
             android:label="Sunburst pairing" />
 
-        <!-- Settings screen, opened from the stream activity with the Menu key. -->
+        <!-- Settings screen, opened with the Menu key from the grid or the stream. -->
         <activity
             android:name=".SettingsActivity"
             android:exported="false"
