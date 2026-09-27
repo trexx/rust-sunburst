@@ -16,8 +16,15 @@
   "packageRules": [
     {
       "description": "Cut PR noise: one grouped PR for all non-major bumps across Cargo, npm and Gradle. Majors stay separate so they get reviewed on their own.",
-      "matchUpdateTypes": ["minor", "patch"],
       "matchManagers": ["cargo", "npm", "gradle"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "non-major dependencies"
+    },
+    {
+      "description": "Minors join the same group, except on a 0.x line: Renovate calls 0.10 -> 0.11 a minor, but under Cargo's semver it is breaking, so it gets its own PR like a major.",
+      "matchManagers": ["cargo", "npm", "gradle"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentValue": "!/^[\\^~=]?0\\./",
       "groupName": "non-major dependencies"
     },
     {
@@ -26,15 +33,40 @@
       "groupName": "github actions"
     },
     {
-      "description": "The Rust crypto/USB stack behind sunburst-gip-bridge touches the pad security handshake; never auto-merge, and keep it its own PR for review.",
+      "description": "windows-rs is the whole FFI surface of seven crates (capture, encode, audio, input, net, server, probe-windows). One PR, every version, so the workspace never builds two copies.",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["rsa", "p256", "sha2", "hmac", "rand_core", "getrandom"],
+      "matchPackageNames": ["windows"],
+      "groupName": "windows-rs"
+    },
+    {
+      "description": "sunburst-net names windows-core directly for PSTR, which it hands to windows' WSABUF, so it must stay on the line `windows` itself depends on. windows-core versions independently (0.100 shipped with windows still at 0.62), so Renovate cannot follow it; bump it by hand in the windows-rs PR.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["windows-core"],
+      "enabled": false
+    },
+    {
+      "description": "The Rust crypto stack behind sunburst-gip-bridge implements the pad security handshake. Its own PR, never auto-merged.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["rsa", "p256", "sha2", "hmac", "rand_core"],
       "groupName": "gip-bridge crypto",
       "automerge": false
+    },
+    {
+      "description": "RustCrypto breaking lines only build together (rsa pins the sha2/rand_core traits it accepts), so a new line is its own group and waits on the Dependency Dashboard until all of them have shipped it, instead of sitting open and red. Patches keep flowing in the group above.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["rsa", "p256", "sha2", "hmac", "rand_core"],
+      "matchUpdateTypes": ["major", "minor"],
+      "groupName": "gip-bridge crypto (breaking)",
+      "groupSlug": "gip-bridge-crypto-breaking",
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "rust-toolchain.toml pins an exact channel. A new toolchain brings new clippy lints, so it stays its own PR where CI's clippy run is the review.",
+      "matchManagers": ["rust-toolchain"],
+      "commitMessageTopic": "Rust toolchain"
     }
   ],
   "ignorePaths": [
-    "sunburst-gip-bridge/vendor/**",
-    "tools/probe-windows/**"
+    "sunburst-gip-bridge/vendor/**"
   ]
 }
