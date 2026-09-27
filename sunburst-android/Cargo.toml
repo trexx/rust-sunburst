@@ -33,7 +33,7 @@ getrandom = "0.4"
 # and linked into this cdylib (the first real link of the vendored driver); the
 # host build never sees it, and its own build.rs also gates on target_os=android.
 sunburst-gip-bridge = { workspace = true, features = ["vendored"] }
-jni = "0.21"
+jni = "0.22.4"
 ndk = { version = "0.9", features = ["media", "audio", "api-level-30"] }
 ndk-sys = "0.6"
 ndk-context = "0.1"
