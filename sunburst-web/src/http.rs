@@ -103,7 +103,7 @@ async fn handle(
 
     let body = match collect_body(req).await {
         Ok(bytes) => bytes,
-        Err(response) => return Ok(response),
+        Err((status, message)) => return Ok(json_error(status, message)),
     };
 
     let api_req = ApiRequest {
@@ -115,7 +115,9 @@ async fn handle(
     Ok(to_response(api::dispatch(&state, &api_req, unix_now())))
 }
 
-async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<Bytes>>> {
+/// The body, or the status and message to reject it with. The caller builds the
+/// response, so the `Err` variant stays small.
+async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>, (u16, &'static str)> {
     // `Limited` stops reading once the cap is passed. Checking the size after
     // collecting would mean having already buffered whatever was sent, which is
     // the memory exhaustion the limit exists to prevent — and `Content-Length`
@@ -123,9 +125,9 @@ async fn collect_body(req: Request<Incoming>) -> Result<Vec<u8>, Response<Full<B
     match Limited::new(req.into_body(), MAX_BODY).collect().await {
         Ok(collected) => Ok(collected.to_bytes().to_vec()),
         Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            Err(json_error(413, "request body too large"))
+            Err((413, "request body too large"))
         }
-        Err(_) => Err(json_error(400, "could not read request body")),
+        Err(_) => Err((400, "could not read request body")),
     }
 }
 
