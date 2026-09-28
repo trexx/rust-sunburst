@@ -20,9 +20,6 @@ const ENTRIES: &[(&str, &str)] = &[
     ("argb10_to_p010.ptx", "argb10_to_p010"),
     ("argb_to_nv12.ptx", "argb_to_nv12"),
     ("argb_to_nv12.ptx", "argb_to_nv12_tonemap"),
-    // BT.709 P010 for a 10-bit SDR stream (Hello.display_hdr = false).
-    ("argb_to_nv12.ptx", "argb10_to_p010_709"),
-    ("argb_to_nv12.ptx", "argb10_to_p010_709_tonemap"),
 ];
 
 /// `(src, src_pitch_words, dst, dst_pitch_elems, width, height)` — the launch in
@@ -86,19 +83,5 @@ fn entries_do_real_work() {
             body.contains("st.global"),
             "`{name}` never writes global memory"
         );
-    }
-}
-
-#[test]
-fn the_sdr_p010_entries_write_sixteen_bit_samples() {
-    // P010 is u16 per sample; an NV12 (u8) body under a P010 name would write
-    // half-width planes and look plausible until it reached the TV.
-    for name in ["argb10_to_p010_709", "argb10_to_p010_709_tonemap"] {
-        let body = entry(NV12, name).unwrap();
-        assert!(
-            body.contains("st.global.u16"),
-            "`{name}` never stores a u16"
-        );
-        assert!(!body.contains("st.global.u8"), "`{name}` stores bytes");
     }
 }

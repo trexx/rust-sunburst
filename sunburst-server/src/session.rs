@@ -251,21 +251,8 @@ impl StreamControl for SessionManager {
         // capture governor keeps the exact interval.
         let fps = encoder_fps(hello.refresh_mhz, settings.fps_cap);
         let interval_ns = client_interval_ns(hello.refresh_mhz, settings.fps_cap);
-        // H.264 is SDR (tonemapped): never enable HDR on the desktop for it. Nor
-        // for a client whose display cannot show HDR10: BT.2020 PQ on an SDR
-        // panel came out washed out and over-exposed, and an SDR desktop is also
-        // the cheapest SDR source (no tonemap).
-        let want_hdr = settings.hdr && codec != StreamCodec::H264 && hello.display_hdr;
-        if settings.hdr && !want_hdr {
-            eprintln!(
-                "sunburst: streaming SDR ({})",
-                if codec == StreamCodec::H264 {
-                    "H.264"
-                } else {
-                    "the client's display is not HDR10-capable"
-                }
-            );
-        }
+        // H.264 is SDR (tonemapped): never enable HDR on the desktop for it.
+        let want_hdr = settings.hdr && codec != StreamCodec::H264;
 
         // Set the display up BEFORE spawning the pipeline, so capture starts on the
         // final desktop (correct HDR state + resolution) instead of the old one.
@@ -448,8 +435,7 @@ impl StreamControl for SessionManager {
             headers_sent: false,
             secure_sent: false,
             cursor,
-            // Fine-grained when the client cannot predict (EPP on, gain 0).
-            cursor_throttle: PositionThrottle::for_gain(pointer_gain_milli),
+            cursor_throttle: PositionThrottle::new(),
             output,
         });
 

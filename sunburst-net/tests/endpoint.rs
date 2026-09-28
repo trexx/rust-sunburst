@@ -341,7 +341,6 @@ fn an_authenticated_client_is_recognised_by_its_key_alone() {
             codecs: sunburst_core::proto::codecs::HEVC_MAIN10,
             prefer_codec: None,
             max_bitrate_kbps: 0,
-            display_hdr: true,
         }))
         .expect("send");
 
@@ -956,7 +955,6 @@ fn hello_with(nonce: [u8; NONCE_LEN]) -> Hello {
         codecs: codecs::HEVC_MAIN10,
         prefer_codec: None,
         max_bitrate_kbps: 0,
-        display_hdr: true,
     }
 }
 

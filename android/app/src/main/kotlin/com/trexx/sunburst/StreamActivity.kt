@@ -14,7 +14,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.PerformanceHintManager
 import android.os.PerformanceHintManager.Session
-import android.view.Display
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -225,7 +224,7 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         handle = nativeStart(
             s, params.host, params.port, params.secret, supportedCodecs(),
             params.preferCodec, params.maxBitrateKbps, params.jitterMinMs,
-            params.audioRoute, params.padVolume, if (displayHdr10()) 1 else 0,
+            params.audioRoute, params.padVolume,
         )
         startedWith = params
     }
@@ -313,21 +312,6 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         return true
-    }
-
-    /** Whether the connected display can show HDR10, for Hello.display_hdr. The
-     *  server streams HDR only to a display that can show it: BT.2020 PQ on an
-     *  SDR panel came out washed out and over-exposed. Unknown (no display yet)
-     *  keeps the old behaviour and lets the server's own setting decide. */
-    private fun displayHdr10(): Boolean {
-        val d = display ?: return true
-        val types = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            d.mode.supportedHdrTypes
-        } else {
-            @Suppress("DEPRECATION")
-            d.hdrCapabilities?.supportedHdrTypes
-        } ?: return false
-        return types.contains(Display.HdrCapabilities.HDR_TYPE_HDR10)
     }
 
     /** Codecs this device can decode, as Hello.codecs bits (bit0 HEVC, bit1 AV1). */
@@ -438,7 +422,6 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
         jitterMinMs: Int,
         audioRoute: Int,
         padVolume: Int,
-        displayHdr: Int,
     ): Long
     private external fun nativeStop(handle: Long)
     private external fun nativeSurfaceChanged(handle: Long, surface: Surface)

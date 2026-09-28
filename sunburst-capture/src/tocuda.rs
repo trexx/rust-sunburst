@@ -27,10 +27,9 @@ use crate::{Backend, Caps, Capture, CaptureError, CudaFormat, CudaFrame, Frame, 
 /// `NVFBC_SHARED_CUDA` at `NVFBC_DLL_VERSION 0x70`.
 const NVFBC_SHARED_CUDA: u32 = 0x1007;
 
-/// `NVFBCToCUDABufferFormat`: A2B10G10R10 — a 10-bit *integer* format, not
-/// scRGB FP16. The only format this backend grabs, SDR or HDR, because every
-/// convert kernel (`sunburst-encode/cuda/*.cu`) unpacks it. Grabbing 8-bit ARGB
-/// for an SDR session, as this once did, fed 8-bit pixels to a 10-bit unpacker.
+/// `NVFBCToCUDABufferFormat`.
+const NVFBC_TOCUDA_ARGB: u32 = 0;
+/// A2B10G10R10 — a 10-bit *integer* format, not scRGB FP16.
 const NVFBC_TOCUDA_ARGB10: u32 = 1;
 
 const NVFBC_TOCUDA_NOWAIT: u32 = 0x1;
@@ -163,7 +162,11 @@ impl NvFbcCapture {
             cuda,
             context,
             buffer: 0,
-            format: CudaFormat::Argb10,
+            format: if hdr {
+                CudaFormat::Argb10
+            } else {
+                CudaFormat::Argb8
+            },
             caps: Caps {
                 backend: Backend::NvFbc,
                 hdr,
@@ -235,7 +238,11 @@ impl NvFbcCapture {
     fn setup(&mut self, hdr: bool) -> i32 {
         let mut params = SetupParams {
             version: nvfbc::struct_version(SETUP_SIZE, 1),
-            format: NVFBC_TOCUDA_ARGB10,
+            format: if hdr {
+                NVFBC_TOCUDA_ARGB10
+            } else {
+                NVFBC_TOCUDA_ARGB
+            },
             ..Default::default()
         };
         if hdr {
@@ -333,18 +340,12 @@ impl Drop for NvFbcCapture {
             self.object = std::ptr::null_mut();
         }
         // Never destroyed — it is NvFBC's — but `new` pushed it onto this
-        // thread's stack, and that push is ours to undo, so the next session's
-        // NvFBC_CreateEx (an AccessLost rebuild) never runs on a released one.
-        // NvFBCCudaRelease normally takes its own context off the stack itself
-        // (observed on the 4070), leaving none current: nothing to do then.
-        match self.cuda.ctx_get_current() {
-            None => {}
-            Some(c) if c == self.context => {
-                let _ = self.cuda.ctx_pop();
-            }
-            Some(_) => {
-                eprintln!("sunburst-capture: another CUDA context is current after NvFBC release")
-            }
+        // thread's stack, and that push is ours to undo. Left current, the next
+        // session's NvFBC_CreateEx (an AccessLost rebuild) runs on top of a
+        // released context — the leading suspect for the access violation in
+        // nvcuda64.dll seen on the first rebuild that got this far.
+        if !self.cuda.ctx_pop_if_current(self.context) {
+            eprintln!("sunburst-capture: NvFBC context was not current at release");
         }
         eprintln!("sunburst-capture: NvFBC session released");
     }

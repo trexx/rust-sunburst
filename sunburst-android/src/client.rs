@@ -203,9 +203,6 @@ pub struct StreamPrefs {
     pub audio_route: u8,
     /// Pad headset volume, `0..=100`.
     pub pad_volume: u8,
-    /// Whether the connected display can show HDR10 (from the platform, not a
-    /// setting). Sent in the `Hello`: an SDR panel gets an SDR stream.
-    pub display_hdr: bool,
 }
 
 /// Run the client until `stop` is set. `codecs` is the bitmask the device can
@@ -276,7 +273,6 @@ fn run_inner(
             // `max_bitrate_kbps` to its own ceiling.
             prefer_codec: prefs.prefer_codec,
             max_bitrate_kbps: prefs.max_bitrate_kbps,
-            display_hdr: prefs.display_hdr,
         })
         .map_err(|e| e.to_string())?;
 
