@@ -35,7 +35,22 @@ fn hello() -> ClientControl {
         codecs: codecs::HEVC_MAIN10,
         prefer_codec: None,
         max_bitrate_kbps: 0,
+        display_hdr: false,
     })
+}
+
+#[test]
+fn a_hello_without_display_hdr_reads_as_hdr_capable() {
+    // An older client stops after max_bitrate_kbps.
+    let mut bytes = hello().encode().expect("encode");
+    let len = u16::from_le_bytes([bytes[1], bytes[2]]) - 1;
+    bytes[1..3].copy_from_slice(&len.to_le_bytes());
+    bytes.pop();
+    let (decoded, _) = ClientControl::decode(&bytes).expect("decode");
+    let ClientControl::Hello(h) = decoded else {
+        panic!("not a Hello: {decoded:?}");
+    };
+    assert!(h.display_hdr);
 }
 
 fn session_config(hdr: bool) -> SessionConfig {

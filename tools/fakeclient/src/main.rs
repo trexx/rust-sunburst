@@ -343,6 +343,7 @@ fn hello(client_nonce: [u8; NONCE_LEN]) -> Hello {
         codecs: codecs::HEVC_MAIN10 | codecs::AV1_MAIN10,
         prefer_codec: None,
         max_bitrate_kbps: 0,
+        display_hdr: true,
     }
 }
 

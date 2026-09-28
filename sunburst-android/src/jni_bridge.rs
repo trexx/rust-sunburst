@@ -99,6 +99,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart<'local
     jitter_min_ms: jint,
     audio_route: jint,
     pad_volume: jint,
+    display_hdr: jint,
 ) -> jlong {
     init_logging();
 
@@ -157,6 +158,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart<'local
             jitter_min_ms: jitter_min_ms.max(0) as u32,
             audio_route: audio_route.clamp(0, 2) as u8,
             pad_volume: pad_volume.clamp(0, 100) as u8,
+            display_hdr: display_hdr != 0,
         };
         let (input_tx, input_rx) = mpsc::channel();
         let cursor = Arc::new(CursorShared::default());

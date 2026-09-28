@@ -305,6 +305,11 @@ Client → server:
     session bitrate is the minimum of the server/per-app setting, the codec
     ceiling, and this. It can only lower the rate, never raise it past the
     server's own cap.
+  - `display_hdr` — u8, `1` if the client's display can show HDR10 (Android:
+    the display mode's supported HDR types). The server streams HDR — and
+    switches the desktop to HDR — only when this is set; otherwise the stream is
+    BT.709 SDR, tonemapped if the desktop is already HDR. A trailing byte: a
+    `Hello` that ends before it (an older client) reads as `1`.
 - `DecoderQuirks` — the quirks struct (see CLAUDE.md); server adapts encoder config
 - `RequestIdr` — last resort only; prefer NACK + reference invalidation
 - `Resize` — client resolution/refresh change
@@ -460,8 +465,10 @@ Server → client:
   output's own rectangle, wherever it sits on the virtual desktop), `u8
   visible` (false when the cursor is hidden *or* off the captured output). The
   server's observation of the pointer. It is sent when that changes: at once
-  for visibility, at most every 100 ms for motion, and never while the pointer
-  is still, so a stopped pointer's resting place always lands within 100 ms.
+  for visibility, at most every 100 ms for motion while the client predicts
+  (`pointer_gain_milli > 0`) or every 33 ms when it cannot (gain 0: these
+  reports are all it has), and never while the pointer is still, so a stopped
+  pointer's resting place always lands within one interval.
   Then `u32 input_seq`: the newest mouse `InputPacket.input_seq` the server had
   handed to `SendInput` when it sampled the pointer (0 for none). A client that
   moves its overlay from its own input replays its moves after `input_seq` on

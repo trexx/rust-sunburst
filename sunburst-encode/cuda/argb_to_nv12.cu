@@ -12,8 +12,13 @@
 //                           so PQ-decode -> BT.2020 linear -> Rec.709 primaries ->
 //                           ACES tonemap -> Rec.709 OETF -> YCbCr.
 //
-// Compiled to PTX by .github/workflows/cuda-kernel.yml (nvcc -ptx) and embedded;
-// the checked-in .ptx is a no-op placeholder. Like the P010 kernel, the exact
+// And the same two for a 10-bit SDR stream (HEVC/AV1 to a display that cannot
+// show HDR — Hello.display_hdr), written as P010 (10-bit YCbCr 4:2:0, codes
+// left-justified in u16) instead of NV12:
+//   argb10_to_p010_709, argb10_to_p010_709_tonemap.
+//
+// Compiled to PTX by .github/workflows/cuda-kernel.yml (nvcc -ptx) and embedded
+// (sunburst-encode/tests/ptx_vendored.rs checks the entries). Like the P010 kernel, the exact
 // transfer/tonemap is the thing to confirm on the 4070. One thread owns a 2x2
 // block (one chroma sample).
 
@@ -114,6 +119,69 @@ __device__ __forceinline__ void convert(const uint32_t* src, int src_pitch_words
     float inv = 1.0f / (float)n;
     dst_uv[(size_t)by * dst_pitch_elems + bx * 2 + 0] = clamp8(cb_sum * inv);
     dst_uv[(size_t)by * dst_pitch_elems + bx * 2 + 1] = clamp8(cr_sum * inv);
+}
+
+// Rec.709 gamma-encoded R'G'B' in [0,1] -> limited-range 10-bit YCbCr codes.
+__device__ __forceinline__ void ycbcr709_10(float r, float g, float b,
+                                             float& y, float& cb, float& cr) {
+    float yn = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+    y  = 64.0f  + yn * 876.0f;
+    cb = 512.0f + ((b - yn) / 1.8556f) * 896.0f;
+    cr = 512.0f + ((r - yn) / 1.5748f) * 896.0f;
+}
+
+// A 10-bit code, left-justified into 16 bits (P010 = code << 6).
+__device__ __forceinline__ uint16_t pack_p010(float code10) {
+    if (code10 < 0.0f) code10 = 0.0f;
+    if (code10 > 1023.0f) code10 = 1023.0f;
+    return (uint16_t)(((uint32_t)(code10 + 0.5f)) << 6);
+}
+
+// The NV12 convert's 2x2 walk, writing 10-bit Rec.709 P010 instead.
+__device__ __forceinline__ void convert_p010(const uint32_t* src, int src_pitch_words,
+                                              uint16_t* dst, int dst_pitch_elems,
+                                              int width, int height, bool tonemap) {
+    int bx = blockIdx.x * blockDim.x + threadIdx.x; // chroma column
+    int by = blockIdx.y * blockDim.y + threadIdx.y; // chroma row
+    int x = bx * 2, y = by * 2;
+    if (x >= width || y >= height) return;
+
+    uint16_t* dst_y = dst;
+    uint16_t* dst_uv = dst + (size_t)height * dst_pitch_elems;
+
+    float cb_sum = 0.0f, cr_sum = 0.0f;
+    int n = 0;
+    for (int dy = 0; dy < 2; ++dy) {
+        for (int dx = 0; dx < 2; ++dx) {
+            int px = x + dx, py = y + dy;
+            if (px >= width || py >= height) continue;
+            float r10, g10, b10;
+            unpack(src[(size_t)py * src_pitch_words + px], r10, g10, b10);
+            float r, g, b, yv, cb, cr;
+            to_rec709(r10, g10, b10, tonemap, r, g, b);
+            ycbcr709_10(r, g, b, yv, cb, cr);
+            dst_y[(size_t)py * dst_pitch_elems + px] = pack_p010(yv);
+            cb_sum += cb;
+            cr_sum += cr;
+            ++n;
+        }
+    }
+    float inv = 1.0f / (float)n;
+    dst_uv[(size_t)by * dst_pitch_elems + bx * 2 + 0] = pack_p010(cb_sum * inv);
+    dst_uv[(size_t)by * dst_pitch_elems + bx * 2 + 1] = pack_p010(cr_sum * inv);
+}
+
+extern "C" __global__ void argb10_to_p010_709(const uint32_t* src, int src_pitch_words,
+                                              uint16_t* dst, int dst_pitch_elems,
+                                              int width, int height) {
+    convert_p010(src, src_pitch_words, dst, dst_pitch_elems, width, height, false);
+}
+
+extern "C" __global__ void argb10_to_p010_709_tonemap(const uint32_t* src,
+                                                      int src_pitch_words,
+                                                      uint16_t* dst, int dst_pitch_elems,
+                                                      int width, int height) {
+    convert_p010(src, src_pitch_words, dst, dst_pitch_elems, width, height, true);
 }
 
 extern "C" __global__ void argb_to_nv12(const uint32_t* src, int src_pitch_words,
