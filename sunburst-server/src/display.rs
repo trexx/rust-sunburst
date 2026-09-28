@@ -233,8 +233,10 @@ const VDD_HARDWARE_IDS: &[&str] = &["mttvdd", "virtualdisplaydriver", "iddsample
 /// The first string of a `REG_MULTI_SZ`/`REG_SZ` UTF-16 property buffer.
 fn first_utf16_string(bytes: &[u8]) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .take_while(|&u| u != 0)
         .collect();
     String::from_utf16_lossy(&units)

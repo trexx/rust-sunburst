@@ -75,8 +75,10 @@ impl<'a> Nack<'a> {
     /// The missing packet indices, in the order the client listed them.
     pub fn missing(&self) -> impl Iterator<Item = u16> + 'a {
         self.indices
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
     }
 }
 
