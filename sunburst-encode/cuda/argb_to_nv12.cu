@@ -17,8 +17,8 @@
 // left-justified in u16) instead of NV12:
 //   argb10_to_p010_709, argb10_to_p010_709_tonemap.
 //
-// Compiled to PTX by .github/workflows/cuda-kernel.yml (nvcc -ptx) and embedded;
-// the checked-in .ptx is a no-op placeholder. Like the P010 kernel, the exact
+// Compiled to PTX by .github/workflows/cuda-kernel.yml (nvcc -ptx) and embedded
+// (sunburst-encode/tests/ptx_vendored.rs checks the entries). Like the P010 kernel, the exact
 // transfer/tonemap is the thing to confirm on the 4070. One thread owns a 2x2
 // block (one chroma sample).
 
