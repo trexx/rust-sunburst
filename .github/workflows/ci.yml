@@ -22,8 +22,8 @@ jobs:
     name: Linux (tests, clippy, fmt)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       # The zero-allocation and synthetic-pipeline tests live here. They are the
@@ -34,8 +34,8 @@ jobs:
     name: Windows (real MSVC build)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The five Windows-only crates compile to nothing on Linux, so this is the
       # only job that type-checks them for real. `cargo xwin` locally catches the
       # same errors sooner; this is the backstop.
@@ -51,13 +51,13 @@ jobs:
     runs-on: windows-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build the server and fakeclient (release)
         run: cargo build --release -p sunburst-server -p fakeclient
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 24.21.0
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Build the web UI
@@ -74,7 +74,7 @@ jobs:
           cp target/release/sunburst-server.exe dist/
           cp target/release/fakeclient.exe dist/
           cp -r web/dist/* dist/web/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sunburst-windows
           path: dist/
@@ -84,10 +84,10 @@ jobs:
     name: Management UI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
+          node-version: 24.21.0
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
@@ -100,8 +100,8 @@ jobs:
     name: Android (both ABIs + Gradle)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # The runner ships an Android SDK and NDK already. Using them avoids a
       # third-party action and a version string that would have to be guessed
@@ -133,7 +133,7 @@ jobs:
       # a public artifact.
       - name: Cache the dongle firmware
         id: fw-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: android/app/src/main/assets/xone_dongle_fw.bin
           key: xone-dongle-fw-${{ hashFiles('scripts/fetch-firmware.sh') }}
@@ -191,7 +191,7 @@ jobs:
       # twin of the Windows `package` job. Debug-signed: installable via sideload,
       # not Play. Uploaded on PRs too, so a reviewer can grab the build.
       - name: Publish the APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sunburst-android
           path: android/app/build/outputs/apk/debug/app-debug.apk
