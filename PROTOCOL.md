@@ -318,6 +318,11 @@ Client → server:
   only the presence mask for what *this* packet holds.
 - `PadDisconnected` — `pad_index`. Server unplugs it.
 - `Bye`
+- `KeepAlive` — no body; sent once a second while streaming. Its ack is the
+  client's liveness signal: every other client-visible stream (video, audio,
+  cursor) is unreliable or change-driven, so a server that died with no
+  control in flight was otherwise never noticed. Unacknowledged for the reliable
+  channel's retry budget, the client ends the stream.
 
 Server → client:
 - `PairChallenge` — `request_id`, `server_nonce`. Unauthenticated.
@@ -464,7 +469,9 @@ Server → client:
 - `SecureDesktop` — `u8 active`. Capture unavailable (UAC, lock screen, DRM);
   the client shows a placeholder rather than a frozen frame, and `active = 0`
   ends it.
-- `Bye`
+- `Bye` — the server ended the stream: its video pipeline stopped (a fatal
+  capture/encode error) or the session was disconnected from the web UI. The
+  client leaves the stream rather than wait on a black screen.
 
 `clock_offset_ns` is estimated from the handshake round trip, accurate to about
 RTT/2 — sub-millisecond on a wired LAN, which is ample for attributing 5–10ms

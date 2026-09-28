@@ -134,6 +134,12 @@ impl NvFbcCapture {
             return Err(CaptureError::Backend("cuInit failed".into()));
         }
 
+        // A rebuild must start from an empty context stack: NvFBC is left to
+        // make its own context, and one still current here would be a context
+        // some earlier owner forgot to pop.
+        if cuda.ctx_get_current().is_some() {
+            eprintln!("sunburst-capture: a CUDA context is already current before NvFBC_CreateEx");
+        }
         let created = nvfbc::create_interface(NVFBC_SHARED_CUDA);
         if !created.succeeded {
             return Err(CaptureError::Backend(format!(
@@ -196,6 +202,9 @@ impl NvFbcCapture {
                 result_name(status)
             )));
         }
+        // Once per (re)build, never per frame: if a rebuild ever faults again,
+        // the last of these lines names the step.
+        eprintln!("sunburst-capture: NvFBC session created (hdr={hdr})");
         Ok(cap)
     }
 
@@ -330,6 +339,14 @@ impl Drop for NvFbcCapture {
             unsafe { f(self.object) };
             self.object = std::ptr::null_mut();
         }
-        // self.context is deliberately left alone; it is NvFBC's.
+        // Never destroyed — it is NvFBC's — but `new` pushed it onto this
+        // thread's stack, and that push is ours to undo. Left current, the next
+        // session's NvFBC_CreateEx (an AccessLost rebuild) runs on top of a
+        // released context — the leading suspect for the access violation in
+        // nvcuda64.dll seen on the first rebuild that got this far.
+        if !self.cuda.ctx_pop_if_current(self.context) {
+            eprintln!("sunburst-capture: NvFBC context was not current at release");
+        }
+        eprintln!("sunburst-capture: NvFBC session released");
     }
 }

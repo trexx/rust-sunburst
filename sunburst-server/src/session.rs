@@ -520,12 +520,31 @@ impl StreamControl for SessionManager {
     }
 
     fn drain_outbound(&mut self) -> Vec<Outbound> {
-        // A UI-requested disconnect ends the session first.
-        if let Some(id) = self.sessions.take_disconnect()
-            && self.active.as_ref().is_some_and(|a| a.session_id == id)
-        {
+        // A UI-requested disconnect, or a pipeline that stopped on its own (a
+        // fatal capture/encode error, or a panic), ends the session — and says
+        // so. Without the `Bye`, the client sat on a black screen for good: video
+        // is unreliable, so it had nothing to time out on.
+        let disconnect = self
+            .sessions
+            .take_disconnect()
+            .is_some_and(|id| self.active.as_ref().is_some_and(|a| a.session_id == id));
+        let died = self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.pipeline.is_finished());
+        if disconnect || died {
+            if died {
+                eprintln!("sunburst: the video pipeline stopped; ending the session");
+            }
+            let client = self.active.as_ref().map(|a| a.client);
             self.stop_active();
-            return Vec::new();
+            return client
+                .map(|client| Outbound::Control {
+                    client,
+                    message: ServerControl::Bye,
+                })
+                .into_iter()
+                .collect();
         }
 
         let Some(a) = &mut self.active else {

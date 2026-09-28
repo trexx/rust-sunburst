@@ -27,6 +27,8 @@ const KERNEL_PTX_NV12: &[u8] = include_bytes!("../cuda/argb_to_nv12.ptx");
 /// shared CUDA context.
 pub struct CudaConverter {
     cuda: Cuda,
+    /// NvFBC's context, pushed by `new` and popped again on drop.
+    context: CuContext,
     kernel: CuFunction,
     /// The output buffer (P010 or NV12), reused each frame.
     out_buf: CuDevicePtr,
@@ -89,24 +91,31 @@ impl CudaConverter {
             ConvertOutput::Nv12 => pitch_bytes as i32,
         };
 
+        // A failure from here on must undo the push above, as `Drop` would.
+        let unpush = |e: String| {
+            cuda.ctx_pop_if_current(context);
+            e
+        };
         // cuModuleLoadData wants NUL-terminated PTX text.
         let mut ptx = ptx_src.to_vec();
         ptx.push(0);
         let module = cuda
             .module_load_data(&ptx)
-            .map_err(|s| format!("cuModuleLoadData: {s}"))?;
+            .map_err(|s| unpush(format!("cuModuleLoadData: {s}")))?;
         // The module stays loaded in the context for the process's life; the
         // kernel handle keeps working without holding the module handle.
         let kernel = cuda
             .module_get_function(module, kernel_name)
-            .map_err(|s| format!("cuModuleGetFunction: {s}"))?;
+            .map_err(|s| unpush(format!("cuModuleGetFunction: {s}")))?;
 
         let out_buf = cuda
             .mem_alloc(bytes)
-            .map_err(|s| format!("cuMemAlloc({bytes}): {s}"))?;
+            .map_err(|s| unpush(format!("cuMemAlloc({bytes}): {s}")))?;
 
+        eprintln!("sunburst-encode: CUDA convert built ({kernel_name}, {width}x{height})");
         Ok(CudaConverter {
             cuda,
+            context,
             kernel,
             out_buf,
             pitch_bytes,
@@ -170,5 +179,10 @@ impl Drop for CudaConverter {
             self.out_buf = 0;
         }
         // The module is left loaded (process-lifetime); no cuModuleUnload wired.
+        // Undo `new`'s push, so the capture's own push is what is left current
+        // and its drop can pop it in turn (the spine always drops first).
+        if !self.cuda.ctx_pop_if_current(self.context) {
+            eprintln!("sunburst-encode: CUDA convert context was not current at drop");
+        }
     }
 }

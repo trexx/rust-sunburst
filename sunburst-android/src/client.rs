@@ -79,6 +79,9 @@ fn mono_ms() -> u64 {
 /// Upcalls into the Kotlin activity from the client thread (attached to the JVM
 /// for the thread's life). The activity draws the cursor
 /// overlay, so the pointer never rides the video.
+/// How often the stream loop proves the server is still there.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct Callbacks {
     pub vm: JavaVM,
     pub activity: Global<JObject<'static>>,
@@ -101,6 +104,24 @@ impl Callbacks {
                         JValue::Int(hx),
                         JValue::Int(hy),
                     ],
+                )?;
+                Ok(())
+            });
+    }
+
+    /// The stream ended without the user stopping it (the server said `Bye`,
+    /// stopped answering, or negotiation failed): the activity leaves the black
+    /// screen and says why.
+    fn stream_ended(&self, reason: &str) {
+        let _ = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<()> {
+                let reason = env.new_string(reason)?;
+                env.call_method(
+                    &self.activity,
+                    jni_str!("onStreamEnded"),
+                    jni_sig!("(Ljava/lang/String;)V"),
+                    &[JValue::Object(&reason)],
                 )?;
                 Ok(())
             });
@@ -214,6 +235,9 @@ pub fn run(
         server, secret, codecs, prefs, &window, &stop, &input_rx, &cursor, &callbacks,
     ) {
         log::error!("client stopped: {e}");
+        if !stop.load(Ordering::Relaxed) {
+            callbacks.stream_ended(&e);
+        }
     }
 }
 
@@ -348,6 +372,7 @@ fn run_inner(
     let mut received = 0u32;
     let mut dropped = 0u32;
     let mut last_feedback = Instant::now();
+    let mut last_keepalive = Instant::now();
     let mut input_acc = InputAccumulator::new();
     let mut cursor_shape = CursorReassembler::default();
     // Server→client rumble/pad-output, deduplicated and timed out before it
@@ -402,6 +427,9 @@ fn run_inner(
                     cursor.set_space(cp.width, cp.height);
                 }
                 current = cp;
+            }
+            Some(Inbound::Control(ServerControl::Bye)) => {
+                return Err("the server ended the stream".into());
             }
             Some(Inbound::Control(ServerControl::CursorShape(c))) => {
                 if let Some((bgra, w, h, hx, hy)) = cursor_shape.push(&c) {
@@ -554,6 +582,14 @@ fn run_inner(
         headsets.capture(|pad, seq, opus| {
             let _ = client.send_audio_in(pad, seq, mono_ns() as u32, opus);
         });
+
+        // Liveness: a reliable no-op a second. A server that stops acking it
+        // surfaces as PeerGone from `client.tick()` below within ~2.6 s; nothing
+        // else the client receives would ever say the server is gone.
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            last_keepalive = Instant::now();
+            let _ = client.send_control(&ClientControl::KeepAlive);
+        }
 
         // Stop any motor that has gone unheard past the timeout (a lost final
         // zero-level packet), on the same 100 ms cadence as feedback.

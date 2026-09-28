@@ -24,6 +24,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.widget.FrameLayout
+import android.widget.Toast
 import android.view.WindowManager
 
 /**
@@ -332,6 +333,18 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
     // --- Cursor (called from the client thread; marshalled to the UI thread) ---
 
     /** A new cursor shape as BGRA bytes with its hotspot; `width == 0` hides it. */
+    /** Called from the Rust client thread when the stream ended without the user
+     *  stopping it — the server said Bye (its pipeline stopped, or it was
+     *  disconnected from the web UI), stopped answering, or never negotiated.
+     *  Say why and go back to the app grid rather than hold a black screen. */
+    fun onStreamEnded(reason: String) {
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            Toast.makeText(this, "Stream ended: $reason", Toast.LENGTH_LONG).show()
+            finish()
+        }
+    }
+
     fun onCursorShape(bgra: ByteArray, width: Int, height: Int, hotspotX: Int, hotspotY: Int) {
         val bitmap = if (width == 0 || height == 0) {
             null

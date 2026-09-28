@@ -247,6 +247,13 @@ impl Pipeline {
         self.shutdown();
     }
 
+    /// The GPU thread has exited on its own — a fatal capture/encode error, or a
+    /// panic — so nothing more will ever be encoded. The session must end rather
+    /// than leave the client on a black screen.
+    pub fn is_finished(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.is_finished())
+    }
+
     /// Wake the send thread now. The control thread calls this after queueing a
     /// retransmit: the client is waiting on that packet, and without a wake it
     /// sits in the ring until the send thread's idle park times out.

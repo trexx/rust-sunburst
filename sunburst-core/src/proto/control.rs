@@ -87,6 +87,7 @@ pub enum ClientMessage {
     ListApps = 9,
     LaunchApp = 10,
     ArtRequest = 11,
+    KeepAlive = 12,
 }
 
 /// Server → client discriminants. Complete, including kinds not yet decoded.
@@ -121,6 +122,7 @@ impl ClientMessage {
             9 => ClientMessage::ListApps,
             10 => ClientMessage::LaunchApp,
             11 => ClientMessage::ArtRequest,
+            12 => ClientMessage::KeepAlive,
             _ => return None,
         })
     }
@@ -485,6 +487,10 @@ pub enum ClientControl {
         pad_index: u8,
     },
     Bye,
+    /// Nothing, reliably: its ack is the proof the server is alive. Video,
+    /// input and feedback are all unreliable, so without it a client whose
+    /// server died with no control in flight had nothing to time out on.
+    KeepAlive,
     /// A kind this build does not decode. Skipped, never fatal.
     Unhandled(u8),
 }
@@ -598,6 +604,7 @@ impl ClientControl {
             ClientControl::ListApps => ClientMessage::ListApps,
             ClientControl::LaunchApp { .. } => ClientMessage::LaunchApp,
             ClientControl::ArtRequest { .. } => ClientMessage::ArtRequest,
+            ClientControl::KeepAlive => ClientMessage::KeepAlive,
             ClientControl::Unhandled(_) => return None,
         })
     }
@@ -666,6 +673,7 @@ impl ClientControl {
             ClientControl::ListApps
             | ClientControl::RequestIdr
             | ClientControl::Bye
+            | ClientControl::KeepAlive
             | ClientControl::Unhandled(_) => {}
         });
 
@@ -731,6 +739,7 @@ impl ClientControl {
             ClientMessage::ListApps => ClientControl::ListApps,
             ClientMessage::RequestIdr => ClientControl::RequestIdr,
             ClientMessage::Bye => ClientControl::Bye,
+            ClientMessage::KeepAlive => ClientControl::KeepAlive,
         };
         Ok((message, consumed))
     }

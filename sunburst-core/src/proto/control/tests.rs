@@ -147,6 +147,7 @@ fn every_implemented_client_message_round_trips() {
         digest: [0xC3; 16],
     });
     round_trip_client(ClientControl::RequestIdr);
+    round_trip_client(ClientControl::KeepAlive);
     round_trip_client(ClientControl::Resize {
         width: 1920,
         height: 1080,
@@ -483,6 +484,7 @@ fn only_the_pairing_exchange_may_arrive_unauthenticated() {
         ClientMessage::Resize,
         ClientMessage::DecoderQuirks,
         ClientMessage::PadDisconnected,
+        ClientMessage::KeepAlive,
     ] {
         assert!(!kind.is_pre_pairing(), "{kind:?} must require a MAC");
     }

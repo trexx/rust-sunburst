@@ -49,6 +49,7 @@ pub const CUDA_SUCCESS: i32 = 0;
 type PfnInit = unsafe extern "system" fn(u32) -> i32;
 type PfnCtxPopCurrent = unsafe extern "system" fn(*mut CuContext) -> i32;
 type PfnCtxPushCurrent = unsafe extern "system" fn(CuContext) -> i32;
+type PfnCtxGetCurrent = unsafe extern "system" fn(*mut CuContext) -> i32;
 type PfnMemAlloc = unsafe extern "system" fn(*mut CuDevicePtr, usize) -> i32;
 type PfnMemFree = unsafe extern "system" fn(CuDevicePtr) -> i32;
 type PfnModuleLoadData = unsafe extern "system" fn(*mut CuModule, *const c_void) -> i32;
@@ -73,6 +74,7 @@ pub struct Cuda {
     init: PfnInit,
     ctx_pop: PfnCtxPopCurrent,
     ctx_push: PfnCtxPushCurrent,
+    ctx_get_current: PfnCtxGetCurrent,
     mem_alloc: PfnMemAlloc,
     mem_free: PfnMemFree,
     module_load_data: PfnModuleLoadData,
@@ -120,6 +122,7 @@ impl Cuda {
         let init = need("cuInit");
         let ctx_pop = need("cuCtxPopCurrent");
         let ctx_push = need("cuCtxPushCurrent");
+        let ctx_get_current = need("cuCtxGetCurrent");
         let mem_alloc = need("cuMemAlloc");
         let mem_free = need("cuMemFree");
         let module_load_data = need("cuModuleLoadData");
@@ -143,6 +146,7 @@ impl Cuda {
                 init: crate::nvfbc::cast_fn(init.unwrap()),
                 ctx_pop: crate::nvfbc::cast_fn(ctx_pop.unwrap()),
                 ctx_push: crate::nvfbc::cast_fn(ctx_push.unwrap()),
+                ctx_get_current: crate::nvfbc::cast_fn(ctx_get_current.unwrap()),
                 mem_alloc: crate::nvfbc::cast_fn(mem_alloc.unwrap()),
                 mem_free: crate::nvfbc::cast_fn(mem_free.unwrap()),
                 module_load_data: crate::nvfbc::cast_fn(module_load_data.unwrap()),
@@ -174,6 +178,29 @@ impl Cuda {
     pub fn ctx_push(&self, ctx: CuContext) -> i32 {
         // SAFETY: `ctx` came from `ctx_pop` and is still live.
         unsafe { (self.ctx_push)(ctx) }
+    }
+
+    /// The calling thread's current context (null when there is none).
+    pub fn ctx_get_current(&self) -> Option<CuContext> {
+        let mut ctx: CuContext = std::ptr::null_mut();
+        // SAFETY: `ctx` is a valid out pointer.
+        let status = unsafe { (self.ctx_get_current)(&mut ctx) };
+        (status == CUDA_SUCCESS && !ctx.is_null()).then_some(ctx)
+    }
+
+    /// Undo one [`ctx_push`](Self::ctx_push) of `ctx`: pop it if, and only if,
+    /// it is the current context, so a caller never pops someone else's.
+    ///
+    /// The context stack is per thread and outlives every object on it. Each
+    /// push must be matched when its owner goes away, or a released context is
+    /// left current for the next `NvFBC_CreateEx` on that thread (an
+    /// `AccessLost` rebuild) — the leading suspect for a fault inside nvcuda.
+    pub fn ctx_pop_if_current(&self, ctx: CuContext) -> bool {
+        if self.ctx_get_current() == Some(ctx) {
+            self.ctx_pop().is_ok()
+        } else {
+            false
+        }
     }
 
     pub fn mem_alloc(&self, bytes: usize) -> Result<CuDevicePtr, i32> {
