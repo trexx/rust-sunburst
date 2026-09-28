@@ -14,7 +14,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use jni::JNIEnv;
+use jni::EnvUnowned;
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint};
 
@@ -42,20 +43,19 @@ fn is_adapter(pid: i32) -> bool {
 }
 
 /// Open the driver on a claimed device fd. `pid` selects adapter vs wired;
-/// `firmware_path` is only used for the adapter. Returns 1 on success.
+/// `firmware_path` is only used for the adapter. Returns true on success.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeUsbAttach(
-    mut env: JNIEnv,
-    _obj: JObject,
+pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeUsbAttach<'local>(
+    mut env: EnvUnowned<'local>,
+    _obj: JObject<'local>,
     fd: jint,
     _vid: jint,
     pid: jint,
-    firmware_path: JString,
+    firmware_path: JString<'local>,
 ) -> jboolean {
     let firmware: String = env
-        .get_string(&firmware_path)
-        .map(|s| s.into())
-        .unwrap_or_default();
+        .with_env(|env| firmware_path.try_to_string(env))
+        .resolve::<LogErrorAndDefault>();
 
     let adapter = is_adapter(pid);
     let opened = if adapter {
@@ -72,11 +72,11 @@ pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeUsbAttach(
                 if adapter { "adapter" } else { "wired pad" },
                 pid as u16
             );
-            1
+            true
         }
         Err(e) => {
             log::error!("gip: open failed: {e}");
-            0
+            false
         }
     }
 }
@@ -84,7 +84,7 @@ pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeUsbAttach(
 /// Drop the current bridge, closing the device.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeUsbDetach(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _obj: JObject,
 ) {
     *slot().lock().expect("not poisoned") = None;
@@ -94,12 +94,12 @@ pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeUsbDetach(
 /// Put the adapter in (or out of) pairing mode. No-op without an adapter.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_UsbBridge_nativeSetPairing(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _obj: JObject,
     on: jboolean,
 ) -> jboolean {
     match current_bridge() {
-        Some(bridge) => bridge.set_pairing(on != 0) as jboolean,
-        None => 0,
+        Some(bridge) => bridge.set_pairing(on),
+        None => false,
     }
 }

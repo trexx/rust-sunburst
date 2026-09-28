@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::client::{Callbacks, StreamPrefs};
-use jni::JNIEnv;
+use jni::EnvUnowned;
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
 use ndk::native_window::NativeWindow;
@@ -85,13 +86,13 @@ fn parse_secret(hex: &str) -> Option<[u8; 32]> {
 /// the TV settings screen.
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
-    mut env: JNIEnv,
-    activity: JObject,
-    surface: JObject,
-    host: JString,
+pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart<'local>(
+    mut env: EnvUnowned<'local>,
+    activity: JObject<'local>,
+    surface: JObject<'local>,
+    host: JString<'local>,
     port: jint,
-    secret_hex: JString,
+    secret_hex: JString<'local>,
     codecs: jint,
     prefer_codec: jint,
     max_bitrate_kbps: jint,
@@ -101,102 +102,103 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStart(
 ) -> jlong {
     init_logging();
 
-    let host: String = match env.get_string(&host) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
-    };
-    let secret_hex: String = match env.get_string(&secret_hex) {
-        Ok(s) => s.into(),
-        Err(_) => return 0,
-    };
-    let Some(secret) = parse_secret(&secret_hex) else {
-        log::error!("no valid pairing secret; pair the device first");
-        return 0;
-    };
-    let server: SocketAddr = match format!("{host}:{port}").parse() {
-        Ok(a) => a,
-        Err(e) => {
-            log::error!("bad server address {host}:{port}: {e}");
-            return 0;
-        }
-    };
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        let Ok(host) = host.try_to_string(env) else {
+            return Ok(0);
+        };
+        let Ok(secret_hex) = secret_hex.try_to_string(env) else {
+            return Ok(0);
+        };
+        let Some(secret) = parse_secret(&secret_hex) else {
+            log::error!("no valid pairing secret; pair the device first");
+            return Ok(0);
+        };
+        let server: SocketAddr = match format!("{host}:{port}").parse() {
+            Ok(a) => a,
+            Err(e) => {
+                log::error!("bad server address {host}:{port}: {e}");
+                return Ok(0);
+            }
+        };
 
-    // Acquire the native window from the Java Surface. The `jni` crate and `ndk`
-    // pull different `jni-sys` versions whose types are the stable JNI ABI, so
-    // the raw pointers are reinterpreted with `cast`.
-    // SAFETY: `env` and `surface` are the live JVM env and Surface for this call.
-    let window =
-        unsafe { NativeWindow::from_surface(env.get_raw().cast(), surface.as_raw().cast()) };
-    let Some(window) = window else {
-        log::error!("ANativeWindow_fromSurface returned null");
-        return 0;
-    };
+        // Acquire the native window from the Java Surface. The `jni` crate and `ndk`
+        // pull different `jni-sys` versions whose types are the stable JNI ABI, so
+        // the raw pointers are reinterpreted with `cast`.
+        // SAFETY: `env` and `surface` are the live JVM env and Surface for this call.
+        let window =
+            unsafe { NativeWindow::from_surface(env.get_raw().cast(), surface.as_raw().cast()) };
+        let Some(window) = window else {
+            log::error!("ANativeWindow_fromSurface returned null");
+            return Ok(0);
+        };
 
-    // Capture the JVM and a global ref to the activity for cursor upcalls.
-    let Ok(vm) = env.get_java_vm() else {
-        log::error!("no JavaVM");
-        return 0;
-    };
-    let Ok(activity_ref) = env.new_global_ref(&activity) else {
-        log::error!("global ref failed");
-        return 0;
-    };
-    let callbacks = Callbacks {
-        vm,
-        activity: activity_ref,
-    };
+        // Capture the JVM and a global ref to the activity for cursor upcalls.
+        let Ok(vm) = env.get_java_vm() else {
+            log::error!("no JavaVM");
+            return Ok(0);
+        };
+        let Ok(activity_ref) = env.new_global_ref(&activity) else {
+            log::error!("global ref failed");
+            return Ok(0);
+        };
+        let callbacks = Callbacks {
+            vm,
+            activity: activity_ref,
+        };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
-    let codecs = codecs as u8;
-    let prefs = StreamPrefs {
-        prefer_codec: u8::try_from(prefer_codec)
-            .ok()
-            .and_then(StreamCodec::from_u8),
-        max_bitrate_kbps: max_bitrate_kbps.max(0) as u32,
-        jitter_min_ms: jitter_min_ms.max(0) as u32,
-        audio_route: audio_route.clamp(0, 2) as u8,
-        pad_volume: pad_volume.clamp(0, 100) as u8,
-    };
-    let (input_tx, input_rx) = mpsc::channel();
-    let cursor = Arc::new(CursorShared::default());
-    let thread_cursor = Arc::clone(&cursor);
-    let client_tid = Arc::new(AtomicI32::new(0));
-    let thread_tid = Arc::clone(&client_tid);
-    let thread = std::thread::Builder::new()
-        .name("sunburst-client".into())
-        .spawn(move || {
-            client::run(
-                server,
-                secret,
-                codecs,
-                prefs,
-                window,
-                thread_stop,
-                input_rx,
-                thread_tid,
-                thread_cursor,
-                callbacks,
-            )
-        })
-        .ok();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let codecs = codecs as u8;
+        let prefs = StreamPrefs {
+            prefer_codec: u8::try_from(prefer_codec)
+                .ok()
+                .and_then(StreamCodec::from_u8),
+            max_bitrate_kbps: max_bitrate_kbps.max(0) as u32,
+            jitter_min_ms: jitter_min_ms.max(0) as u32,
+            audio_route: audio_route.clamp(0, 2) as u8,
+            pad_volume: pad_volume.clamp(0, 100) as u8,
+        };
+        let (input_tx, input_rx) = mpsc::channel();
+        let cursor = Arc::new(CursorShared::default());
+        let thread_cursor = Arc::clone(&cursor);
+        let client_tid = Arc::new(AtomicI32::new(0));
+        let thread_tid = Arc::clone(&client_tid);
+        let thread = std::thread::Builder::new()
+            .name("sunburst-client".into())
+            .spawn(move || {
+                client::run(
+                    server,
+                    secret,
+                    codecs,
+                    prefs,
+                    window,
+                    thread_stop,
+                    input_rx,
+                    thread_tid,
+                    thread_cursor,
+                    callbacks,
+                )
+            })
+            .ok();
 
-    log::info!("client started for {server}");
-    Box::into_raw(Box::new(Client {
-        stop,
-        thread,
-        input_tx,
-        client_tid,
-        cursor,
-        ui_cursor: Mutex::new((SubPixel::default(), CursorPredictor::new())),
-    })) as jlong
+        log::info!("client started for {server}");
+        Ok(Box::into_raw(Box::new(Client {
+            stop,
+            thread,
+            input_tx,
+            client_tid,
+            cursor,
+            ui_cursor: Mutex::new((SubPixel::default(), CursorPredictor::new())),
+        })) as jlong)
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// The client thread's OS tid, for the Java PerformanceHintManager to target.
 /// 0 until the thread has started.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeClientTid(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) -> jint {
@@ -211,7 +213,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeClientTid(
 /// Stop and free a client started by `nativeStart`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStop(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) {
@@ -232,7 +234,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeStop(
 /// destroy/create around a real surface change, so this only logs.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeSurfaceChanged(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     _handle: jlong,
     _surface: JObject,

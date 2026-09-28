@@ -7,7 +7,7 @@
 //! packets. Keeping the send on the client thread means the socket is touched
 //! from one place.
 
-use jni::JNIEnv;
+use jni::EnvUnowned;
 use jni::objects::JClass;
 use jni::sys::{jboolean, jfloat, jint, jlong};
 
@@ -30,21 +30,14 @@ fn enqueue(handle: jlong, input: ClientInput) {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeKey(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     code: jint,
     down: jboolean,
     meta: jint,
 ) {
-    enqueue(
-        handle,
-        ClientInput::Key {
-            code,
-            down: down != 0,
-            meta,
-        },
-    );
+    enqueue(handle, ClientInput::Key { code, down, meta });
 }
 
 /// CLOCK_MONOTONIC milliseconds, for the prediction's "still moving" window.
@@ -69,7 +62,7 @@ fn now_ms() -> u64 {
 /// server's reports as before.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeMouseMove(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     dx: jfloat,
@@ -104,7 +97,7 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeMouseMove(
 /// or -1 while not predicting.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeCursorSync(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
 ) -> jlong {
@@ -123,59 +116,41 @@ pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeCursorSync(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeMouseButton(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     code: jint,
     down: jboolean,
 ) {
-    enqueue(
-        handle,
-        ClientInput::MouseButton {
-            code,
-            down: down != 0,
-        },
-    );
+    enqueue(handle, ClientInput::MouseButton { code, down });
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativeWheel(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     delta: jfloat,
     horizontal: jboolean,
 ) {
-    enqueue(
-        handle,
-        ClientInput::Wheel {
-            delta,
-            horizontal: horizontal != 0,
-        },
-    );
+    enqueue(handle, ClientInput::Wheel { delta, horizontal });
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativePadButton(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     code: jint,
     down: jboolean,
 ) {
-    enqueue(
-        handle,
-        ClientInput::PadButton {
-            code,
-            down: down != 0,
-        },
-    );
+    enqueue(handle, ClientInput::PadButton { code, down });
 }
 
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_com_trexx_sunburst_StreamActivity_nativePadAxis(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
     handle: jlong,
     lx: jfloat,
