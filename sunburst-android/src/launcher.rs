@@ -13,9 +13,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JString};
-use jni::sys::{jint, jobjectArray, jstring};
+use jni::errors::LogErrorAndDefault;
+use jni::objects::{JClass, JObjectArray, JString};
+use jni::sys::jint;
+use jni::{Env, EnvUnowned};
 use sunburst_core::proto::{AppListing, ClientControl, ServerControl, SessionKey};
 use sunburst_net::ClientEndpoint;
 
@@ -171,83 +172,79 @@ fn launch(host: &str, port: u16, secret_hex: &str, app_id: u32) -> Result<(), St
     result
 }
 
-fn get_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
-    env.get_string(s).ok().map(Into::into)
+fn get_string(env: &Env, s: &JString) -> Option<String> {
+    s.try_to_string(env).ok()
 }
 
 /// The catalogue as a flat `String[]`: `id, name, artPath` per app (an empty
 /// path for none). `null` on failure, logged.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_trexx_sunburst_LauncherActivity_nativeCatalogue(
-    mut env: JNIEnv,
-    _class: JClass,
-    host: JString,
+pub extern "system" fn Java_com_trexx_sunburst_LauncherActivity_nativeCatalogue<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    host: JString<'local>,
     port: jint,
-    secret_hex: JString,
-    cache_dir: JString,
-) -> jobjectArray {
-    let (Some(host), Some(secret), Some(cache)) = (
-        get_string(&mut env, &host),
-        get_string(&mut env, &secret_hex),
-        get_string(&mut env, &cache_dir),
-    ) else {
-        return std::ptr::null_mut();
-    };
-    let apps = match catalogue(&host, port as u16, &secret, Path::new(&cache)) {
-        Ok(apps) => apps,
-        Err(e) => {
-            log::error!("catalogue: {e}");
-            return std::ptr::null_mut();
-        }
-    };
-    let flat: Vec<String> = apps
-        .iter()
-        .flat_map(|(a, path)| {
-            [
-                a.id.to_string(),
-                a.name.clone(),
-                path.as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            ]
-        })
-        .collect();
-    let Ok(array) = env.new_object_array(flat.len() as i32, "java/lang/String", JObject::null())
-    else {
-        return std::ptr::null_mut();
-    };
-    for (i, s) in flat.iter().enumerate() {
-        let Ok(js) = env.new_string(s) else {
-            return std::ptr::null_mut();
+    secret_hex: JString<'local>,
+    cache_dir: JString<'local>,
+) -> JObjectArray<'local, JString<'local>> {
+    env.with_env(|env| -> jni::errors::Result<_> {
+        let (Some(host), Some(secret), Some(cache)) = (
+            get_string(env, &host),
+            get_string(env, &secret_hex),
+            get_string(env, &cache_dir),
+        ) else {
+            return Ok(JObjectArray::default());
         };
-        if env.set_object_array_element(&array, i as i32, js).is_err() {
-            return std::ptr::null_mut();
+        let apps = match catalogue(&host, port as u16, &secret, Path::new(&cache)) {
+            Ok(apps) => apps,
+            Err(e) => {
+                log::error!("catalogue: {e}");
+                return Ok(JObjectArray::default());
+            }
+        };
+        let flat: Vec<String> = apps
+            .iter()
+            .flat_map(|(a, path)| {
+                [
+                    a.id.to_string(),
+                    a.name.clone(),
+                    path.as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                ]
+            })
+            .collect();
+        let array = JObjectArray::<JString>::new(env, flat.len(), JString::default())?;
+        for (i, s) in flat.iter().enumerate() {
+            let js = env.new_string(s)?;
+            array.set_element(env, i, &js)?;
         }
-    }
-    array.into_raw()
+        Ok(array)
+    })
+    .resolve::<LogErrorAndDefault>()
 }
 
 /// Launch an app. Returns "" on success, or why not.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_trexx_sunburst_LauncherActivity_nativeLaunch(
-    mut env: JNIEnv,
-    _class: JClass,
-    host: JString,
+pub extern "system" fn Java_com_trexx_sunburst_LauncherActivity_nativeLaunch<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    host: JString<'local>,
     port: jint,
-    secret_hex: JString,
+    secret_hex: JString<'local>,
     app_id: jint,
-) -> jstring {
-    let message = match (
-        get_string(&mut env, &host),
-        get_string(&mut env, &secret_hex),
-    ) {
-        (Some(host), Some(secret)) => match launch(&host, port as u16, &secret, app_id as u32) {
-            Ok(()) => String::new(),
-            Err(e) => e,
-        },
-        _ => "bad arguments".into(),
-    };
-    env.new_string(message)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+) -> JString<'local> {
+    env.with_env(|env| {
+        let message = match (get_string(env, &host), get_string(env, &secret_hex)) {
+            (Some(host), Some(secret)) => {
+                match launch(&host, port as u16, &secret, app_id as u32) {
+                    Ok(()) => String::new(),
+                    Err(e) => e,
+                }
+            }
+            _ => "bad arguments".into(),
+        };
+        env.new_string(message)
+    })
+    .resolve::<LogErrorAndDefault>()
 }

@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use jni::JavaVM;
-use jni::objects::{GlobalRef, JValue};
+use jni::objects::{JObject, JValue};
+use jni::refs::Global;
+use jni::{JavaVM, jni_sig, jni_str};
 use ndk::native_window::NativeWindow;
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{
@@ -80,38 +81,43 @@ fn mono_ms() -> u64 {
 /// overlay, so the pointer never rides the video.
 pub struct Callbacks {
     pub vm: JavaVM,
-    pub activity: GlobalRef,
+    pub activity: Global<JObject<'static>>,
 }
 
 impl Callbacks {
     fn cursor_shape(&self, bgra: &[u8], w: i32, h: i32, hx: i32, hy: i32) {
-        if let Ok(mut env) = self.vm.attach_current_thread()
-            && let Ok(arr) = env.byte_array_from_slice(bgra)
-        {
-            let _ = env.call_method(
-                &self.activity,
-                "onCursorShape",
-                "([BIIII)V",
-                &[
-                    JValue::Object(&arr),
-                    JValue::Int(w),
-                    JValue::Int(h),
-                    JValue::Int(hx),
-                    JValue::Int(hy),
-                ],
-            );
-        }
+        let _ = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<()> {
+                let arr = env.byte_array_from_slice(bgra)?;
+                env.call_method(
+                    &self.activity,
+                    jni_str!("onCursorShape"),
+                    jni_sig!("([BIIII)V"),
+                    &[
+                        JValue::Object(&arr),
+                        JValue::Int(w),
+                        JValue::Int(h),
+                        JValue::Int(hx),
+                        JValue::Int(hy),
+                    ],
+                )?;
+                Ok(())
+            });
     }
 
     fn cursor_position(&self, x: i32, y: i32, visible: bool) {
-        if let Ok(mut env) = self.vm.attach_current_thread() {
-            let _ = env.call_method(
-                &self.activity,
-                "onCursorPosition",
-                "(IIZ)V",
-                &[JValue::Int(x), JValue::Int(y), JValue::Bool(visible as u8)],
-            );
-        }
+        let _ = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<()> {
+                env.call_method(
+                    &self.activity,
+                    jni_str!("onCursorPosition"),
+                    jni_sig!("(IIZ)V"),
+                    &[JValue::Int(x), JValue::Int(y), JValue::Bool(visible)],
+                )?;
+                Ok(())
+            });
     }
 }
 
@@ -198,8 +204,12 @@ pub fn run(
     let tid = unsafe { libc::gettid() };
     client_tid.store(tid, Ordering::Relaxed);
     // Stay attached for the thread's life: cursor reports now upcall on every
-    // change, and attaching per call would pay for it each time.
-    let _ = callbacks.vm.attach_current_thread_permanently();
+    // change, and attaching per call would pay for it each time. jni's
+    // `attach_current_thread` attaches permanently; each upcall then only
+    // pushes (and pops) a local frame.
+    let _ = callbacks
+        .vm
+        .attach_current_thread(|_| Ok::<_, jni::errors::Error>(()));
     if let Err(e) = run_inner(
         server, secret, codecs, prefs, &window, &stop, &input_rx, &cursor, &callbacks,
     ) {

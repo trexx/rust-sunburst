@@ -17,9 +17,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use jni::JNIEnv;
+use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JObject, JString, JValue};
-use jni::sys::{jint, jstring};
+use jni::sys::jint;
+use jni::{Env, EnvUnowned, jni_sig, jni_str};
 use sunburst_core::proto::pairing::{
     NONCE_LEN, PAIRING_WINDOW_SECS, accepted_tag, confirm_tag, derive_secret, tags_match,
 };
@@ -38,12 +39,13 @@ const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Generate a PIN to display. The client shows it; the user types it into the
 /// web UI. Returns an empty string only if the OS RNG fails.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_trexx_sunburst_PairActivity_nativeGenPin(
-    env: JNIEnv,
-    _class: JClass,
-) -> jstring {
+pub extern "system" fn Java_com_trexx_sunburst_PairActivity_nativeGenPin<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JString<'local> {
     let pin = generate_pin().unwrap_or_default();
-    to_jstring(env, &pin)
+    env.with_env(|env| env.new_string(pin))
+        .resolve::<LogErrorAndDefault>()
 }
 
 /// Run the pairing handshake against `host:port` with the shown `pin`, and wait
@@ -52,59 +54,61 @@ pub extern "system" fn Java_com_trexx_sunburst_PairActivity_nativeGenPin(
 /// by shape. Each wrong PIN typed in the web UI calls `onWrongPin(remaining)`
 /// on the activity, from this (the calling) thread.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_trexx_sunburst_PairActivity_nativePair(
-    mut env: JNIEnv,
-    activity: JObject,
-    host: JString,
+pub extern "system" fn Java_com_trexx_sunburst_PairActivity_nativePair<'local>(
+    mut env: EnvUnowned<'local>,
+    activity: JObject<'local>,
+    host: JString<'local>,
     port: jint,
-    pin: JString,
-) -> jstring {
-    let host: String = match env.get_string(&host) {
-        Ok(s) => s.into(),
-        Err(_) => return to_jstring(env, "could not read the host"),
-    };
-    let pin: String = match env.get_string(&pin) {
-        Ok(s) => s.into(),
-        Err(_) => return to_jstring(env, "could not read the PIN"),
-    };
-    CANCEL.store(false, Ordering::Relaxed);
-    let result = pair(&host, port as u16, &pin, |remaining| {
-        let _ = env.call_method(
-            &activity,
-            "onWrongPin",
-            "(I)V",
-            &[JValue::Int(remaining.into())],
-        );
-        // A throwing callback must not poison the JNI calls that follow.
-        if env.exception_check().unwrap_or(false) {
-            let _ = env.exception_clear();
+    pin: JString<'local>,
+) -> JString<'local> {
+    env.with_env(|env| {
+        let host = match host.try_to_string(env) {
+            Ok(s) => s,
+            Err(_) => return env.new_string("could not read the host"),
+        };
+        let pin = match pin.try_to_string(env) {
+            Ok(s) => s,
+            Err(_) => return env.new_string("could not read the PIN"),
+        };
+        CANCEL.store(false, Ordering::Relaxed);
+        let result = pair(&host, port as u16, &pin, |remaining| {
+            on_wrong_pin(env, &activity, remaining)
+        });
+        match result {
+            Ok(secret) => {
+                let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+                env.new_string(hex)
+            }
+            Err(e) => {
+                log::error!("pairing failed: {e}");
+                env.new_string(e)
+            }
         }
-    });
-    match result {
-        Ok(secret) => {
-            let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
-            to_jstring(env, &hex)
-        }
-        Err(e) => {
-            log::error!("pairing failed: {e}");
-            to_jstring(env, &e)
-        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// Tell the activity a wrong PIN was typed, with the tries left.
+fn on_wrong_pin(env: &mut Env, activity: &JObject, remaining: u8) {
+    let _ = env.call_method(
+        activity,
+        jni_str!("onWrongPin"),
+        jni_sig!("(I)V"),
+        &[JValue::Int(remaining.into())],
+    );
+    // A throwing callback must not poison the JNI calls that follow.
+    if env.exception_check() {
+        env.exception_clear();
     }
 }
 
 /// End a `nativePair` wait early. Called from the UI thread.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_trexx_sunburst_PairActivity_nativeCancelPair(
-    _env: JNIEnv,
+    _env: EnvUnowned,
     _class: JClass,
 ) {
     CANCEL.store(true, Ordering::Relaxed);
-}
-
-fn to_jstring(env: JNIEnv, s: &str) -> jstring {
-    env.new_string(s)
-        .map(|js| js.into_raw())
-        .unwrap_or(std::ptr::null_mut())
 }
 
 fn cancelled() -> Result<(), String> {
