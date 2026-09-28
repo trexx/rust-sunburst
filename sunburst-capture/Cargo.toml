@@ -14,7 +14,7 @@ sunburst-core.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # DDA/WGC yield an ID3D11Texture2D; NvFBC yields a CUDA pointer via nvcuda.dll.
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

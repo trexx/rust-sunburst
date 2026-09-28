@@ -17,10 +17,10 @@ subtle.workspace = true
 # hand: its layout differs between armeabi-v7a and arm64-v8a, and getting that
 # wrong yields plausible-looking garbage rather than a compile error.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.189"
 
 [dev-dependencies]
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "instr"
