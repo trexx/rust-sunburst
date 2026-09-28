@@ -16,7 +16,7 @@ thiserror.workspace = true
 [target.'cfg(windows)'.dependencies]
 # UDP send offload (WSASendMsg + UDP_SEND_MSG_SIZE). Cross-platform code lives
 # in the crate; only the offload sender is Windows-only.
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_System_IO",
