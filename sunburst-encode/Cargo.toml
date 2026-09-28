@@ -17,7 +17,7 @@ sunburst-capture.workspace = true
 [target.'cfg(windows)'.dependencies]
 # NVENC is loaded at runtime from nvEncodeAPI64.dll (no build dep); the convert
 # stage compiles its HLSL via D3DCompile at runtime too.
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     # The scRGB→P010 convert stage: a D3D11 compute shader, runtime-compiled.
