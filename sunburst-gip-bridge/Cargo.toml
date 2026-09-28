@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 sunburst-core.workspace = true
-log = "0.4"
+log = "0.4.34"
 
 # The GIP security-handshake crypto, reimplemented in Rust (xow delegates it to a
 # Java `GipCrypto` + mbedtls, which Sunburst has not got). Pure Rust, so it
@@ -36,4 +36,4 @@ vendored = []
 # Android (see build.rs); on every other build it does nothing, so the dep is
 # cheap and the host toolchain is never invoked.
 [build-dependencies]
-cc = "1"
+cc = "1.5.1"
