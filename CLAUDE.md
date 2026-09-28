@@ -447,6 +447,11 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   put the HDR SEI pointers 4 bytes off and crashed the driver. **Lock every
   overlay field you touch with `offset_of!`/size asserts** against the 13.1
   header; they run in the Windows CI test job.
+- **Resolve CUDA driver exports by the exact name `cuda.h` maps to** — never
+  guess a `_v2`. Some are aliases (`cuMemAlloc` → `cuMemAlloc_v2`, a different
+  ABI from the bare export); some are not: `cuCtxSynchronize_v2(CUcontext)` is a
+  different function, and a `_v2`-first loader called it with no argument and
+  crashed the NvFBC path inside nvcuda64.dll (`sunburst-capture/src/cuda.rs`).
 - Surface `nvEncGetLastErrorString` on failure. A bare `NV_ENC_ERR_INVALID_PARAM`
   hides the one sentence that names the field.
 - 10-bit needs `inputBitDepth`/`outputBitDepth = NV_ENC_BIT_DEPTH_10` in SDK 13.x,

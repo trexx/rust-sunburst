@@ -19,13 +19,13 @@
 //!
 //! # The `_v2` trap
 //!
-//! `cuda.h` `#define`s most of these names to a `_v2` variant — `cuMemAlloc`
-//! really resolves to `cuMemAlloc_v2` — so asking `GetProcAddress` for the bare
-//! name returns null and CUDA looks absent rather than misnamed. That is the
-//! same class of mistake as looking for `NvFBCCreateInstance` and concluding
-//! NvFBC was unavailable, which cost this investigation several rounds. So each
-//! symbol is resolved `_v2`-first with a bare-name fallback, and the probe
-//! **prints which spelling answered** rather than leaving it to be assumed.
+//! `cuda.h` `#define`s some of these names to a `_v2` variant — `cuMemAlloc`
+//! really means `cuMemAlloc_v2` — and the bare export is a legacy ABI. But a
+//! `_v2` is not always an alias: `cuCtxSynchronize_v2(CUcontext)` is a different
+//! function from `cuCtxSynchronize()`, and guessing `_v2`-first picked it and
+//! crashed sunburst-capture's NvFBC path inside nvcuda. So each symbol is
+//! resolved by the exact export `cuda.h` maps its name to — never guessed — and
+//! the probe **prints which export answered** rather than leaving it assumed.
 
 use std::ffi::{CString, c_void};
 
@@ -64,22 +64,16 @@ fn symbol(module: HMODULE, name: &str) -> Option<*const c_void> {
     unsafe { GetProcAddress(module, PCSTR(cname.as_ptr().cast())) }.map(|p| p as *const c_void)
 }
 
-/// Resolve `name`, preferring the `_v2` spelling the headers actually alias to.
+/// Resolve `name` by its exact export `export` (see "The `_v2` trap").
 fn resolve(
     module: HMODULE,
     name: &'static str,
+    export: &'static str,
     resolved: &mut Vec<(&'static str, &'static str)>,
 ) -> Option<*const c_void> {
-    if let Some(p) = symbol(module, &format!("{name}_v2")) {
-        resolved.push((name, "_v2"));
-        return Some(p);
-    }
-    if let Some(p) = symbol(module, name) {
-        resolved.push((name, "bare"));
-        return Some(p);
-    }
-    resolved.push((name, "MISSING"));
-    None
+    let p = symbol(module, export);
+    resolved.push((name, if p.is_some() { export } else { "MISSING" }));
+    p
 }
 
 impl Cuda {
@@ -90,16 +84,16 @@ impl Cuda {
             .map_err(|e| format!("nvcuda.dll did not load: {e}"))?;
 
         let mut resolved = Vec::new();
-        let mut need = |name: &'static str| resolve(module, name, &mut resolved);
+        let mut need =
+            |name: &'static str, export: &'static str| resolve(module, name, export, &mut resolved);
 
-        // cuInit has no _v2 form, but going through the same path keeps it in
-        // the printed table.
-        let init = need("cuInit");
-        let ctx_pop = need("cuCtxPopCurrent");
-        let ctx_push = need("cuCtxPushCurrent");
-        let mem_alloc = need("cuMemAlloc");
-        let mem_free = need("cuMemFree");
-        let memcpy_dtoh = need("cuMemcpyDtoH");
+        // `_v2` exactly where cuda.h `#define`s it.
+        let init = need("cuInit", "cuInit");
+        let ctx_pop = need("cuCtxPopCurrent", "cuCtxPopCurrent_v2");
+        let ctx_push = need("cuCtxPushCurrent", "cuCtxPushCurrent_v2");
+        let mem_alloc = need("cuMemAlloc", "cuMemAlloc_v2");
+        let mem_free = need("cuMemFree", "cuMemFree_v2");
+        let memcpy_dtoh = need("cuMemcpyDtoH", "cuMemcpyDtoH_v2");
 
         let missing: Vec<_> = resolved
             .iter()

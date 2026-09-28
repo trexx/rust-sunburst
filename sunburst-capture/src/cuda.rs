@@ -15,14 +15,22 @@
 //! is a `LoadLibrary` at startup and no build dependency at all. There is no CUDA
 //! toolkit involved and `cargo xwin` is unaffected.
 //!
-//! # The `_v2` trap
+//! # The `_v2` trap, both halves
 //!
-//! `cuda.h` `#define`s most of these names to a `_v2` variant — `cuMemAlloc`
-//! really resolves to `cuMemAlloc_v2` — so asking `GetProcAddress` for the bare
-//! name returns null and CUDA looks absent rather than misnamed. That is the
-//! same class of mistake as looking for `NvFBCCreateInstance` and concluding
-//! NvFBC was unavailable. So each symbol is resolved `_v2`-first with a bare-name
-//! fallback, and a symbol that answers to neither spelling fails the load.
+//! `cuda.h` `#define`s some of these names to a `_v2` variant — `cuMemAlloc`
+//! really means `cuMemAlloc_v2`, whose `CUdeviceptr` is 64-bit — so the bare
+//! export is a different, legacy ABI.
+//!
+//! The other half: some `_v2` exports are **different functions** that the
+//! header never aliases to. `cuCtxSynchronize_v2(CUcontext)` takes a context;
+//! `cuCtxSynchronize()` takes nothing. This loader used to try `<name>_v2`
+//! first for every symbol, picked the former, and called it with no argument —
+//! the driver read a garbage context from a register, and the NvFBC path died
+//! with an access violation inside nvcuda64.dll on its first convert.
+//!
+//! So nothing is guessed: each symbol is resolved by the exact export `cuda.h`
+//! maps its name to (the `EXPORT_*` constants), and a missing one fails the load
+//! by name.
 
 // This module is a thin wrapper over the CUDA driver API: the CUcontext /
 // CUmodule / CUfunction pointers it takes are opaque handles whose validity is
@@ -83,28 +91,37 @@ pub struct Cuda {
     ctx_synchronize: PfnCtxSynchronize,
 }
 
+// The exact exports `cuda.h` (CUDA 13) resolves each name to. `_v2` only where
+// the header `#define`s it; never by guesswork (see the module docs).
+const EXPORT_INIT: &str = "cuInit";
+const EXPORT_CTX_POP: &str = "cuCtxPopCurrent_v2";
+const EXPORT_CTX_PUSH: &str = "cuCtxPushCurrent_v2";
+const EXPORT_CTX_GET_CURRENT: &str = "cuCtxGetCurrent";
+const EXPORT_MEM_ALLOC: &str = "cuMemAlloc_v2";
+const EXPORT_MEM_FREE: &str = "cuMemFree_v2";
+const EXPORT_MODULE_LOAD_DATA: &str = "cuModuleLoadData";
+const EXPORT_MODULE_GET_FUNCTION: &str = "cuModuleGetFunction";
+const EXPORT_LAUNCH_KERNEL: &str = "cuLaunchKernel";
+/// Not `cuCtxSynchronize_v2`: that one takes a `CUcontext`.
+const EXPORT_CTX_SYNCHRONIZE: &str = "cuCtxSynchronize";
+
 fn symbol(module: HMODULE, name: &str) -> Option<*const c_void> {
     let cname = CString::new(name).ok()?;
     // SAFETY: `module` is live and `cname` is NUL-terminated.
     unsafe { GetProcAddress(module, PCSTR(cname.as_ptr().cast())) }.map(|p| p as *const c_void)
 }
 
-/// Resolve `name`, preferring the `_v2` spelling the headers actually alias to.
+/// Resolve the exact export `name`, recording it as missing if absent.
 fn resolve(
     module: HMODULE,
     name: &'static str,
-    resolved: &mut Vec<(&'static str, &'static str)>,
+    missing: &mut Vec<&'static str>,
 ) -> Option<*const c_void> {
-    if let Some(p) = symbol(module, &format!("{name}_v2")) {
-        resolved.push((name, "_v2"));
-        return Some(p);
+    let p = symbol(module, name);
+    if p.is_none() {
+        missing.push(name);
     }
-    if let Some(p) = symbol(module, name) {
-        resolved.push((name, "bare"));
-        return Some(p);
-    }
-    resolved.push((name, "MISSING"));
-    None
+    p
 }
 
 impl Cuda {
@@ -114,27 +131,20 @@ impl Cuda {
         let module = unsafe { LoadLibraryA(PCSTR(cname.as_ptr().cast())) }
             .map_err(|e| format!("nvcuda.dll did not load: {e}"))?;
 
-        let mut resolved = Vec::new();
-        let mut need = |name: &'static str| resolve(module, name, &mut resolved);
+        let mut missing = Vec::new();
+        let mut need = |name: &'static str| resolve(module, name, &mut missing);
 
-        // cuInit has no _v2 form, but going through the same path keeps the
-        // `_v2`-first resolution uniform.
-        let init = need("cuInit");
-        let ctx_pop = need("cuCtxPopCurrent");
-        let ctx_push = need("cuCtxPushCurrent");
-        let ctx_get_current = need("cuCtxGetCurrent");
-        let mem_alloc = need("cuMemAlloc");
-        let mem_free = need("cuMemFree");
-        let module_load_data = need("cuModuleLoadData");
-        let module_get_function = need("cuModuleGetFunction");
-        let launch_kernel = need("cuLaunchKernel");
-        let ctx_synchronize = need("cuCtxSynchronize");
+        let init = need(EXPORT_INIT);
+        let ctx_pop = need(EXPORT_CTX_POP);
+        let ctx_push = need(EXPORT_CTX_PUSH);
+        let ctx_get_current = need(EXPORT_CTX_GET_CURRENT);
+        let mem_alloc = need(EXPORT_MEM_ALLOC);
+        let mem_free = need(EXPORT_MEM_FREE);
+        let module_load_data = need(EXPORT_MODULE_LOAD_DATA);
+        let module_get_function = need(EXPORT_MODULE_GET_FUNCTION);
+        let launch_kernel = need(EXPORT_LAUNCH_KERNEL);
+        let ctx_synchronize = need(EXPORT_CTX_SYNCHRONIZE);
 
-        let missing: Vec<_> = resolved
-            .iter()
-            .filter(|(_, how)| *how == "MISSING")
-            .map(|(name, _)| *name)
-            .collect();
         if !missing.is_empty() {
             return Err(format!("nvcuda.dll is missing {}", missing.join(", ")));
         }
@@ -277,5 +287,35 @@ impl Cuda {
     pub fn ctx_synchronize(&self) -> i32 {
         // SAFETY: no arguments; synchronises the current context.
         unsafe { (self.ctx_synchronize)() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned to `cuda.h`: `_v2` exactly where the header aliases a name to it,
+    /// and never for `cuCtxSynchronize`, whose `_v2` is a different function.
+    #[test]
+    fn exports_match_the_header_not_a_guess() {
+        for v2 in [
+            EXPORT_CTX_POP,
+            EXPORT_CTX_PUSH,
+            EXPORT_MEM_ALLOC,
+            EXPORT_MEM_FREE,
+        ] {
+            assert!(v2.ends_with("_v2"), "{v2}");
+        }
+        for bare in [
+            EXPORT_INIT,
+            EXPORT_CTX_GET_CURRENT,
+            EXPORT_MODULE_LOAD_DATA,
+            EXPORT_MODULE_GET_FUNCTION,
+            EXPORT_LAUNCH_KERNEL,
+            EXPORT_CTX_SYNCHRONIZE,
+        ] {
+            assert!(!bare.contains("_v"), "{bare}");
+        }
+        assert_eq!(EXPORT_CTX_SYNCHRONIZE, "cuCtxSynchronize");
     }
 }
