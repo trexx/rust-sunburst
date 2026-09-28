@@ -30,24 +30,58 @@ pub fn normalise(x: i32, y: i32, rect: [i32; 4]) -> (u16, u16, bool) {
     (scale(x - left, w), scale(y - top, h), inside)
 }
 
-/// How often motion may be reported. A change of visibility is reported at
-/// once.
+/// How often motion may be reported while the client **predicts** the pointer
+/// from its own mouse (`pointer_gain_milli > 0`): the report only corrects the
+/// prediction. A change of visibility is reported at once.
 pub const MOTION_INTERVAL_MS: u64 = 100;
+
+/// How often motion may be reported when the client does **not** predict
+/// (`pointer_gain_milli == 0`, Enhanced Pointer Precision on): every report is
+/// the only motion the viewer sees. At 100 ms the overlay moved at 10 Hz and
+/// read as a very delayed mouse; ~30 Hz keeps it smooth without flooding the
+/// reliable channel.
+pub const UNPREDICTED_INTERVAL_MS: u64 = 33;
 
 /// Decides when a polled position goes on the wire.
 ///
 /// Compared against the last position *sent*, not the last one polled, so a
 /// pointer that stops between sends still has its resting place reported
-/// within [`MOTION_INTERVAL_MS`], and a still pointer costs nothing.
-#[derive(Debug, Default)]
+/// within one interval, and a still pointer costs nothing.
+#[derive(Debug)]
 pub struct PositionThrottle {
     last_sent: Option<(u16, u16, bool)>,
     last_sent_ms: u64,
+    interval_ms: u64,
+}
+
+impl Default for PositionThrottle {
+    fn default() -> Self {
+        PositionThrottle::with_interval(MOTION_INTERVAL_MS)
+    }
 }
 
 impl PositionThrottle {
     pub fn new() -> PositionThrottle {
         PositionThrottle::default()
+    }
+
+    /// Motion reported at most every `interval_ms`.
+    pub fn with_interval(interval_ms: u64) -> PositionThrottle {
+        PositionThrottle {
+            last_sent: None,
+            last_sent_ms: 0,
+            interval_ms,
+        }
+    }
+
+    /// The throttle for a session reporting `pointer_gain_milli`: coarse when
+    /// the client predicts, fine when the reports are all it has.
+    pub fn for_gain(pointer_gain_milli: u16) -> PositionThrottle {
+        PositionThrottle::with_interval(if pointer_gain_milli > 0 {
+            MOTION_INTERVAL_MS
+        } else {
+            UNPREDICTED_INTERVAL_MS
+        })
     }
 
     /// The position to send now, if any.
@@ -56,7 +90,7 @@ impl PositionThrottle {
             None => true,
             Some(last) if last == pos => false,
             Some(last) if last.2 != pos.2 => true,
-            Some(_) => now_ms.saturating_sub(self.last_sent_ms) >= MOTION_INTERVAL_MS,
+            Some(_) => now_ms.saturating_sub(self.last_sent_ms) >= self.interval_ms,
         };
         if !due {
             return None;
@@ -146,5 +180,24 @@ mod tests {
         t.offer((1, 1, true), 0);
         t.reset();
         assert!(t.offer((1, 1, true), 1).is_some());
+    }
+
+    #[test]
+    fn an_unpredicting_client_gets_motion_about_thirty_times_a_second() {
+        let mut t = PositionThrottle::for_gain(0);
+        assert!(t.offer((1, 0, true), 0).is_some());
+        assert_eq!(t.offer((2, 0, true), 20), None, "inside the interval");
+        assert_eq!(
+            t.offer((3, 0, true), UNPREDICTED_INTERVAL_MS),
+            Some((3, 0, true))
+        );
+    }
+
+    #[test]
+    fn a_predicting_client_keeps_the_coarse_interval() {
+        let mut t = PositionThrottle::for_gain(1_000);
+        assert!(t.offer((1, 0, true), 0).is_some());
+        assert_eq!(t.offer((2, 0, true), UNPREDICTED_INTERVAL_MS), None);
+        assert!(t.offer((3, 0, true), MOTION_INTERVAL_MS).is_some());
     }
 }

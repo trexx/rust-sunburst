@@ -261,6 +261,11 @@ pub struct Hello {
     /// A client-requested bitrate ceiling in kbps, or `0` for no client limit.
     /// The server only ever lowers its target by this, never raises it.
     pub max_bitrate_kbps: u32,
+    /// Whether the client's display can show HDR10. The server streams HDR
+    /// only when this is set: a BT.2020 PQ stream on an SDR panel comes out
+    /// washed out, however the box tries to map it down. A trailing byte; a
+    /// `Hello` without it (an older client) reads as `true`, the old behaviour.
+    pub display_hdr: bool,
 }
 
 /// Bits of [`Hello::codecs`].
@@ -641,6 +646,7 @@ impl ClientControl {
                 // 0xFF = no codec preference; else the StreamCodec wire value.
                 b.push(h.prefer_codec.map_or(0xFF, |c| c as u8));
                 b.extend_from_slice(&h.max_bitrate_kbps.to_le_bytes());
+                b.push(u8::from(h.display_hdr));
             }
             ClientControl::Quirks(q) => {
                 b.push(q.flags());
@@ -716,6 +722,7 @@ impl ClientControl {
                     v => StreamCodec::from_u8(v),
                 },
                 max_bitrate_kbps: r.u32()?,
+                display_hdr: r.optional_u8().is_none_or(|v| v != 0),
             }),
             ClientMessage::DecoderQuirks => {
                 ClientControl::Quirks(DecoderQuirks::from_flags(r.u8()?, r.u32()?))
@@ -1185,6 +1192,11 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self) -> Result<u8, ControlError> {
         Ok(self.take(1)?[0])
+    }
+
+    /// A trailing field an older peer may not send: `None` at the payload's end.
+    fn optional_u8(&mut self) -> Option<u8> {
+        self.u8().ok()
     }
 
     fn u16(&mut self) -> Result<u16, ControlError> {

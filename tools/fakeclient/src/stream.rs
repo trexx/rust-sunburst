@@ -193,6 +193,8 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
             codecs: opts.codecs,
             prefer_codec: opts.prefer_codec,
             max_bitrate_kbps: opts.max_bitrate_kbps,
+            // A stub display: HDR-capable, so the server's own setting decides.
+            display_hdr: true,
         })
         .map_err(|e| e.to_string())?;
 

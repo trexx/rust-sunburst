@@ -45,8 +45,8 @@ pub struct CudaConverter {
 impl CudaConverter {
     /// Build a converter in NvFBC's CUDA `context`, allocating an `output` buffer
     /// (P010 for HEVC/AV1, NV12 for H.264) for `width`×`height`. `hdr_source`
-    /// selects the tonemapping NV12 kernel for an HDR desktop; it is ignored by
-    /// the P010 kernel.
+    /// selects the tonemapping SDR kernel (NV12, or BT.709 P010) for an HDR
+    /// desktop; it is ignored by the PQ P010 kernel.
     pub fn new(
         context: CuContext,
         width: u32,
@@ -66,11 +66,23 @@ impl CudaConverter {
 
         // Pick the kernel, its output pitch/size, and destination element stride.
         let (ptx_src, kernel_name, pitch_bytes, bytes) = match output {
-            ConvertOutput::P010 | ConvertOutput::P010Sdr => (
+            ConvertOutput::P010 => (
                 KERNEL_PTX_P010,
                 "argb10_to_p010",
                 width * 2,
                 // Y plane (w·h·2) + interleaved UV (w·h) = w·h·3 bytes.
+                (width as usize) * (height as usize) * 3,
+            ),
+            // 10-bit BT.709 for a display that cannot show HDR. These live in the
+            // SDR kernel file beside the NV12 ones; tonemapped from an HDR desktop.
+            ConvertOutput::P010Sdr => (
+                KERNEL_PTX_NV12,
+                if hdr_source {
+                    "argb10_to_p010_709_tonemap"
+                } else {
+                    "argb10_to_p010_709"
+                },
+                width * 2,
                 (width as usize) * (height as usize) * 3,
             ),
             ConvertOutput::Nv12 => (

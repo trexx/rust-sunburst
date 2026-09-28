@@ -231,8 +231,8 @@ pub struct Converter {
 impl Converter {
     /// Build a converter on the device that owns `like` (an input texture),
     /// producing `output` (P010 for HEVC/AV1, NV12 for H.264). `hdr_source` says
-    /// whether the capture is HDR-range, which the NV12 (SDR) path tonemaps; it
-    /// is ignored by the P010 path. The output texture lives on the same device,
+    /// whether the capture is HDR-range, which the SDR paths (NV12, P010Sdr)
+    /// tonemap; it is ignored by the PQ P010 path. The output texture lives on the same device,
     /// as NVENC requires.
     pub fn new(
         like: &ID3D11Texture2D,
@@ -249,8 +249,9 @@ impl Converter {
 
         let (src, tonemap, ten_bit) = match output {
             ConvertOutput::P010 => (SHADER_HLSL, false, false),
-            // P010Sdr is SDR content, so never tonemap; 10-bit P010 packing.
-            ConvertOutput::P010Sdr => (SDR_SHADER_HLSL, false, true),
+            // 10-bit BT.709 P010. From an HDR desktop (an SDR session on a desktop
+            // left in HDR), roll it off with the same ACES tonemap as NV12.
+            ConvertOutput::P010Sdr => (SDR_SHADER_HLSL, hdr_source, true),
             ConvertOutput::Nv12 => (SDR_SHADER_HLSL, hdr_source, false),
         };
         let bytecode = compile(src, tonemap, ten_bit, srgb_input)?;

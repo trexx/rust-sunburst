@@ -657,14 +657,19 @@ fn build_and_convert<'a>(
     // live HDR<->SDR flip changes `output` and rebuilds the spine below.
     let frame_hdr = frame.meta().hdr;
     let hdr_source = frame_hdr;
+    // PQ only when the frame is HDR *and* the session is: the client's display
+    // may be SDR (`Hello.display_hdr`), and a desktop left in HDR then gets
+    // tonemapped into BT.709 rather than streamed as PQ to a panel that cannot
+    // show it.
+    let hdr_out = frame_hdr && params.hdr;
     let (output, color) = match params.codec {
         Codec::H264 => (ConvertOutput::Nv12, ColorSpace::Bt709),
-        Codec::Hevc | Codec::Av1 if frame_hdr => (ConvertOutput::P010, ColorSpace::Bt2020Pq),
+        Codec::Hevc | Codec::Av1 if hdr_out => (ConvertOutput::P010, ColorSpace::Bt2020Pq),
         Codec::Hevc | Codec::Av1 => (ConvertOutput::P010Sdr, ColorSpace::Bt709),
     };
     ecfg.color = color;
-    // Mastering-display / MaxCLL SEI only when the source is genuinely HDR.
-    ecfg.hdr = if frame_hdr {
+    // Mastering-display / MaxCLL SEI only when the stream is genuinely HDR.
+    ecfg.hdr = if hdr_out {
         capture.caps().hdr_metadata.map(|m| m.mastering())
     } else {
         None
