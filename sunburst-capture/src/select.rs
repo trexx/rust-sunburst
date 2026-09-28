@@ -66,7 +66,10 @@ pub fn build(
         match NvFbcCapture::new(hdr) {
             Ok(c) => return Ok(Box::new(c)),
             Err(e) => {
-                eprintln!("sunburst-capture: NvFBC requested but unavailable ({e}); falling back");
+                eprintln!(
+                    "sunburst-capture: NvFBC requested but unavailable ({e}); \
+                     falling back to WGC/DDA"
+                );
             }
         }
     }

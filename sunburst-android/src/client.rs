@@ -298,6 +298,15 @@ fn run_inner(
     // startup IDR went out during negotiation, so the gate asks for one at once.
     let mut gate = KeyframeGate::new(current.first_frame, mono_ms());
     let mut last_fed: Option<Seq16> = None;
+    // Without reference invalidation the server answers every abandon with an
+    // IDR, and the frames between the loss and that IDR reference a picture the
+    // decoder never had: hold them back (`KeyframeGate::on_loss`) rather than
+    // decode garbage. With it, the server re-anchors on a good reference and the
+    // stream carries on.
+    let gate_on_loss = !config.ref_invalidation;
+    if let Some(bytes) = client.recv_buffer_bytes() {
+        log::info!("socket receive buffer: {bytes} bytes");
+    }
 
     // Audio routing: 0 TV only, 1 pad headset only, 2 both.
     let route_tv = prefs.audio_route != 1;
@@ -440,6 +449,9 @@ fn run_inner(
                     reassembler.discard(id);
                     id = id.next();
                 }
+                if gate_on_loss {
+                    gate.on_loss(mono_ms());
+                }
             }
             let fid = rel.frame.frame_id.0 as u32;
             // Complete frames the decoder cannot use (the previous build's, or a
@@ -449,13 +461,29 @@ fn run_inner(
             if gate.admit(rel.frame.frame_id, rel.frame.keyframe)
                 && let Some(n) = reassembler.copy_into(&rel.frame, &mut out)
             {
-                match decoder.feed(&out[..n], pts_us, fid) {
-                    Ok(true) => {
-                        pts_us += frame_interval_us;
-                        last_fed = Some(rel.frame.frame_id);
+                let fed = match decoder.feed(&out[..n], pts_us, fid) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        log::warn!("decoder input full; dropped frame {fid}");
+                        false
                     }
-                    Ok(false) => log::warn!("decoder input full; dropped frame {fid}"),
-                    Err(e) => log::error!("feed: {e}"),
+                    Err(e) => {
+                        log::error!("feed: {e}");
+                        false
+                    }
+                };
+                if fed {
+                    gate.on_fed(rel.frame.keyframe);
+                    pts_us += frame_interval_us;
+                    last_fed = Some(rel.frame.frame_id);
+                } else {
+                    // The server still predicts from this frame; the decoder
+                    // never saw it. Report it lost, like a stepped-over one.
+                    dropped += 1;
+                    let _ = client.send_nack(rel.frame.frame_id, &[]);
+                    if gate_on_loss {
+                        gate.on_loss(mono_ms());
+                    }
                 }
             }
             reassembler.release(rel.frame);
@@ -475,6 +503,9 @@ fn run_inner(
         let a = reassembler.drain_abandoned(&mut abandoned);
         for id in &abandoned[..a] {
             let _ = client.send_nack(*id, &[]);
+        }
+        if a > 0 && gate_on_loss {
+            gate.on_loss(mono_ms());
         }
 
         // Drain queued input and send it, mapped to wire events. The session

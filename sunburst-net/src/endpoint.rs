@@ -87,6 +87,7 @@ use sunburst_core::proto::{
 
 use crate::handler::{ControlHandler, Outbound};
 use crate::reliable::{FRAME_HEADER_LEN, Incarnation, Reliable, ReliableError};
+use crate::sockbuf;
 
 /// Room for a control message once the common header, the reliable frame header
 /// and the MAC are accounted for.
@@ -177,6 +178,9 @@ impl<H: ControlHandler> Endpoint<H> {
     /// handing the socket over.
     pub fn from_socket(socket: UdpSocket, handler: H) -> io::Result<Endpoint<H>> {
         socket.set_read_timeout(Some(POLL_INTERVAL))?;
+        // Best-effort: a refusal keeps the OS default (see `sockbuf`).
+        sockbuf::request(&socket, sockbuf::Buffer::Send, sockbuf::SEND_BUFFER_BYTES);
+        sockbuf::request(&socket, sockbuf::Buffer::Recv, sockbuf::RECV_BUFFER_BYTES);
         Ok(Endpoint {
             socket,
             handler,
@@ -881,6 +885,8 @@ pub struct ClientEndpoint {
     /// fixed key and no handshake, this is that key; for a real client it is the
     /// pairing key.
     pub key: Option<SessionKey>,
+    /// The receive buffer the kernel granted, as `getsockopt` reports it.
+    recv_buffer: Option<usize>,
     /// The raw pairing secret, kept so the session key can be derived when
     /// `SessionConfig` arrives. Set by [`connect_paired`](Self::connect_paired).
     secret: Option<[u8; 32]>,
@@ -926,8 +932,14 @@ impl ClientEndpoint {
         };
         let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
+        // A 4K frame is one paced burst of up to ~200 datagrams; the Android
+        // default buffer holds about one, so any stall in the receive loop drops
+        // a frame's tail. Best-effort: the kernel clamps it to rmem_max.
+        let recv_buffer =
+            sockbuf::request(&socket, sockbuf::Buffer::Recv, sockbuf::RECV_BUFFER_BYTES);
         Ok(ClientEndpoint {
             socket,
+            recv_buffer,
             server,
             reliable: Reliable::new(MAX_CONTROL_PAYLOAD),
             key,
@@ -951,6 +963,12 @@ impl ClientEndpoint {
 
     /// How long [`recv`](Self::recv) waits for a datagram. A client that also
     /// services input between reads wants this short once streaming.
+    /// The socket receive buffer the kernel granted (clamped by `rmem_max`), so
+    /// the client can log it: a small one is a likely cause of frame loss.
+    pub fn recv_buffer_bytes(&self) -> Option<usize> {
+        self.recv_buffer
+    }
+
     pub fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
         self.socket.set_read_timeout(Some(timeout))
     }

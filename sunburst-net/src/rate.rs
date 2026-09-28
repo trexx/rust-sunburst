@@ -102,6 +102,17 @@ pub const CEILING_MARGIN: f64 = 0.95;
 pub const PROBE_INTERVAL_MS: u64 = 5_000;
 /// Decrease on loss with no usable gradient.
 pub const LOSS_DECREASE: f64 = 0.85;
+/// Loss without a gradient is judged over windows this long, so it moves the
+/// target at most once per window.
+pub const LOSS_WINDOW_MS: u64 = 1_000;
+/// Loss-only decreases need at least this fraction of a window's frames lost.
+///
+/// Below it, loss is not congestion — a queue would have shown in the gradient —
+/// it is a noisy link (Wi-Fi retries, a burst dropped by a small socket buffer),
+/// which NACK and the keyframe path repair. Cutting 15% on every such drop
+/// ratcheted a Wi-Fi client to the session floor within seconds, and then held it
+/// there, since every later drop also blocked the climb back.
+pub const LOSS_FRACTION_FOR_DECREASE: f64 = 0.05;
 /// Safety factor under the capacity estimate.
 pub const ESTIMATE_MARGIN: f64 = 0.9;
 
@@ -115,6 +126,11 @@ pub struct RateController {
     last_increase_ms: Option<u64>,
     last_probe_ms: Option<u64>,
     last_dropped: Option<u32>,
+    last_received: Option<u32>,
+    /// The current loss window: when it opened, and its frame counts.
+    window_start_ms: Option<u64>,
+    window_received: u32,
+    window_dropped: u32,
     last_loss_ms: Option<u64>,
     decreases: u32,
     increases: u32,
@@ -133,6 +149,10 @@ impl RateController {
             last_increase_ms: None,
             last_probe_ms: None,
             last_dropped: None,
+            last_received: None,
+            window_start_ms: None,
+            window_received: 0,
+            window_dropped: 0,
             last_loss_ms: None,
             decreases: 0,
             increases: 0,
@@ -157,11 +177,7 @@ impl RateController {
             self.last_increase_ms = Some(now_ms);
         }
 
-        let lost = match self.last_dropped {
-            Some(prev) => fb.frames_dropped > prev,
-            None => false,
-        };
-        self.last_dropped = Some(fb.frames_dropped);
+        let lost = self.lossy_window(fb, now_ms);
         if lost {
             self.last_loss_ms = Some(now_ms);
         }
@@ -182,6 +198,35 @@ impl RateController {
         }
 
         (self.target_kbps != before).then_some(self.target_kbps)
+    }
+
+    /// Account this report's frames to the loss window. `true` once, when a
+    /// window closes having lost at least [`LOSS_FRACTION_FOR_DECREASE`] of its
+    /// frames.
+    fn lossy_window(&mut self, fb: &Feedback, now_ms: u64) -> bool {
+        // The counters are cumulative; the first report only sets the baseline.
+        let dropped = self
+            .last_dropped
+            .map_or(0, |prev| fb.frames_dropped.wrapping_sub(prev));
+        let received = self
+            .last_received
+            .map_or(0, |prev| fb.frames_received.wrapping_sub(prev));
+        self.last_dropped = Some(fb.frames_dropped);
+        self.last_received = Some(fb.frames_received);
+        self.window_dropped = self.window_dropped.saturating_add(dropped);
+        self.window_received = self.window_received.saturating_add(received);
+
+        let start = *self.window_start_ms.get_or_insert(now_ms);
+        if now_ms.saturating_sub(start) < LOSS_WINDOW_MS {
+            return false;
+        }
+        let total = self.window_received as f64 + self.window_dropped as f64;
+        let lossy = self.window_dropped > 0
+            && self.window_dropped as f64 >= total * LOSS_FRACTION_FOR_DECREASE;
+        self.window_start_ms = Some(now_ms);
+        self.window_received = 0;
+        self.window_dropped = 0;
+        lossy
     }
 
     fn maybe_increase(&mut self, now_ms: u64) {
@@ -465,13 +510,63 @@ mod tests {
         let mut rc = RateController::new(bounds());
         let flat = Feedback::default();
         assert_eq!(rc.on_feedback(&flat, 0), None);
+        // A window losing 10 of 60 frames: one fixed step, when it closes.
         let lossy = Feedback {
-            frames_dropped: 3,
+            frames_received: 50,
+            frames_dropped: 10,
             ..Default::default()
         };
-        assert_eq!(rc.on_feedback(&lossy, 100), Some(102_000));
-        // The same count again is not new loss.
-        assert_eq!(rc.on_feedback(&lossy, 200), None);
+        assert_eq!(rc.on_feedback(&lossy, 100), None);
+        assert_eq!(rc.on_feedback(&lossy, 1_000), Some(102_000));
+        // The same counts again are not new loss.
+        let same = Feedback {
+            frames_received: 110,
+            frames_dropped: 10,
+            ..Default::default()
+        };
+        assert_eq!(rc.on_feedback(&same, 1_500), None);
+    }
+
+    /// A Wi-Fi client: ~60 fps, a frame lost every second or so, no queueing.
+    /// That is repaired by NACK/keyframe, not by bitrate — it must not ratchet
+    /// the target down to the floor.
+    #[test]
+    fn sparse_loss_without_a_gradient_does_not_ratchet_to_the_floor() {
+        let mut rc = RateController::new(bounds());
+        let (mut received, mut dropped) = (0u32, 0u32);
+        for i in 0..300u64 {
+            received += 6;
+            if i % 10 == 3 {
+                dropped += 1;
+            }
+            let fb = Feedback {
+                frames_received: received,
+                frames_dropped: dropped,
+                ..Default::default()
+            };
+            rc.on_feedback(&fb, i * 100);
+        }
+        assert_eq!(rc.stats().0, 0, "sparse loss decreased the target");
+        assert!(rc.target_kbps() >= 120_000);
+    }
+
+    /// Heavy loss with no gradient still backs off, but at most once a window.
+    #[test]
+    fn heavy_loss_backs_off_at_most_once_per_window() {
+        let mut rc = RateController::new(bounds());
+        let (mut received, mut dropped) = (0u32, 0u32);
+        for i in 0..20u64 {
+            received += 4;
+            dropped += 2;
+            let fb = Feedback {
+                frames_received: received,
+                frames_dropped: dropped,
+                ..Default::default()
+            };
+            rc.on_feedback(&fb, i * 100);
+        }
+        let (decreases, _) = rc.stats();
+        assert!((1..=2).contains(&decreases), "{decreases} decreases in 2 s");
     }
 
     #[test]

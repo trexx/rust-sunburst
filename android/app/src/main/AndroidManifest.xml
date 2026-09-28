@@ -37,12 +37,14 @@
             </intent-filter>
         </activity>
 
-        <!-- The streaming client, opened from the grid. -->
+        <!-- The streaming client, opened from the grid. Full-screen with no
+             action bar: the video owns the panel, and nothing SDR sits over it. -->
         <activity
             android:name=".StreamActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|keyboardHidden"
-            android:label="Sunburst" />
+            android:label="Sunburst"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen" />
 
         <!-- Pairing screen: opened by the grid when unpaired, and from Settings
              to re-pair. -->

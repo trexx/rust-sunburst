@@ -24,6 +24,7 @@ pub mod refinval;
 pub mod reliable;
 pub mod retransmit;
 pub mod send;
+pub mod sockbuf;
 pub mod spsc;
 pub mod video;
 

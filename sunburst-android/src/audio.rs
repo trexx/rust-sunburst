@@ -30,6 +30,7 @@ use sunburst_gip_bridge::Bridge;
 use crate::audio_ring::{PcmProducer, pcm_ring};
 use crate::headset::HeadsetGate;
 use crate::mic::MicFramer;
+use crate::plc::{Arrival, AudioSequence};
 
 /// Largest Opus frame we might decode (120 ms at 48 kHz), per channel — the
 /// scratch is sized for it even though the server sends 5 ms frames.
@@ -44,6 +45,10 @@ pub struct AudioPlayer {
     decoder: OpusDecoder,
     scratch: Vec<i16>,
     channels: usize,
+    /// Samples per channel in one packet — the length of a concealed frame.
+    frame_samples: usize,
+    /// The packet sequence, to notice losses and conceal them.
+    sequence: AudioSequence,
     /// Drop a freshly-decoded frame once the ring holds more than this, to keep
     /// buffering (and so A/V offset) bounded when the client runs slow.
     high_watermark: usize,
@@ -107,6 +112,8 @@ impl AudioPlayer {
             decoder,
             scratch: vec![0i16; MAX_FRAME_SAMPLES * ch],
             channels: ch,
+            frame_samples: frame_samples as usize,
+            sequence: AudioSequence::default(),
             high_watermark,
             route_tv,
         })
@@ -116,20 +123,38 @@ impl AudioPlayer {
     /// is overrun), and return the decoded interleaved stereo PCM so the caller
     /// can also fork it to a pad headset. `id` is the packet's audio sequence
     /// number, for the instrumentation chain.
+    ///
+    /// Packets lost just before this one are concealed first (Opus PLC, see
+    /// [`crate::plc`]) and played on the TV; a late or duplicate packet is
+    /// dropped, since its slot has already played.
     pub fn feed(&mut self, payload: &[u8], id: u32) -> Option<&[i16]> {
+        let conceal = match self.sequence.on_packet(Seq16(id as u16)) {
+            Arrival::Stale => return None,
+            Arrival::Play { conceal } => conceal,
+        };
+        for _ in 0..conceal {
+            if let Ok(samples) = self.decoder.conceal(&mut self.scratch, self.frame_samples) {
+                self.play_tv(samples * self.channels, id);
+            }
+        }
         let samples = self
             .decoder
             .decode(payload, &mut self.scratch, false)
             .ok()?;
         instr::record(Stage::AudioDecode, id);
         let n = samples * self.channels;
-        // Play on the TV unless routed away, and never past the overrun watermark
-        // (keeps buffering — and so A/V offset — bounded when the client is slow).
+        self.play_tv(n, id);
+        Some(&self.scratch[..n])
+    }
+
+    /// Play the first `n` scratch samples on the TV unless routed away, and
+    /// never past the overrun watermark (keeps buffering — and so A/V offset —
+    /// bounded when the client is slow).
+    fn play_tv(&mut self, n: usize, id: u32) {
         if self.route_tv && self.producer.available() <= self.high_watermark {
             self.producer.push(&self.scratch[..n]);
             instr::record(Stage::AudioPlay, id);
         }
-        Some(&self.scratch[..n])
     }
 }
 

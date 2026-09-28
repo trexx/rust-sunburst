@@ -1296,6 +1296,7 @@ dependencies = [
 name = "sunburst-net"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sunburst-core",
  "thiserror 2.0.21",
  "windows",

@@ -199,7 +199,7 @@ impl Capture for WgcCapture {
                 }
                 // No frame ready yet — wait on the arrival event within the
                 // remaining budget rather than spinning.
-                Err(e) if e.code() == E_POINTER => {
+                Err(e) if is_empty_pool(&e) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Ok(None);
@@ -235,6 +235,16 @@ impl Drop for WgcCapture {
             let _ = CloseHandle(self.frame_ready);
         }
     }
+}
+
+/// An empty pool: `TryGetNextFrame` succeeded but returned no frame.
+///
+/// windows-core 0.62 maps a null interface out-param to `Error::empty()`, whose
+/// HRESULT is `S_OK` — "The operation completed successfully". Matching only
+/// `E_POINTER` (what older bindings returned) made the first empty poll fatal and
+/// stopped the pipeline. Both are accepted.
+fn is_empty_pool(e: &windows::core::Error) -> bool {
+    e.code().is_ok() || e.code() == E_POINTER
 }
 
 /// Device-removed / reset are recoverable by rebuilding the whole session.

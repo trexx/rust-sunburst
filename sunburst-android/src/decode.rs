@@ -34,6 +34,10 @@ fn mime(codec: StreamCodec) -> &'static str {
     }
 }
 
+/// `max-input-size`: a 4K keyframe at 150 Mbps with a one-frame VBV is ~300 KB;
+/// this leaves an order of magnitude of headroom.
+const MAX_INPUT_BYTES: i32 = 4 << 20;
+
 /// The format one encoder build needs: its size and `csd-0` (HEVC/H.264
 /// parameter sets in Annex-B, or the AV1 av1C record), the low-latency keys,
 /// and its colour. The colour keys are set for SDR too, explicitly BT.709, so a
@@ -51,6 +55,10 @@ fn format_for(cp: &CodecPrivate, fps: i32) -> MediaFormat {
     fmt.set_i32("low-latency", 1);
     fmt.set_i32("priority", 0);
     fmt.set_i32("operating-rate", fps.max(60) * 2);
+    // Room for a 4K keyframe at any bitrate the session can reach. A codec's
+    // default input buffer is sized for typical content, and a frame that does
+    // not fit is lost to the decoder.
+    fmt.set_i32("max-input-size", MAX_INPUT_BYTES);
 
     if let Some((standard, transfer, range)) = media_color_keys(&cp.color) {
         fmt.set_i32("color-standard", standard);
@@ -122,7 +130,13 @@ impl Decoder {
             DequeuedInputBufferResult::Buffer(mut buf) => {
                 let dst = buf.buffer_mut();
                 if dst.len() < data.len() {
-                    return Err(format!("input buffer {} < frame {}", dst.len(), data.len()));
+                    let have = dst.len();
+                    // Hand the slot back empty: a dequeued buffer that is never
+                    // queued is lost to the codec for good.
+                    self.codec
+                        .queue_input_buffer(buf, 0, 0, pts_us, 0)
+                        .map_err(|e| format!("queue_input: {e}"))?;
+                    return Err(format!("input buffer {have} < frame {}", data.len()));
                 }
                 for (d, s) in dst.iter_mut().zip(data) {
                     d.write(*s);

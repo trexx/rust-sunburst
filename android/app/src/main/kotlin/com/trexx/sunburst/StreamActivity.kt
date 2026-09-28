@@ -21,6 +21,8 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.widget.FrameLayout
 import android.view.WindowManager
 
@@ -144,7 +146,23 @@ class StreamActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) view.requestPointerCapture()
+        if (hasFocus) {
+            hideSystemBars()
+            view.requestPointerCapture()
+        }
+    }
+
+    /** The video owns the whole panel: no status or navigation bar over it (the
+     *  manifest's NoActionBar.Fullscreen theme already removes the title bar).
+     *  Re-applied on every focus gain, since a dialog or Settings brings them
+     *  back. Beyond hiding the chrome, this matters for colour: on the Homatics'
+     *  Amlogic compositor an SDR UI layer above HDR10 video came out with RGB read
+     *  as YUV — the old black title bar showed green, its white text magenta. */
+    private fun hideSystemBars() {
+        window.insetsController?.let {
+            it.hide(WindowInsets.Type.systemBars())
+            it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {

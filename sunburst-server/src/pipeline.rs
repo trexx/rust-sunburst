@@ -508,6 +508,17 @@ fn gpu_loop(
                 continue;
             }
             Err(CaptureError::AccessLost) => {
+                // Tear the old backend down *before* building its replacement.
+                // The spine (and every surface it produced) goes first: on the
+                // NvFBC path it lives in NvFBC's CUDA context. Building while the
+                // old capture was still alive asked for a second NvFBC session (or
+                // a second duplication of the same output), which the driver may
+                // refuse — the likely reason an NvFBC session, rebuilt after the
+                // HDR toggle at session start, ended up falling back to WGC.
+                spine = None;
+                held = None;
+                last = None;
+                drop(capture);
                 capture = select::build(
                     params.nvfbc,
                     params.force_backend,
@@ -515,10 +526,6 @@ fn gpu_loop(
                     params.output,
                 )
                 .map_err(|e| e.to_string())?;
-                // The spine (and every surface it produced) goes with it.
-                spine = None;
-                held = None;
-                last = None;
                 st.need_keyframe = true;
                 governor = FrameGovernor::new(params.interval_ns, capture.honors_timeout());
                 continue;

@@ -21,6 +21,14 @@
 //! The gate also covers the start of a session. The server fires its startup IDR
 //! the moment the pipeline spawns, which is before the client has finished
 //! negotiating, so that IDR is gone. A gate starts closed and asks at once.
+//!
+//! And it covers loss. Without reference invalidation, a frame the client gave
+//! up on (stepped over, abandoned, refused by the decoder) leaves every later
+//! P-frame predicting from a picture the decoder never had; fed anyway, they
+//! smear garbage across the screen until the next keyframe. The server answers
+//! the abandon with an IDR, so the gate closes on the loss and waits for it: a
+//! brief freeze instead of corruption. The gate opens only once a keyframe was
+//! actually *queued* — a keyframe the decoder refused re-anchors nothing.
 
 use sunburst_core::proto::{CodecPrivate, ColorInfo, Seq16, cicp};
 
@@ -118,16 +126,33 @@ impl KeyframeGate {
         self.ask_at_ms = if spent { now_ms } else { now_ms + IDR_RETRY_MS };
     }
 
-    /// Whether a released frame may be fed to the decoder.
-    pub fn admit(&mut self, frame_id: Seq16, keyframe: bool) -> bool {
+    /// Whether a released frame may be fed to the decoder. Feeding it does not
+    /// open the gate; [`on_fed`](Self::on_fed) does, once the decoder took it.
+    pub fn admit(&self, frame_id: Seq16, keyframe: bool) -> bool {
         if self.first.is_newer_than(frame_id) {
             // The previous build's: the decoder is no longer configured for it.
             return false;
         }
-        if !self.open && keyframe {
+        self.open || keyframe
+    }
+
+    /// An admitted frame was queued in the decoder. A keyframe opens the gate.
+    pub fn on_fed(&mut self, keyframe: bool) {
+        if keyframe {
             self.open = true;
         }
-        self.open
+    }
+
+    /// A frame of the current build was lost to the decoder, so the frames after
+    /// it predict from a picture it does not have. Close until a keyframe. The
+    /// abandon that reported the loss already makes the server send one, so this
+    /// asks again only after [`IDR_RETRY_MS`]; an already-closed gate keeps its
+    /// earlier deadline.
+    pub fn on_loss(&mut self, now_ms: u64) {
+        if self.open {
+            self.open = false;
+            self.ask_at_ms = now_ms + IDR_RETRY_MS;
+        }
     }
 
     /// Whether to send `RequestIdr` now. While closed, every [`IDR_RETRY_MS`].
@@ -214,25 +239,43 @@ mod tests {
         assert_eq!(media_color_keys(&odd), None);
     }
 
+    /// What the client loop does: admit, then report the frame as fed.
+    fn feed(gate: &mut KeyframeGate, id: Seq16, keyframe: bool) -> bool {
+        let admitted = gate.admit(id, keyframe);
+        if admitted {
+            gate.on_fed(keyframe);
+        }
+        admitted
+    }
+
     #[test]
     fn a_session_starts_closed_and_asks_at_once() {
         let mut gate = KeyframeGate::new(Seq16(7), 1_000);
         assert!(gate.tick(1_000), "the startup IDR is gone; ask immediately");
         assert!(!gate.tick(1_100), "and not again straight away");
-        assert!(!gate.admit(Seq16(8), false), "no P-frame before a keyframe");
+        assert!(
+            !feed(&mut gate, Seq16(8), false),
+            "no P-frame before a keyframe"
+        );
         assert!(gate.tick(1_500), "still closed after the retry interval");
-        assert!(gate.admit(Seq16(9), true));
-        assert!(gate.admit(Seq16(10), false), "open: everything after flows");
+        assert!(feed(&mut gate, Seq16(9), true));
+        assert!(
+            feed(&mut gate, Seq16(10), false),
+            "open: everything after flows"
+        );
         assert!(!gate.tick(5_000), "an open gate never asks");
     }
 
     #[test]
     fn frames_of_the_previous_build_are_dropped() {
         let mut gate = KeyframeGate::new(Seq16(100), 0);
-        assert!(!gate.admit(Seq16(99), true), "a keyframe of the old build");
-        assert!(gate.admit(Seq16(100), true));
         assert!(
-            !gate.admit(Seq16(98), false),
+            !feed(&mut gate, Seq16(99), true),
+            "a keyframe of the old build"
+        );
+        assert!(feed(&mut gate, Seq16(100), true));
+        assert!(
+            !feed(&mut gate, Seq16(98), false),
             "late, and still the old build's"
         );
     }
@@ -241,10 +284,10 @@ mod tests {
     fn an_idr_still_in_flight_is_waited_for() {
         // CodecPrivate outran the IDR: the old configuration never saw frame 50.
         let mut gate = KeyframeGate::new(Seq16(0), 0);
-        gate.admit(Seq16(0), true);
+        feed(&mut gate, Seq16(0), true);
         gate.close(Seq16(50), Some(Seq16(49)), 10_000);
         assert!(!gate.tick(10_000), "the build's own IDR is on its way");
-        assert!(gate.admit(Seq16(50), true), "and it opens the gate");
+        assert!(feed(&mut gate, Seq16(50), true), "and it opens the gate");
         assert!(!gate.tick(20_000));
     }
 
@@ -253,27 +296,68 @@ mod tests {
         // The usual order: the IDR (frame 50) reached the decoder before the
         // CodecPrivate that says it belongs to a different stream.
         let mut gate = KeyframeGate::new(Seq16(0), 0);
-        gate.admit(Seq16(0), true);
+        feed(&mut gate, Seq16(0), true);
         gate.close(Seq16(50), Some(Seq16(52)), 10_000);
         assert!(gate.tick(10_000), "ask now");
         assert!(
-            !gate.admit(Seq16(53), false),
+            !feed(&mut gate, Seq16(53), false),
             "P-frames need references it lacks"
         );
-        assert!(gate.admit(Seq16(60), true), "the requested IDR");
+        assert!(feed(&mut gate, Seq16(60), true), "the requested IDR");
     }
 
     #[test]
     fn the_gate_works_across_the_frame_id_wrap() {
         let mut gate = KeyframeGate::new(Seq16(65_530), 0);
-        assert!(!gate.admit(Seq16(65_529), true));
-        assert!(gate.admit(Seq16(65_535), true));
+        assert!(!feed(&mut gate, Seq16(65_529), true));
+        assert!(feed(&mut gate, Seq16(65_535), true));
         assert!(
-            gate.admit(Seq16(2), false),
+            feed(&mut gate, Seq16(2), false),
             "past the wrap is newer, not older"
         );
         gate.close(Seq16(5), Some(Seq16(3)), 0);
-        assert!(!gate.admit(Seq16(65_535), true), "before the wrap is older");
-        assert!(gate.admit(Seq16(5), true));
+        assert!(
+            !feed(&mut gate, Seq16(65_535), true),
+            "before the wrap is older"
+        );
+        assert!(feed(&mut gate, Seq16(5), true));
+    }
+
+    #[test]
+    fn a_loss_closes_until_the_next_keyframe() {
+        let mut gate = KeyframeGate::new(Seq16(0), 0);
+        assert!(feed(&mut gate, Seq16(0), true));
+        assert!(feed(&mut gate, Seq16(1), false));
+        gate.on_loss(1_000);
+        assert!(
+            !feed(&mut gate, Seq16(3), false),
+            "a P-frame after the gap predicts from the lost one"
+        );
+        assert!(!gate.tick(1_000), "the abandon already asked for the IDR");
+        assert!(
+            gate.tick(1_000 + IDR_RETRY_MS),
+            "ask again if it went missing"
+        );
+        assert!(feed(&mut gate, Seq16(4), true), "the keyframe re-anchors");
+        assert!(feed(&mut gate, Seq16(5), false));
+    }
+
+    #[test]
+    fn a_second_loss_while_closed_keeps_the_first_deadline() {
+        let mut gate = KeyframeGate::new(Seq16(0), 0);
+        feed(&mut gate, Seq16(0), true);
+        gate.on_loss(1_000);
+        gate.on_loss(1_400);
+        assert!(gate.tick(1_000 + IDR_RETRY_MS));
+    }
+
+    #[test]
+    fn a_keyframe_the_decoder_refused_does_not_open_the_gate() {
+        let mut gate = KeyframeGate::new(Seq16(0), 0);
+        assert!(gate.admit(Seq16(0), true), "offered to the decoder");
+        // ...which had no input buffer: not fed, so still closed.
+        assert!(!gate.is_open());
+        assert!(!gate.admit(Seq16(1), false));
+        assert!(gate.tick(IDR_RETRY_MS), "still asking for a keyframe");
     }
 }

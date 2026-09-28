@@ -13,6 +13,10 @@ workspace = true
 sunburst-core.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# setsockopt for the socket buffer sizes (`sockbuf`).
+libc = "0.2.189"
+
 [target.'cfg(windows)'.dependencies]
 # UDP send offload (WSASendMsg + UDP_SEND_MSG_SIZE). Cross-platform code lives
 # in the crate; only the offload sender is Windows-only.
