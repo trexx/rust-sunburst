@@ -17,12 +17,12 @@ log = "0.4.34"
 # The GIP security-handshake crypto, reimplemented in Rust (xow delegates it to a
 # Java `GipCrypto` + mbedtls, which Sunburst has not got). Pure Rust, so it
 # cross-compiles to both Android ABIs and is host-tested against known vectors.
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11.0"
+hmac = "0.13.0"
 rsa = "0.9.10"
-p256 = { version = "0.13", features = ["ecdh"] }
+p256 = { version = "0.14.0", features = ["ecdh"] }
 # `OsRng`, an OS CSPRNG implementing the `rand_core` traits `rsa`/`p256` want.
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = { version = "0.10.1", features = ["getrandom"] }
 
 [features]
 # Turned on once the xow-derived C++ driver + libusb are vendored under `vendor/`
