@@ -128,7 +128,8 @@ pub struct NvFbcCapture {
 
 impl NvFbcCapture {
     /// Open a keyed session, adopt NvFBC's CUDA context, allocate the destination
-    /// buffer, and set up the requested format (ARGB10 for HDR, ARGB8 otherwise).
+    /// buffer, and set up ARGB10 capture. `hdr` asks NvFBC for HDR (PQ) frames:
+    /// set it whenever the desktop is HDR, not only for an HDR session.
     pub fn new(hdr: bool) -> Result<NvFbcCapture, CaptureError> {
         let cuda = Cuda::load().map_err(CaptureError::Backend)?;
         if cuda.init() != CUDA_SUCCESS {
@@ -158,6 +159,16 @@ impl NvFbcCapture {
             return Err(CaptureError::Backend("cuCtxPushCurrent failed".into()));
         }
 
+        // NvFBC has no DXGI output of its own. It grabs the primary desktop, so
+        // the primary's desc is the right source for the mastering metadata
+        // (without it an HDR stream from this path carried no mastering SEI at
+        // all) and for the SDR white an SDR stream tonemaps against.
+        let primary = if hdr {
+            crate::output::output_info(crate::OutputSelect::Primary).ok()
+        } else {
+            None
+        };
+
         let mut cap = NvFbcCapture {
             object: created.object,
             cuda,
@@ -169,17 +180,8 @@ impl NvFbcCapture {
                 hdr,
                 width: 0,
                 height: 0,
-                // NvFBC has no DXGI output of its own. It grabs the primary
-                // desktop, so the primary's desc is the right source, and
-                // without it an HDR stream from this path carried no mastering
-                // SEI at all.
-                hdr_metadata: if hdr {
-                    crate::output::output_info(crate::OutputSelect::Primary)
-                        .ok()
-                        .and_then(|o| o.hdr_metadata)
-                } else {
-                    None
-                },
+                hdr_metadata: primary.and_then(|o| o.hdr_metadata),
+                sdr_white_nits: primary.and_then(|o| o.sdr_white_nits),
             },
         };
 

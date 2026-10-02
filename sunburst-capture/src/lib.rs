@@ -161,6 +161,10 @@ pub struct Caps {
     /// backend could read it — forwarded to the encoder for the mastering-display
     /// / content-light-level SEI/OBU.
     pub hdr_metadata: Option<HdrMetadata>,
+    /// The nits an HDR desktop draws SDR white at (Windows' SDR content
+    /// brightness). An SDR stream from an HDR desktop normalises by it before
+    /// tonemapping. `None` for an SDR desktop or when unreadable.
+    pub sdr_white_nits: Option<f32>,
 }
 
 /// The display's HDR mastering metadata, read from the DXGI output desc. CIE xy

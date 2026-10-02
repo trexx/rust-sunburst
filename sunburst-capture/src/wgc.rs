@@ -95,6 +95,11 @@ impl WgcCapture {
             let (_, dxgi_output) = crate::output::resolve_output(output)?;
             let hmon: HMONITOR = dxgi_output.GetDesc().map_err(backend)?.Monitor;
             let (hdr, hdr_metadata) = crate::output::output_hdr(&dxgi_output);
+            let sdr_white_nits = if hdr {
+                crate::output::sdr_white_nits(&dxgi_output)
+            } else {
+                None
+            };
             let interop: IGraphicsCaptureItemInterop =
                 windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                     .map_err(backend)?;
@@ -155,6 +160,7 @@ impl WgcCapture {
                     width: size.Width.max(0) as u32,
                     height: size.Height.max(0) as u32,
                     hdr_metadata,
+                    sdr_white_nits,
                 },
             })
         }

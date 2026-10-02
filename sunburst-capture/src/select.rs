@@ -50,8 +50,8 @@ pub fn set_dpi_awareness() {
 /// Build the capture backend for this host.
 ///
 /// `nvfbc_opt_in` selects NvFBC (falling through to the OS default if it is
-/// unavailable). `hdr` is a hint the NvFBC path uses to pick ARGB10 vs ARGB8;
-/// DDA and WGC detect HDR from the output themselves.
+/// unavailable). `hdr` is the session's HDR; NvFBC asks for HDR frames when it
+/// or the desktop is HDR. DDA and WGC detect HDR from the output themselves.
 pub fn build(
     nvfbc_opt_in: bool,
     force: Option<Backend>,
@@ -63,7 +63,19 @@ pub fn build(
     if nvfbc_opt_in {
         // NvFBC captures the primary desktop; it does not take an output
         // selector, so a non-primary virtual display is a DDA/WGC path.
-        match NvFbcCapture::new(hdr) {
+        //
+        // Ask for HDR whenever the desktop is HDR, even for an SDR session.
+        // Without the request NvFBC hands back an HDR desktop as SDR codes
+        // already clipped at reference white, and flags the frame SDR, so the
+        // tonemapping kernel never runs. Windows draws SDR content above
+        // reference white on an HDR desktop, so every light tone came out flat
+        // white. With it, frames come back PQ and flagged HDR, and an SDR
+        // session tonemaps them against the desktop's SDR white, as the D3D11
+        // path does.
+        let desktop_hdr = crate::output::output_info(OutputSelect::Primary)
+            .map(|o| o.hdr)
+            .unwrap_or(false);
+        match NvFbcCapture::new(hdr || desktop_hdr) {
             Ok(c) => return Ok(Box::new(c)),
             Err(e) => {
                 eprintln!(
