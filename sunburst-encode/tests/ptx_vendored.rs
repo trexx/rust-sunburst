@@ -25,9 +25,10 @@ const ENTRIES: &[(&str, &str)] = &[
     ("argb_to_nv12.ptx", "argb10_to_p010_709_tonemap"),
 ];
 
-/// `(src, src_pitch_words, dst, dst_pitch_elems, width, height)` — the launch in
-/// `cuda_convert.rs` passes exactly these six.
-const PARAMS: usize = 6;
+/// `(src, src_pitch_words, dst, dst_pitch_elems, width, height, sdr_white_nits,
+/// peak)` — the launch in `cuda_convert.rs` passes exactly these eight, to every
+/// kernel (only the SDR tonemap kernels read the last two).
+const PARAMS: usize = 8;
 
 fn module(file: &str) -> &'static str {
     if file.starts_with("argb10") {

@@ -91,7 +91,7 @@ Homatics ships a 64-bit SoC with a 32-bit userspace — `armeabi-v7a` is require
   reuses the HEVC packetizer (Annex-B NAL), the sequence-header path (SPS/PPS),
   and HEVC's reference-invalidation `Window`. Its one new piece is an **8-bit SDR
   pixel path**: a second convert — an scRGB→NV12 BT.709 HLSL shader and an
-  `argb_to_nv12` CUDA kernel, both with an ACES HDR→SDR tonemap so H.264 works
+  `argb_to_nv12` CUDA kernel, both with an HDR→SDR tonemap so H.264 works
   from an HDR desktop — feeding NVENC NV12 input instead of P010. HEVC/AV1 stay
   10-bit P010 throughout.
 
@@ -483,6 +483,17 @@ Rust's value here is the protocol and state-machine code, not the GPU boundary.
   composition space. That wrong check once made colour correct on HDR desktops
   only. The convert and colorimetry follow the captured state per frame, so an
   HDR↔SDR flip rebuilds the encoder.
+- **An SDR client on an HDR desktop tonemaps against the desktop's SDR white**,
+  not 80 nits. Windows draws SDR content at the user's "SDR content brightness"
+  (`SDRWhiteLevel`, often 200–480 nits), so with 80 nits taken as white, every
+  light tone blew out to flat white. The convert normalises by it
+  (`output::sdr_white_nits`), passes SDR tones through below a knee, and rolls
+  off only what is brighter, up to the display's peak (`ToneParams`). NvFBC must
+  then request HDR whenever the *desktop* is HDR, not only for HDR sessions.
+  Without the request it returns frames flagged SDR and already clipped at
+  reference white. **Leave the server desktop in HDR for an SDR client**: an SDR
+  desktop composites at 8 bits, and the 10-bit SDR encode cannot restore the
+  gradient steps that are already gone.
 
 **AV1 is not a flag on the HEVC path**
 - OBUs, not NAL units. No Annex-B start codes. Packetize on OBU boundaries;

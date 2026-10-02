@@ -17,7 +17,7 @@ use std::ffi::c_void;
 
 use sunburst_capture::cuda::{CUDA_SUCCESS, CuContext, CuDevicePtr, CuFunction, Cuda};
 
-use crate::convert::ConvertOutput;
+use crate::convert::{ConvertOutput, ToneParams};
 
 /// The compiled convert kernels, vendored from CI; see the module docs.
 const KERNEL_PTX_P010: &[u8] = include_bytes!("../cuda/argb10_to_p010.ptx");
@@ -38,6 +38,9 @@ pub struct CudaConverter {
     dst_pitch_elems: i32,
     /// The kernel's name, for the launch-failure message.
     kernel_name: &'static str,
+    /// What the SDR tonemap kernels normalise and roll off against; passed to
+    /// every kernel (the others ignore it) so all share one launch signature.
+    tone: ToneParams,
     width: u32,
     height: u32,
 }
@@ -46,13 +49,15 @@ impl CudaConverter {
     /// Build a converter in NvFBC's CUDA `context`, allocating an `output` buffer
     /// (P010 for HEVC/AV1, NV12 for H.264) for `width`×`height`. `hdr_source`
     /// selects the tonemapping SDR kernel (NV12, or BT.709 P010) for an HDR
-    /// desktop; it is ignored by the PQ P010 kernel.
+    /// desktop, which tonemaps against `tone`; both are ignored by the PQ P010
+    /// kernel.
     pub fn new(
         context: CuContext,
         width: u32,
         height: u32,
         output: ConvertOutput,
         hdr_source: bool,
+        tone: ToneParams,
     ) -> Result<CudaConverter, String> {
         let cuda = Cuda::load().map_err(|e| format!("cuda load: {e}"))?;
         // NvFBC already called cuInit; repeating it is harmless.
@@ -133,6 +138,7 @@ impl CudaConverter {
             pitch_bytes,
             dst_pitch_elems,
             kernel_name,
+            tone,
             width,
             height,
         })
@@ -149,13 +155,17 @@ impl CudaConverter {
         let mut dst_pitch_elems = self.dst_pitch_elems;
         let mut width = self.width as i32;
         let mut height = self.height as i32;
-        let mut params: [*mut c_void; 6] = [
+        let mut sdr_white_nits = self.tone.sdr_white_nits;
+        let mut peak = self.tone.peak;
+        let mut params: [*mut c_void; 8] = [
             std::ptr::addr_of_mut!(src).cast(),
             std::ptr::addr_of_mut!(src_pitch_words).cast(),
             std::ptr::addr_of_mut!(dst).cast(),
             std::ptr::addr_of_mut!(dst_pitch_elems).cast(),
             std::ptr::addr_of_mut!(width).cast(),
             std::ptr::addr_of_mut!(height).cast(),
+            std::ptr::addr_of_mut!(sdr_white_nits).cast(),
+            std::ptr::addr_of_mut!(peak).cast(),
         ];
 
         // One thread per 2×2 block (one chroma sample), 16×16 threads per group.

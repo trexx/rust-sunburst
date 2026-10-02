@@ -33,10 +33,10 @@ use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use sunburst_capture::cuda::{CuContext, CuDevicePtr};
-use sunburst_capture::{CaptureError, Frame, OutputSelect, TextureFormat, select};
+use sunburst_capture::{Caps, CaptureError, Frame, OutputSelect, TextureFormat, select};
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{ColorInfo, HdrMastering, Header, Nack, Seq16};
-use sunburst_encode::convert::{ConvertOutput, Converter};
+use sunburst_encode::convert::{ConvertOutput, Converter, ToneParams};
 use sunburst_encode::cuda_convert::CudaConverter;
 use sunburst_encode::encoder::{Codec, ColorSpace, Encoder, EncoderConfig, PicRequest};
 use sunburst_encode::nvenc::Nvenc;
@@ -692,7 +692,8 @@ fn build_and_convert<'a>(
                 ecfg.width = w;
                 ecfg.height = h;
                 let srgb_input = matches!(tf.format, TextureFormat::Bgra8);
-                let converter = Converter::new(&tf.texture, output, hdr_source, srgb_input)?;
+                let tone = tone_params(capture.caps(), output, hdr_source);
+                let converter = Converter::new(&tf.texture, output, hdr_source, srgb_input, tone)?;
                 let encoder = Encoder::new(nvenc, device.as_raw(), &ecfg)?;
                 *spine = Some(Spine::D3d11 { converter, encoder });
             }
@@ -712,7 +713,8 @@ fn build_and_convert<'a>(
             if first {
                 ecfg.width = w;
                 ecfg.height = h;
-                let converter = CudaConverter::new(ctx, w, h, output, hdr_source)?;
+                let tone = tone_params(capture.caps(), output, hdr_source);
+                let converter = CudaConverter::new(ctx, w, h, output, hdr_source, tone)?;
                 let pitch = converter.pitch();
                 let encoder = Encoder::new_cuda(nvenc, ctx, &ecfg, pitch)?;
                 *spine = Some(Spine::Cuda { converter, encoder });
@@ -724,6 +726,24 @@ fn build_and_convert<'a>(
             Ok((surface as *mut c_void, first.then(|| built(&ecfg))))
         }
     }
+}
+
+/// What an SDR stream from an HDR desktop tonemaps against: the desktop's SDR
+/// white and the display's peak, read at a spine build, never per frame. Says so
+/// when a tonemapping build has to guess the SDR white.
+fn tone_params(caps: Caps, output: ConvertOutput, hdr_source: bool) -> ToneParams {
+    let tonemaps = hdr_source && output != ConvertOutput::P010;
+    if tonemaps && caps.sdr_white_nits.is_none() {
+        eprintln!(
+            "sunburst: the desktop's SDR white level is unreadable; tonemapping \
+             against {} nits",
+            ToneParams::FALLBACK_SDR_WHITE_NITS
+        );
+    }
+    ToneParams::new(
+        caps.sdr_white_nits,
+        caps.hdr_metadata.map(|m| m.max_luminance),
+    )
 }
 
 /// What an encoder built from `ecfg` produces.
