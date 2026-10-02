@@ -154,6 +154,22 @@ jobs:
           sudo apt-get update && sudo apt-get install -y cabextract
           scripts/fetch-firmware.sh
 
+      # Sign with the project's stable debug key, so each published APK installs
+      # over the last instead of needing an uninstall (which wipes the pairing).
+      # Fork PRs get no secrets and fall back to a throwaway key, as before.
+      - name: Install the stable debug signing key
+        env:
+          SUNBURST_DEBUG_KEYSTORE_B64: ${{ secrets.SUNBURST_DEBUG_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SUNBURST_DEBUG_KEYSTORE_B64:-}" ]; then
+            ks="$RUNNER_TEMP/sunburst-debug.keystore"
+            echo "$SUNBURST_DEBUG_KEYSTORE_B64" | base64 -d > "$ks"
+            echo "SUNBURST_DEBUG_KEYSTORE=$ks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::no SUNBURST_DEBUG_KEYSTORE_B64 secret: this APK gets a throwaway key and will not install over another build"
+          fi
+
       - name: Gradle build and unit tests
         # The Gradle wrapper fetches its own JDK via the toolchain resolver, and
         # `ndkVersion` in app/build.gradle installs the pinned NDK if the

@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+// One stable debug key, so every build installs over the last. Without it each
+// CI runner signs with a fresh throwaway key, and moving the box to a new build
+// means an uninstall, which wipes the pairing. CI decodes the key from the
+// SUNBURST_DEBUG_KEYSTORE_B64 secret into SUNBURST_DEBUG_KEYSTORE; a dev
+// machine keeps it beside the SDK's own debug.keystore. Where neither exists
+// (a fork PR, a fresh checkout) AGP's default debug key applies, as before.
+def stableDebugKeystore = file(System.getenv('SUNBURST_DEBUG_KEYSTORE')
+        ?: "${System.getProperty('user.home')}/.android/sunburst-debug.keystore")
+
 android {
     namespace 'com.trexx.sunburst'
     // CLAUDE.md pins these. targetSdk is deliberately behind compileSdk.
@@ -24,7 +33,23 @@ android {
         }
     }
 
+    signingConfigs {
+        if (stableDebugKeystore.exists()) {
+            sunburstDebug {
+                storeFile stableDebugKeystore
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (stableDebugKeystore.exists()) {
+                signingConfig signingConfigs.sunburstDebug
+            }
+        }
         release {
             minifyEnabled false
         }
