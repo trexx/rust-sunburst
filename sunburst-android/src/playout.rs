@@ -17,7 +17,17 @@
 //! a frame. The producer trims only past the cushion plus another peak gap plus
 //! a few frames, so a normal post-gap burst fits and only sustained clock drift
 //! is trimmed. An underrun anyway (a gap past anything seen yet) raises the peak
-//! by a frame. All sizes are interleaved samples, as the ring counts them.
+//! by a frame.
+//!
+//! That cushion is what playback *waits* for. Once running, the ring tends to
+//! settle above it: on the Homatics every callback found at least ~32 ms
+//! buffered against an 8 ms pull, ~24 ms that no gap ever used. Nothing pulled
+//! it back down, since the trim only catches bursts. So the callback also
+//! reports the lowest level it saw, and once the lowest over the last
+//! [`MARGIN_WINDOWS`] windows still sits above the cushion, that surplus is
+//! drained by slipping one sample frame from every other packet: a 0.4% speed-up
+//! (about 7 cents), too small to hear, removing ~4 ms a second. All sizes are
+//! interleaved samples, as the ring counts them.
 
 /// Per-arrival decay of the peak gap: ~5% a second at 400 packets/s, so a
 /// burst of jitter is forgotten over tens of seconds, not instantly.
@@ -30,24 +40,46 @@ const SLACK_FRAMES: usize = 1;
 const MAX_PEAK_FRAMES: usize = 24;
 /// Frames past cushion + peak before the producer drops a decoded frame.
 const TRIM_SLACK_FRAMES: usize = 4;
+/// How many margin windows (2 s each, in `audio.rs`) the lowest level must
+/// stay high across before any of it is drained: long enough to have seen the
+/// link's worse gaps, short enough to act within seconds.
+pub const MARGIN_WINDOWS: usize = 5;
 
 /// The producer side: the measured jitter, and the cushion and trim from it.
 #[derive(Debug)]
 pub struct Cushion {
     burst: usize,
     frame: usize,
+    /// Samples in one sample frame (the channel count): the unit a slip drops.
+    channels: usize,
     /// Peak gap between arrivals, in samples of playback it covers.
     peak: f32,
+    /// The lowest level the callback saw in each recent window.
+    margins: [usize; MARGIN_WINDOWS],
+    /// How many entries of `margins` are real since the last reset.
+    margins_seen: usize,
+    next_margin: usize,
+    /// Standing surplus still to drain, in samples.
+    drain: usize,
+    /// Slip on alternate packets only.
+    slip_due: bool,
 }
 
 impl Cushion {
     /// `burst` is AAudio's callback size and `frame` one decoded packet, both
     /// in interleaved samples.
-    pub fn new(burst: usize, frame: usize) -> Cushion {
+    /// `channels` is the samples per sample frame.
+    pub fn new(burst: usize, frame: usize, channels: usize) -> Cushion {
         Cushion {
             burst,
             frame,
+            channels: channels.max(1),
             peak: frame as f32,
+            margins: [0; MARGIN_WINDOWS],
+            margins_seen: 0,
+            next_margin: 0,
+            drain: 0,
+            slip_due: false,
         }
     }
 
@@ -57,10 +89,41 @@ impl Cushion {
         self.clamp();
     }
 
-    /// The ring ran dry anyway: the link has more jitter than measured.
+    /// The ring ran dry anyway: the link has more jitter than measured. Stop
+    /// draining, and forget the margins that suggested it was safe.
     pub fn on_underrun(&mut self) {
         self.peak += self.frame as f32;
         self.clamp();
+        self.drain = 0;
+        self.margins_seen = 0;
+    }
+
+    /// One window ended; the callback's lowest level in it was `lowest`. Once
+    /// [`MARGIN_WINDOWS`] windows all stayed above the cushion by more than a
+    /// frame, drain the smallest of those surpluses.
+    pub fn on_margin(&mut self, lowest: usize) {
+        self.margins[self.next_margin] = lowest;
+        self.next_margin = (self.next_margin + 1) % MARGIN_WINDOWS;
+        self.margins_seen = (self.margins_seen + 1).min(MARGIN_WINDOWS);
+        if self.margins_seen < MARGIN_WINDOWS {
+            return;
+        }
+        let floor = self.margins.iter().copied().min().unwrap_or(0);
+        let surplus = floor.saturating_sub(self.target());
+        self.drain = if surplus > self.frame { surplus } else { 0 };
+    }
+
+    /// For one decoded packet about to be queued: whether to drop one sample
+    /// frame from it to drain standing surplus.
+    pub fn slip(&mut self) -> bool {
+        if self.drain < self.channels {
+            return false;
+        }
+        self.slip_due = !self.slip_due;
+        if self.slip_due {
+            self.drain -= self.channels;
+        }
+        self.slip_due
     }
 
     fn clamp(&mut self) {
@@ -116,7 +179,7 @@ mod tests {
 
     #[test]
     fn a_steady_link_keeps_a_small_cushion() {
-        let mut c = Cushion::new(BURST, FRAME);
+        let mut c = Cushion::new(BURST, FRAME, 2);
         for _ in 0..1000 {
             c.on_arrival(FRAME);
         }
@@ -125,7 +188,7 @@ mod tests {
 
     #[test]
     fn the_cushion_covers_the_worst_gap_seen() {
-        let mut c = Cushion::new(BURST, FRAME);
+        let mut c = Cushion::new(BURST, FRAME, 2);
         c.on_arrival(GAP_24MS);
         // After the burst a callback pulls, the ring still holds the gap.
         assert!(c.target() - BURST >= GAP_24MS);
@@ -133,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_post_gap_burst_fits_under_the_trim() {
-        let mut c = Cushion::new(BURST, FRAME);
+        let mut c = Cushion::new(BURST, FRAME, 2);
         c.on_arrival(GAP_24MS);
         // The gap's worth arrives at once on top of a full cushion.
         assert!(c.target() + GAP_24MS <= c.trim_above());
@@ -141,7 +204,7 @@ mod tests {
 
     #[test]
     fn the_peak_decays_after_a_bad_patch() {
-        let mut c = Cushion::new(BURST, FRAME);
+        let mut c = Cushion::new(BURST, FRAME, 2);
         c.on_arrival(GAP_24MS);
         let high = c.target();
         // A minute of steady 400 packets/s.
@@ -154,7 +217,7 @@ mod tests {
 
     #[test]
     fn an_underrun_raises_the_peak_and_it_is_capped() {
-        let mut c = Cushion::new(BURST, FRAME);
+        let mut c = Cushion::new(BURST, FRAME, 2);
         let before = c.target();
         c.on_underrun();
         assert_eq!(c.target(), before + FRAME);
@@ -162,6 +225,63 @@ mod tests {
             c.on_underrun();
         }
         assert_eq!(c.target(), BURST + MAX_PEAK_FRAMES * FRAME + FRAME);
+    }
+
+    /// Feed `windows` margin windows whose lowest level was `lowest`.
+    fn margins(c: &mut Cushion, lowest: usize, windows: usize) {
+        for _ in 0..windows {
+            c.on_margin(lowest);
+        }
+    }
+
+    /// How many sample frames `packets` packets would slip.
+    fn slips(c: &mut Cushion, packets: usize) -> usize {
+        (0..packets).filter(|_| c.slip()).count()
+    }
+
+    #[test]
+    fn a_standing_surplus_is_drained_on_alternate_packets() {
+        let mut c = Cushion::new(BURST, FRAME, 2);
+        let t = c.target();
+        let surplus = 10 * FRAME;
+        margins(&mut c, t + surplus, MARGIN_WINDOWS);
+        // One sample frame (2 samples) on every other packet, until it is gone.
+        assert_eq!(slips(&mut c, 4), 2);
+        assert_eq!(slips(&mut c, 10_000), surplus / 2 - 2);
+        assert_eq!(slips(&mut c, 10), 0, "drained");
+    }
+
+    #[test]
+    fn nothing_drains_until_every_window_agrees() {
+        let mut c = Cushion::new(BURST, FRAME, 2);
+        let t = c.target();
+        margins(&mut c, t + 10 * FRAME, MARGIN_WINDOWS - 1);
+        assert_eq!(slips(&mut c, 100), 0, "not enough windows yet");
+        // One low window among high ones caps the drain at its surplus.
+        let mut c = Cushion::new(BURST, FRAME, 2);
+        let t = c.target();
+        margins(&mut c, t + 10 * FRAME, MARGIN_WINDOWS - 1);
+        c.on_margin(t + 2 * FRAME);
+        assert_eq!(slips(&mut c, 10_000), 2 * FRAME / 2);
+    }
+
+    #[test]
+    fn a_surplus_within_a_frame_is_left_alone() {
+        let mut c = Cushion::new(BURST, FRAME, 2);
+        let t = c.target();
+        margins(&mut c, t + FRAME, MARGIN_WINDOWS);
+        assert_eq!(slips(&mut c, 100), 0);
+    }
+
+    #[test]
+    fn an_underrun_stops_the_drain_and_restarts_the_count() {
+        let mut c = Cushion::new(BURST, FRAME, 2);
+        let t = c.target();
+        margins(&mut c, t + 10 * FRAME, MARGIN_WINDOWS);
+        c.on_underrun();
+        assert_eq!(slips(&mut c, 100), 0);
+        margins(&mut c, t + 10 * FRAME, MARGIN_WINDOWS - 1);
+        assert_eq!(slips(&mut c, 100), 0, "needs a full set of windows again");
     }
 
     #[test]

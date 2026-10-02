@@ -6,12 +6,14 @@
 //! The client thread puts each audio packet back in order ([`crate::plc`]),
 //! decodes it with [`OpusDecoder`] and pushes the PCM into a lock-free
 //! [`crate::audio_ring`]; AAudio's real-time data callback pops it. The stream is
-//! opened `LowLatency` at 48 kHz stereo i16, with AAudio's own buffer cut to two
-//! bursts: the ring is the jitter buffer.
+//! opened `LowLatency` at 48 kHz stereo i16, with AAudio's own buffer cut to one
+//! burst and raised a burst per underrun it reports: the ring is the jitter
+//! buffer.
 //!
 //! The ring plays only once it holds a cushion ([`crate::playout`]): a burst
 //! plus the peak gap between packet arrivals (decaying slowly) plus a frame,
-//! refilled after an underrun, which also raises the peak.
+//! refilled after an underrun, which also raises the peak. Standing surplus
+//! above it is drained by slipping a sample frame from alternate packets.
 //!
 //! A/V sync, without a resampler: audio and video are stamped in the same server
 //! clock domain, and both play out on the client's `CLOCK_MONOTONIC` timeline.
@@ -42,6 +44,13 @@ use crate::mic::MicFramer;
 use crate::playout::{Cushion, Gate};
 use crate::plc::{AudioReorder, Event};
 
+/// How often the callback's lowest level is folded into the cushion, and
+/// AAudio's underrun count checked.
+const MARGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most bursts AAudio's buffer is raised to on underruns.
+const MAX_AAUDIO_BURSTS: i32 = 4;
+
 /// Largest Opus frame we might decode (120 ms at 48 kHz), per channel — the
 /// scratch is sized for it even though the server sends 5 ms frames.
 const MAX_FRAME_SAMPLES: usize = 5760;
@@ -50,7 +59,7 @@ const MAX_FRAME_SAMPLES: usize = 5760;
 pub struct AudioPlayer {
     // Dropped first: closing the stream stops the callback (and drops the
     // consumer it holds) before the producer goes away.
-    _stream: AudioStream,
+    stream: AudioStream,
     producer: PcmProducer,
     decoder: OpusDecoder,
     scratch: Vec<i16>,
@@ -70,6 +79,14 @@ pub struct AudioPlayer {
     underruns_seen: u32,
     /// When the previous packet arrived, for the gap to this one.
     last_arrival: Option<Instant>,
+    /// The lowest level the callback has seen since the window began, and
+    /// when the window began: the margin the cushion drains standing surplus by.
+    lowest: Arc<AtomicUsize>,
+    window_start: Instant,
+    /// AAudio's own buffer, in bursts, raised whenever it reports an underrun.
+    aaudio_bursts: i32,
+    burst_frames: i32,
+    xruns_seen: i32,
     /// Interleaved samples of playback per second, to turn a gap into samples.
     samples_per_sec: f64,
     /// Whether decoded audio plays on the TV (the AAudio stream). Off when the
@@ -102,6 +119,8 @@ impl AudioPlayer {
         let underruns = Arc::new(AtomicU32::new(0));
         let callback_underruns = Arc::clone(&underruns);
         let mut gate = Gate::default();
+        let lowest = Arc::new(AtomicUsize::new(usize::MAX));
+        let callback_lowest = Arc::clone(&lowest);
 
         let stream = AudioStreamBuilder::new()
             .map_err(|e| format!("AAudio unavailable: {e}"))?
@@ -119,6 +138,7 @@ impl AudioPlayer {
                 };
                 let mut got = 0;
                 let target = callback_target.load(Ordering::Relaxed);
+                callback_lowest.fetch_min(consumer.available(), Ordering::Relaxed);
                 if gate.should_play(consumer.available(), target) {
                     got = consumer.pop(out);
                     if got < out.len() {
@@ -136,9 +156,11 @@ impl AudioPlayer {
 
         // AAudio's own buffer defaults far deeper than the ring needs (72 ms
         // was seen queued in it on the Homatics). The ring is the jitter
-        // buffer; AAudio only needs enough to ride out a late callback.
+        // buffer; AAudio only needs enough to ride out a late callback. Start
+        // at one burst and add one per underrun AAudio reports (Oboe's
+        // latency tuning), up to MAX_AAUDIO_BURSTS.
         let burst = stream.frames_per_burst();
-        let _ = stream.set_buffer_size_in_frames(burst * 2);
+        let _ = stream.set_buffer_size_in_frames(burst);
         log::info!(
             "audio: burst {burst} frames, AAudio buffer {} of {} frames",
             stream.buffer_size_in_frames(),
@@ -146,7 +168,7 @@ impl AudioPlayer {
         );
 
         // The callback's size is what the cushion must cover beyond the jitter.
-        let jitter = Cushion::new(burst.max(1) as usize * ch, frame);
+        let jitter = Cushion::new(burst.max(1) as usize * ch, frame, ch);
         target.store(jitter.target(), Ordering::Relaxed);
 
         stream
@@ -157,7 +179,7 @@ impl AudioPlayer {
             OpusDecoder::new(sample_rate, channels).map_err(|e| format!("Opus decoder: {e}"))?;
 
         Ok(AudioPlayer {
-            _stream: stream,
+            stream,
             producer,
             decoder,
             scratch: vec![0i16; MAX_FRAME_SAMPLES * ch],
@@ -169,6 +191,11 @@ impl AudioPlayer {
             underruns,
             underruns_seen: 0,
             last_arrival: None,
+            lowest,
+            window_start: Instant::now(),
+            aaudio_bursts: 1,
+            burst_frames: burst,
+            xruns_seen: 0,
             samples_per_sec: f64::from(sample_rate) * ch as f64,
             route_tv,
         })
@@ -193,6 +220,12 @@ impl AudioPlayer {
             last_arrival,
             samples_per_sec,
             route_tv,
+            stream,
+            lowest,
+            window_start,
+            aaudio_bursts,
+            burst_frames,
+            xruns_seen,
             ..
         } = self;
         // Size the cushion from this packet's gap and any underruns since.
@@ -205,6 +238,19 @@ impl AudioPlayer {
             jitter.on_underrun();
         }
         *underruns_seen = seen;
+        if now - *window_start >= MARGIN_WINDOW {
+            *window_start = now;
+            let low = lowest.swap(usize::MAX, Ordering::Relaxed);
+            if low != usize::MAX {
+                jitter.on_margin(low);
+            }
+            let xruns = stream.x_run_count();
+            if xruns > *xruns_seen && *aaudio_bursts < MAX_AAUDIO_BURSTS {
+                *aaudio_bursts += 1;
+                let _ = stream.set_buffer_size_in_frames(*burst_frames * *aaudio_bursts);
+            }
+            *xruns_seen = xruns;
+        }
         target.store(jitter.target(), Ordering::Relaxed);
         let trim = jitter.trim_above();
         reorder.push(Seq16(id as u16), payload, |event| {
@@ -223,7 +269,13 @@ impl AudioPlayer {
             };
             let pcm = &scratch[..samples * *channels];
             if *route_tv && producer.available() <= trim {
-                producer.push(pcm);
+                // Draining standing surplus: one sample frame shorter.
+                let keep = if pcm.len() > *channels && jitter.slip() {
+                    pcm.len() - *channels
+                } else {
+                    pcm.len()
+                };
+                producer.push(&pcm[..keep]);
                 instr::record(Stage::AudioPlay, played);
             }
             fork(pcm);
