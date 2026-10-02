@@ -13,14 +13,20 @@ on:
     branches: [main]
   pull_request:
 
+# RUSTFLAGS is set per job, not here: Cargo takes extra flags from exactly one
+# source, and RUSTFLAGS beats `.cargo/config.toml`'s per-target rustflags. Set
+# workflow-wide it would strip the target-CPU flags (NEON on armv7, AVX2 on the
+# server) from the artifacts the boxes run. The lint/test jobs set it; the
+# artifact jobs (package, android) leave the config's flags in force.
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   linux:
     name: Linux (tests, clippy, fmt)
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -33,6 +39,8 @@ jobs:
   windows:
     name: Windows (real MSVC build)
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -117,9 +125,10 @@ jobs:
 
       # Host clippy only sees the crate's empty (non-Android) shell, so lint the
       # real Android target here — the same reasoning as `cargo xwin clippy` for
-      # the Windows-only crates. RUSTFLAGS=-D warnings makes it enforcing.
+      # the Windows-only crates. `-D warnings` is passed here rather than through
+      # RUSTFLAGS, which would override the per-ABI CPU flags (see `env:` above).
       - name: Clippy the Android client
-        run: cargo clippy -p sunburst-android --all-targets --target aarch64-linux-android
+        run: cargo clippy -p sunburst-android --all-targets --target aarch64-linux-android -- -D warnings
 
       # armeabi-v7a is not optional: the Homatics ships a 32-bit userspace on a
       # 64-bit SoC, so dropping it drops half the supported hardware.
