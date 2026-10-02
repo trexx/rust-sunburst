@@ -22,11 +22,19 @@ const FRAME_SLOTS: usize = 256;
 /// eight-second rolling window.
 const WINDOW_INTERVALS: usize = 8;
 
+const _: () = assert!(
+    STAGE_COUNT <= u32::BITS as usize,
+    "FrameSlot::present needs a bit per stage"
+);
+
 /// Timings for one frame, in flight.
 struct FrameSlot {
     frame_id: u32,
-    /// Bit per stage, so "have I seen this one" costs no sentinel value.
-    present: u16,
+    /// Bit per stage, so "have I seen this one" costs no sentinel value. Wide
+    /// enough for every stage: as a `u16` it held only sixteen, and the
+    /// seventeenth (`AudioPlay`) shifted past it, panicking in a debug build
+    /// and, in release, aliasing stage 0's bit.
+    present: u32,
     in_use: bool,
     ticks: [u64; STAGE_COUNT],
 }
@@ -383,6 +391,23 @@ mod tests {
     /// their expected value and tolerance through this so they hold on both.
     fn dur_ns(n: u64) -> u64 {
         clock::ticks_to_ns(n)
+    }
+
+    #[test]
+    fn the_last_stage_pairs_without_touching_the_first() {
+        // AudioPlay is the highest stage. Its bit once shifted out of a u16
+        // mask: a debug build panicked, a release one set stage 0's bit.
+        let mut c = Collector::new();
+        feed(&mut c, Stage::AudioRecv, 9, ns(1_000));
+        feed(&mut c, Stage::AudioDecode, 9, ns(3_000));
+        feed(&mut c, Stage::AudioPlay, 9, ns(3_500));
+        let r = c.report();
+        let play = r.stage(Stage::AudioPlay).expect("AudioPlay missing");
+        assert_eq!(play.count, 1);
+        assert_eq!(play.p50_ns, dur_ns(500));
+        // Stage 1's pair partner (stage 0) must not look present.
+        feed(&mut c, Stage::ColorConvert, 9, ns(4_000));
+        assert!(c.report().stage(Stage::ColorConvert).is_none());
     }
 
     #[test]

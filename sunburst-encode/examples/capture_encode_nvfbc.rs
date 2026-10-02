@@ -56,6 +56,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 h,
                 ConvertOutput::P010,
                 false,
+                // The PQ P010 kernel does not tonemap.
+                sunburst_encode::convert::ToneParams::new(None, None),
             )?),
         };
         let p010 = conv.convert(cf.device_ptr, cf.pitch as u32)?;

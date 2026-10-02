@@ -66,6 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output,
                 hdr.is_some(),
                 matches!(tf.format, sunburst_capture::TextureFormat::Bgra8),
+                // What NV12 from an HDR desktop tonemaps against.
+                sunburst_encode::convert::ToneParams::new(
+                    capture.caps().sdr_white_nits,
+                    capture.caps().hdr_metadata.map(|m| m.max_luminance),
+                ),
             )?),
         };
         let p010 = conv.convert(&tf.texture, w, h)?;

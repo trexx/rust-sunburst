@@ -64,6 +64,11 @@ impl DdaCapture {
             let r = d.DesktopCoordinates;
             let (width, height) = ((r.right - r.left) as u32, (r.bottom - r.top) as u32);
             let (hdr, hdr_metadata) = crate::output::output_hdr(&output);
+            let sdr_white_nits = if hdr {
+                crate::output::sdr_white_nits(&output)
+            } else {
+                None
+            };
 
             let mut device: Option<ID3D11Device> = None;
             D3D11CreateDevice(
@@ -105,6 +110,7 @@ impl DdaCapture {
                     width,
                     height,
                     hdr_metadata,
+                    sdr_white_nits,
                 },
                 format,
                 holding: false,

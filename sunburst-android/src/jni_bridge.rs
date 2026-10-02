@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::client::{Callbacks, StreamPrefs};
 use jni::EnvUnowned;
@@ -21,6 +22,7 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong};
 use ndk::native_window::NativeWindow;
+use sunburst_core::instr;
 use sunburst_core::proto::StreamCodec;
 
 use crate::client;
@@ -61,7 +63,45 @@ fn init_logging() {
                 .with_max_level(log::LevelFilter::Info)
                 .with_tag("sunburst"),
         );
+        // A panic on any thread but the JNI caller's prints to stderr, which
+        // Android discards: a worker thread just vanished without a word. Route
+        // the message, and where it was raised, to logcat first.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            log::error!("panic on {}: {info}", thread.name().unwrap_or("unnamed"));
+            default_hook(info);
+        }));
+        start_instr_reports();
     });
+}
+
+/// How often the client logs its instrumentation report. The drain's window is
+/// eight of these, so a report covers the last 80 s.
+const INSTR_REPORT_EVERY: Duration = Duration::from_secs(10);
+
+/// Drain the client's instrumentation rings and log the report, so the client's
+/// stage p99s (recv, jitter, decode, present, audio) can be read at all; they
+/// were recorded but never drained. A low-priority thread, never the frame path.
+/// The log is `write_report`'s text after an `instr report` line, so
+/// `adb logcat -v raw -s sunburst` feeds `sunburst-instr diff` directly. Once per
+/// process: the rings are process-wide.
+fn start_instr_reports() {
+    let spawned = std::thread::Builder::new()
+        .name("sunburst-instr-log".into())
+        .spawn(|| {
+            let drain = instr::spawn(Duration::from_millis(100), INSTR_REPORT_EVERY);
+            loop {
+                std::thread::sleep(INSTR_REPORT_EVERY);
+                // Nothing streamed in the window: nothing to say.
+                if let Some(report) = drain.report().filter(|r| !r.stages.is_empty()) {
+                    log::info!("instr report\n{}", instr::format::write_report(&report));
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("instrumentation report thread failed to start: {e}");
+    }
 }
 
 /// Parse a 64-character hex pairing secret into 32 bytes.

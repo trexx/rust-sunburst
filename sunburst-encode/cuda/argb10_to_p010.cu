@@ -41,9 +41,13 @@ __device__ __forceinline__ uint16_t p010(float code10) {
 }
 
 // src_pitch_words / dst_pitch_elems are strides in elements (u32 / u16).
+// `sdr_white_nits` and `peak` are unused here: every convert kernel takes the
+// same eight parameters so cuda_convert.rs launches them all one way. Only the
+// SDR tonemap kernels (argb_to_nv12.cu) read them.
 extern "C" __global__ void argb10_to_p010(const uint32_t* src, int src_pitch_words,
                                           uint16_t* dst, int dst_pitch_elems,
-                                          int width, int height) {
+                                          int width, int height,
+                                          float sdr_white_nits, float peak) {
     int bx = blockIdx.x * blockDim.x + threadIdx.x; // chroma column
     int by = blockIdx.y * blockDim.y + threadIdx.y; // chroma row
     int x = bx * 2, y = by * 2;

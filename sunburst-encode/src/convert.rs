@@ -17,6 +17,8 @@
 //! on D3D11 plane-view support that varies by driver — it is verified on the 4070,
 //! not here (this host has no GPU).
 
+use std::ffi::CString;
+
 use windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
 use windows::Win32::Graphics::Direct3D11::{
@@ -96,19 +98,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
 /// The BT.709 SDR compute shader. Same 2×2 structure as the P010 shader, Rec.709.
 /// `TEN_BIT` selects 10-bit P010 output (SDR HEVC/AV1) vs 8-bit NV12 (H.264).
-/// `TONEMAP` (an HDR-range source) rolls HDR off to SDR with an ACES curve, else it
-/// clamps an already-SDR source. `SRGB_INPUT` decodes an 8-bit gamma desktop (DDA
-/// in SDR) to linear; without it the input is scRGB FP16 (already linear).
+/// `TONEMAP` (an HDR desktop) normalises by the desktop's SDR white
+/// (`SDR_WHITE_NITS`) and rolls anything brighter off with a shoulder that lands
+/// the display's peak (`PEAK`, in SDR-white units) on 1.0; else it clamps an
+/// already-SDR source. `SRGB_INPUT` decodes an 8-bit gamma desktop (DDA in SDR) to
+/// linear; without it the input is scRGB FP16 (already linear).
 const SDR_SHADER_HLSL: &[u8] = br#"
 Texture2D<float4>   src   : register(t0);   // scRGB linear FP16 (1.0 == 80 nits)
 RWTexture2D<float>  dstY  : register(u0);   // NV12 luma plane (R8)
 RWTexture2D<float2> dstUV : register(u1);   // NV12 chroma plane (R8G8, half res)
 
-// ACES filmic (Narkowicz): roll HDR-range linear light off into [0, 1].
-float3 aces(float3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+#ifdef TONEMAP
+// An HDR desktop draws SDR content at its SDR white (SDR_WHITE_NITS, often
+// 200-480 nits), not at scRGB 1.0's 80. Normalised so that is 1.0, SDR content
+// passes through untouched below KNEE; above it, extended Reinhard on the excess
+// rolls highlights off, continuous in slope, landing PEAK on exactly 1.0.
+static const float KNEE = 0.8;
+float shoulder1(float x) {
+    if (x <= KNEE || PEAK <= 1.0) return saturate(x);
+    float w = (PEAK - KNEE) / (1.0 - KNEE);
+    float v = (x - KNEE) / (1.0 - KNEE);
+    return saturate(KNEE + (1.0 - KNEE) * v * (1.0 + v / (w * w)) / (1.0 + v));
 }
+float3 shoulder(float3 x) { return float3(shoulder1(x.r), shoulder1(x.g), shoulder1(x.b)); }
+#endif
 
 // Rec.709 opto-electronic transfer (gamma), the SDR video convention.
 float bt709_oetf(float c) {
@@ -130,9 +143,9 @@ float3 decode_input(float3 c) { return c; }   // scRGB FP16 is already linear
 #endif
 
 float3 to_display(float3 rgb) {
-    float3 lin = decode_input(max(rgb, 0.0));   // linear, 1.0 == 80 nits (SDR white)
+    float3 lin = decode_input(max(rgb, 0.0));   // linear, 1.0 == 80 nits
 #ifdef TONEMAP
-    lin = aces(lin);              // HDR source: compress to SDR range
+    lin = shoulder(lin * (80.0 / SDR_WHITE_NITS));   // HDR desktop: SDR white -> 1.0
 #else
     lin = saturate(lin);          // SDR source: clamp
 #endif
@@ -177,6 +190,35 @@ void main(uint3 tid : SV_DispatchThreadID) {
     dstUV[tid.xy] = float2(pack(cb), pack(cr));
 }
 "#;
+
+/// What an SDR stream tonemaps an HDR desktop against: the nits the desktop draws
+/// SDR white at, and the display's peak in units of that white. Read once per
+/// converter build from the capture's caps, never per frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ToneParams {
+    pub sdr_white_nits: f32,
+    /// Peak / SDR white; at or below 1.0 the shoulder just clamps.
+    pub peak: f32,
+}
+
+impl ToneParams {
+    /// BT.2408 reference white, for a desktop whose SDR white level is unreadable.
+    pub const FALLBACK_SDR_WHITE_NITS: f32 = 203.0;
+    /// A typical HDR monitor's peak, when the output reports none.
+    pub const FALLBACK_PEAK_NITS: f32 = 1000.0;
+
+    /// From the capture's SDR white and the display's peak, both in nits; a
+    /// missing or nonsensical value takes its fallback.
+    pub fn new(sdr_white_nits: Option<f32>, peak_nits: Option<f32>) -> ToneParams {
+        let sane = |v: Option<f32>| v.filter(|n| n.is_finite() && *n > 0.0);
+        let white = sane(sdr_white_nits).unwrap_or(Self::FALLBACK_SDR_WHITE_NITS);
+        let peak = sane(peak_nits).unwrap_or(Self::FALLBACK_PEAK_NITS);
+        ToneParams {
+            sdr_white_nits: white,
+            peak: peak / white,
+        }
+    }
+}
 
 /// The output pixel format the converter produces: 10-bit P010 (BT.2020 PQ, for
 /// HEVC/AV1) or 8-bit NV12 (BT.709 SDR, for H.264).
@@ -239,6 +281,7 @@ impl Converter {
         output: ConvertOutput,
         hdr_source: bool,
         srgb_input: bool,
+        tone: ToneParams,
     ) -> Result<Converter, String> {
         // SAFETY: `like` is a live texture; GetDevice/GetImmediateContext hand
         // back refcounted interfaces `windows` releases.
@@ -250,11 +293,11 @@ impl Converter {
         let (src, tonemap, ten_bit) = match output {
             ConvertOutput::P010 => (SHADER_HLSL, false, false),
             // 10-bit BT.709 P010. From an HDR desktop (an SDR session on a desktop
-            // left in HDR), roll it off with the same ACES tonemap as NV12.
+            // left in HDR), tonemap it against its SDR white, as NV12 does.
             ConvertOutput::P010Sdr => (SDR_SHADER_HLSL, hdr_source, true),
             ConvertOutput::Nv12 => (SDR_SHADER_HLSL, hdr_source, false),
         };
-        let bytecode = compile(src, tonemap, ten_bit, srgb_input)?;
+        let bytecode = compile(src, tonemap.then_some(tone), ten_bit, srgb_input)?;
         let mut shader = None;
         // SAFETY: `bytecode` is valid DXBC from D3DCompile; out-param is written.
         unsafe { device.CreateComputeShader(&bytecode, None, Some(&mut shader)) }
@@ -446,17 +489,36 @@ impl Converter {
     }
 }
 
-/// Runtime-compile `src` to DXBC. `tonemap` defines `TONEMAP` for the SDR shader
-/// (HDR→SDR roll-off); it is inert in the P010 shader.
-fn compile(src: &[u8], tonemap: bool, ten_bit: bool, srgb_input: bool) -> Result<Vec<u8>, String> {
+/// Runtime-compile `src` to DXBC. `tonemap` defines `TONEMAP`, `SDR_WHITE_NITS`
+/// and `PEAK` for the SDR shader (HDR→SDR roll-off); it is inert in the P010
+/// shader.
+fn compile(
+    src: &[u8],
+    tonemap: Option<ToneParams>,
+    ten_bit: bool,
+    srgb_input: bool,
+) -> Result<Vec<u8>, String> {
     let mut code = None;
     let mut errors = None;
+    // The float definitions, owned here so they outlive the D3DCompile call.
+    let tone = tonemap.map(|t| {
+        let text = |v: f32| CString::new(format!("{v:.4}")).expect("no NUL in a float");
+        (text(t.sdr_white_nits), text(t.peak))
+    });
     // A `{name, definition}` list terminated by `{null, null}`, per D3DCompile.
     let mut defines: Vec<D3D_SHADER_MACRO> = Vec::new();
-    if tonemap {
+    if let Some((white, peak)) = &tone {
         defines.push(D3D_SHADER_MACRO {
             Name: s!("TONEMAP"),
             Definition: s!("1"),
+        });
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("SDR_WHITE_NITS"),
+            Definition: PCSTR::from_raw(white.as_ptr().cast()),
+        });
+        defines.push(D3D_SHADER_MACRO {
+            Name: s!("PEAK"),
+            Definition: PCSTR::from_raw(peak.as_ptr().cast()),
         });
     }
     if ten_bit {
@@ -524,4 +586,74 @@ fn compile(src: &[u8], tonemap: bool, ten_bit: bool, srgb_input: bool) -> Result
 /// A `windows` error → a `String` context.
 fn err(what: &'static str) -> impl Fn(windows::core::Error) -> String {
     move |e| format!("{what}: {e}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToneParams;
+
+    /// The shoulder `SDR_SHADER_HLSL` and `argb_to_nv12.cu` both implement,
+    /// transcribed so its shape is pinned down once.
+    fn shoulder(x: f32, peak: f32) -> f32 {
+        const KNEE: f32 = 0.8;
+        if x <= KNEE || peak <= 1.0 {
+            return x.clamp(0.0, 1.0);
+        }
+        let w = (peak - KNEE) / (1.0 - KNEE);
+        let v = (x - KNEE) / (1.0 - KNEE);
+        (KNEE + (1.0 - KNEE) * v * (1.0 + v / (w * w)) / (1.0 + v)).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn tone_params_normalise_the_peak_by_sdr_white() {
+        let t = ToneParams::new(Some(250.0), Some(1000.0));
+        assert_eq!(t.sdr_white_nits, 250.0);
+        assert_eq!(t.peak, 4.0);
+    }
+
+    #[test]
+    fn tone_params_fall_back_on_missing_or_nonsense_values() {
+        let t = ToneParams::new(None, Some(f32::NAN));
+        assert_eq!(t.sdr_white_nits, ToneParams::FALLBACK_SDR_WHITE_NITS);
+        assert_eq!(
+            t.peak,
+            ToneParams::FALLBACK_PEAK_NITS / ToneParams::FALLBACK_SDR_WHITE_NITS
+        );
+        assert_eq!(ToneParams::new(Some(0.0), None).sdr_white_nits, 203.0);
+    }
+
+    #[test]
+    fn the_shoulder_leaves_sdr_tones_alone_below_the_knee() {
+        for x in [0.0, 0.18, 0.5, 0.8] {
+            assert_eq!(shoulder(x, 4.0), x);
+        }
+    }
+
+    #[test]
+    fn the_shoulder_lands_the_peak_on_white_and_never_decreases() {
+        let peak = 4.0;
+        assert!((shoulder(peak, peak) - 1.0).abs() < 1e-6);
+        let mut last = 0.0;
+        for i in 0..=1000 {
+            let y = shoulder(i as f32 * 0.005, peak);
+            assert!(y >= last, "not monotonic at {i}");
+            last = y;
+        }
+        // Continuous at the knee.
+        assert!((shoulder(0.8001, peak) - 0.8001).abs() < 1e-3);
+    }
+
+    #[test]
+    fn sdr_white_keeps_most_of_its_brightness() {
+        // The accepted trade-off: plain SDR white sits just under full scale,
+        // leaving the top for highlights up to the display's peak.
+        let y = shoulder(1.0, 4.0);
+        assert!((0.88..0.95).contains(&y), "SDR white at {y}");
+    }
+
+    #[test]
+    fn a_display_no_brighter_than_sdr_white_just_clamps() {
+        assert_eq!(shoulder(1.5, 1.0), 1.0);
+        assert_eq!(shoulder(0.9, 0.9), 0.9);
+    }
 }

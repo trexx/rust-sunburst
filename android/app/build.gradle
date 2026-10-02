@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+// One stable debug key, so every build installs over the last. Without it each
+// CI runner signs with a fresh throwaway key, and moving the box to a new build
+// means an uninstall, which wipes the pairing. CI decodes the key from the
+// SUNBURST_DEBUG_KEYSTORE_B64 secret into SUNBURST_DEBUG_KEYSTORE; a dev
+// machine keeps it beside the SDK's own debug.keystore. Where neither exists
+// (a fork PR, a fresh checkout) AGP's default debug key applies, as before.
+def stableDebugKeystore = file(System.getenv('SUNBURST_DEBUG_KEYSTORE')
+        ?: "${System.getProperty('user.home')}/.android/sunburst-debug.keystore")
+
 android {
     namespace 'com.trexx.sunburst'
     // CLAUDE.md pins these. targetSdk is deliberately behind compileSdk.
@@ -24,7 +33,23 @@ android {
         }
     }
 
+    signingConfigs {
+        if (stableDebugKeystore.exists()) {
+            sunburstDebug {
+                storeFile stableDebugKeystore
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            if (stableDebugKeystore.exists()) {
+                signingConfig signingConfigs.sunburstDebug
+            }
+        }
         release {
             minifyEnabled false
         }
@@ -49,13 +74,15 @@ android {
     }
 }
 
-// Build the Rust client cdylib for both ABIs and drop it into the APK. The
-// plugin sets the NDK linker/AR env itself (apiLevel 30), so it does not rely on
-// `.cargo/config.toml` or the NDK being on PATH.
 // Build the Rust client cdylib for both ABIs and copy it into jniLibs. A small
 // task rather than a plugin: it runs the exact `cargo build` CI uses (so the
 // toolchain cannot drift) and works on the latest AGP, which rust-android-gradle
 // does not yet support.
+//
+// Always `--release`, for the debug APK too. An opt-level-0 client cannot keep
+// up with a 4K stream: on the Homatics it spent ~80% of a core receiving and
+// the socket dropped a third of the datagrams, which stutters video and audio
+// alike. The release profile keeps line tables, so a stall still symbolises.
 def rustAbis = ['arm64-v8a': 'aarch64-linux-android', 'armeabi-v7a': 'armv7-linux-androideabi']
 // The NDK's per-API-30 clang wrappers must be on PATH for the cargo cross-link
 // (see `.cargo/config.toml`). Prefer the CI-provided NDK envs, else the pinned
@@ -82,10 +109,10 @@ def cargoBuildJni = tasks.register('cargoBuildJni') {
             svc.exec.exec {
                 workingDir repoRoot
                 environment 'PATH', "${ndkBin}:${System.getenv('PATH')}"
-                commandLine 'cargo', 'build', '-p', 'sunburst-android', '--target', triple
+                commandLine 'cargo', 'build', '--release', '-p', 'sunburst-android', '--target', triple
             }
             svc.fs.copy {
-                from "${cargoTarget}/${triple}/debug/libsunburst_android.so"
+                from "${cargoTarget}/${triple}/release/libsunburst_android.so"
                 into "${genJniLibs}/${abi}"
             }
         }

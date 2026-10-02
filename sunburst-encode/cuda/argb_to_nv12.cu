@@ -10,7 +10,8 @@
 //                           gamma-encoded, so normalise and go straight to YCbCr.
 //   argb_to_nv12_tonemap  — HDR desktop: NvFBC scans out the PQ BT.2020 signal,
 //                           so PQ-decode -> BT.2020 linear -> Rec.709 primaries ->
-//                           ACES tonemap -> Rec.709 OETF -> YCbCr.
+//                           normalise by the desktop's SDR white -> shoulder ->
+//                           Rec.709 OETF -> YCbCr.
 //
 // And the same two for a 10-bit SDR stream (HEVC/AV1 to a display that cannot
 // show HDR — Hello.display_hdr), written as P010 (10-bit YCbCr 4:2:0, codes
@@ -39,9 +40,33 @@ __device__ __forceinline__ float pq_decode(float e) {  // e in [0,1] -> linear [
     return powf(num / (c2 - c3 * ep), 1.0f / m1);
 }
 
-__device__ __forceinline__ float aces(float x) {
-    const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
-    float y = (x * (a * x + b)) / (x * (c * x + d) + e);
+// pq_decode of every 10-bit code. The input is always a 10-bit integer code, so
+// the two powf per channel per pixel (six a pixel, ~50M a 4K frame) reduce to a
+// lookup in a 4 KB table that stays in cache. Filled by init_pq_lut, which
+// cuda_convert.rs launches once each time it loads this module: the table is
+// per-module state.
+__device__ float pq_lut[1024];
+
+extern "C" __global__ void init_pq_lut() {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 1024) pq_lut[i] = pq_decode((float)i / 1023.0f);
+}
+
+__device__ __forceinline__ float pq_code(float code10) {
+    return __ldg(&pq_lut[(int)code10]);   // unpack() yields exact integers 0..1023
+}
+
+// An HDR desktop draws SDR content at its SDR white (often 200-480 nits).
+// Normalised so that is 1.0, SDR content passes through untouched below KNEE;
+// above it, extended Reinhard on the excess rolls highlights off, continuous in
+// slope, landing `peak` (the display's peak in SDR-white units) on exactly 1.0.
+// The same curve as SDR_SHADER_HLSL's shoulder in convert.rs.
+#define KNEE 0.8f
+__device__ __forceinline__ float shoulder(float x, float peak) {
+    if (x <= KNEE || peak <= 1.0f) return fminf(fmaxf(x, 0.0f), 1.0f);
+    float w = (peak - KNEE) / (1.0f - KNEE);
+    float v = (x - KNEE) / (1.0f - KNEE);
+    float y = KNEE + (1.0f - KNEE) * v * (1.0f + v / (w * w)) / (1.0f + v);
     return fminf(fmaxf(y, 0.0f), 1.0f);
 }
 
@@ -67,30 +92,32 @@ __device__ __forceinline__ uint8_t clamp8(float code) {
 
 // Map one pixel's 10-bit codes to Rec.709 gamma-encoded R'G'B' [0,1].
 __device__ __forceinline__ void to_rec709(float r10, float g10, float b10, bool tonemap,
+                                           float sdr_white_nits, float peak,
                                            float& r, float& g, float& b) {
     if (!tonemap) {
         // SDR desktop: already Rec.709 gamma-encoded.
         r = r10 / 1023.0f; g = g10 / 1023.0f; b = b10 / 1023.0f;
         return;
     }
-    // HDR desktop: PQ BT.2020 -> linear -> Rec.709 primaries -> ACES -> OETF.
-    float lr = pq_decode(r10 / 1023.0f);
-    float lg = pq_decode(g10 / 1023.0f);
-    float lb = pq_decode(b10 / 1023.0f);
+    // HDR desktop: PQ BT.2020 -> linear -> Rec.709 primaries -> shoulder -> OETF.
+    float lr = pq_code(r10);
+    float lg = pq_code(g10);
+    float lb = pq_code(b10);
     // BT.2020 -> Rec.709 linear primaries.
     float r709 =  1.6605f * lr - 0.5876f * lg - 0.0728f * lb;
     float g709 = -0.1246f * lr + 1.1329f * lg - 0.0083f * lb;
     float b709 = -0.0182f * lr - 0.1006f * lg + 1.1187f * lb;
-    // PQ linear is 1.0 == 10000 nits; scale so ~SDR white (100 nits) sits near 1.
-    const float scale = 100.0f;
-    r = bt709_oetf(aces(r709 * scale));
-    g = bt709_oetf(aces(g709 * scale));
-    b = bt709_oetf(aces(b709 * scale));
+    // PQ linear is 1.0 == 10000 nits; the desktop's SDR white becomes 1.0.
+    const float scale = 10000.0f / sdr_white_nits;
+    r = bt709_oetf(shoulder(r709 * scale, peak));
+    g = bt709_oetf(shoulder(g709 * scale, peak));
+    b = bt709_oetf(shoulder(b709 * scale, peak));
 }
 
 __device__ __forceinline__ void convert(const uint32_t* src, int src_pitch_words,
                                          uint8_t* dst, int dst_pitch_elems,
-                                         int width, int height, bool tonemap) {
+                                         int width, int height, bool tonemap,
+                                         float sdr_white_nits, float peak) {
     int bx = blockIdx.x * blockDim.x + threadIdx.x; // chroma column
     int by = blockIdx.y * blockDim.y + threadIdx.y; // chroma row
     int x = bx * 2, y = by * 2;
@@ -108,7 +135,7 @@ __device__ __forceinline__ void convert(const uint32_t* src, int src_pitch_words
             float r10, g10, b10;
             unpack(src[(size_t)py * src_pitch_words + px], r10, g10, b10);
             float r, g, b, yv, cb, cr;
-            to_rec709(r10, g10, b10, tonemap, r, g, b);
+            to_rec709(r10, g10, b10, tonemap, sdr_white_nits, peak, r, g, b);
             ycbcr709(r, g, b, yv, cb, cr);
             dst_y[(size_t)py * dst_pitch_elems + px] = clamp8(yv);
             cb_sum += cb;
@@ -140,7 +167,8 @@ __device__ __forceinline__ uint16_t pack_p010(float code10) {
 // The NV12 convert's 2x2 walk, writing 10-bit Rec.709 P010 instead.
 __device__ __forceinline__ void convert_p010(const uint32_t* src, int src_pitch_words,
                                               uint16_t* dst, int dst_pitch_elems,
-                                              int width, int height, bool tonemap) {
+                                              int width, int height, bool tonemap,
+                                              float sdr_white_nits, float peak) {
     int bx = blockIdx.x * blockDim.x + threadIdx.x; // chroma column
     int by = blockIdx.y * blockDim.y + threadIdx.y; // chroma row
     int x = bx * 2, y = by * 2;
@@ -158,7 +186,7 @@ __device__ __forceinline__ void convert_p010(const uint32_t* src, int src_pitch_
             float r10, g10, b10;
             unpack(src[(size_t)py * src_pitch_words + px], r10, g10, b10);
             float r, g, b, yv, cb, cr;
-            to_rec709(r10, g10, b10, tonemap, r, g, b);
+            to_rec709(r10, g10, b10, tonemap, sdr_white_nits, peak, r, g, b);
             ycbcr709_10(r, g, b, yv, cb, cr);
             dst_y[(size_t)py * dst_pitch_elems + px] = pack_p010(yv);
             cb_sum += cb;
@@ -173,25 +201,33 @@ __device__ __forceinline__ void convert_p010(const uint32_t* src, int src_pitch_
 
 extern "C" __global__ void argb10_to_p010_709(const uint32_t* src, int src_pitch_words,
                                               uint16_t* dst, int dst_pitch_elems,
-                                              int width, int height) {
-    convert_p010(src, src_pitch_words, dst, dst_pitch_elems, width, height, false);
+                                              int width, int height,
+                                              float sdr_white_nits, float peak) {
+    convert_p010(src, src_pitch_words, dst, dst_pitch_elems, width, height, false,
+                 sdr_white_nits, peak);
 }
 
 extern "C" __global__ void argb10_to_p010_709_tonemap(const uint32_t* src,
                                                       int src_pitch_words,
                                                       uint16_t* dst, int dst_pitch_elems,
-                                                      int width, int height) {
-    convert_p010(src, src_pitch_words, dst, dst_pitch_elems, width, height, true);
+                                                      int width, int height,
+                                                      float sdr_white_nits, float peak) {
+    convert_p010(src, src_pitch_words, dst, dst_pitch_elems, width, height, true,
+                 sdr_white_nits, peak);
 }
 
 extern "C" __global__ void argb_to_nv12(const uint32_t* src, int src_pitch_words,
                                         uint8_t* dst, int dst_pitch_elems,
-                                        int width, int height) {
-    convert(src, src_pitch_words, dst, dst_pitch_elems, width, height, false);
+                                        int width, int height,
+                                        float sdr_white_nits, float peak) {
+    convert(src, src_pitch_words, dst, dst_pitch_elems, width, height, false,
+            sdr_white_nits, peak);
 }
 
 extern "C" __global__ void argb_to_nv12_tonemap(const uint32_t* src, int src_pitch_words,
                                                 uint8_t* dst, int dst_pitch_elems,
-                                                int width, int height) {
-    convert(src, src_pitch_words, dst, dst_pitch_elems, width, height, true);
+                                                int width, int height,
+                                                float sdr_white_nits, float peak) {
+    convert(src, src_pitch_words, dst, dst_pitch_elems, width, height, true,
+            sdr_white_nits, peak);
 }

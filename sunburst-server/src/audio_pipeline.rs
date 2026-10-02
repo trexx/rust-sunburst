@@ -20,11 +20,11 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sunburst_audio::LoopbackCapture;
 use sunburst_audio::codec::{Application, OpusEncoder};
-use sunburst_audio::pcm::FrameAccumulator;
+use sunburst_audio::pcm::{FrameAccumulator, IdleFill};
 use sunburst_core::instr::{self, Stage};
 use sunburst_core::proto::{MAX_PAYLOAD, Seq16};
 use sunburst_net::send::{PlainSender, Sender};
@@ -162,8 +162,11 @@ fn audio_loop(socket: UdpSocket, client: SocketAddr, params: AudioParams, stop: 
     let mut pkt = [0u8; MAX_AUDIO_PACKET];
     let mut seq = Seq16(0);
 
-    // Poll at the frame interval; the WASAPI buffer (200 ms) absorbs the rest.
+    // Poll faster than the engine's 10 ms period; the WASAPI buffer (200 ms)
+    // absorbs the rest. Most polls are early, which `idle` accounts for.
     let poll = Duration::from_micros(5_000);
+    let origin = Instant::now();
+    let mut idle = IdleFill::new(params.frame_us as u64, 0);
 
     while !stop.load(Ordering::Relaxed) {
         if capture.drain_into(&mut acc).is_err() {
@@ -191,18 +194,22 @@ fn audio_loop(socket: UdpSocket, client: SocketAddr, params: AudioParams, stop: 
             i += 1;
         }
 
-        if i == 0 {
-            // Idle: hold the cadence with one silence frame.
+        // An idle endpoint sends nothing, so hold the cadence with silence; an
+        // early poll between two periods of real audio must not.
+        let now_us = origin.elapsed().as_micros() as u64;
+        for _ in 0..idle.on_poll(i, now_us) {
+            let qpc = base.wrapping_add(i.wrapping_mul(ticks_per_frame));
             emit(
                 &mut encoder,
                 &silence,
-                qpc_now(),
+                qpc,
                 &mut seq,
                 &mut opus,
                 &mut pkt,
                 &mut sender,
                 client,
             );
+            i += 1;
         }
 
         std::thread::sleep(poll);

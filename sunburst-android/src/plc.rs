@@ -1,53 +1,157 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Which lost audio packets to conceal — pure, host-tested.
+//! Putting audio packets back in order, and which lost ones to conceal — pure,
+//! host-tested.
 //!
 //! Audio rides the same unreliable UDP as video and is never retransmitted, so
-//! a lost 5 ms packet used to leave a hole the playback ring filled with
-//! silence: an audible click per loss, and a crackle under Wi-Fi loss. Opus has
-//! packet-loss concealment for exactly this (`OpusDecoder::conceal`); what the
-//! client needs is to notice the gap, from the packet sequence number.
+//! a lost packet leaves a hole Opus fills with packet-loss concealment
+//! (`OpusDecoder::conceal`). Over Wi-Fi, though, most "gaps" are not losses: on
+//! the Homatics ~45 packets a second arrived swapped with their neighbour.
+//! Concealing at the first gap and then dropping the late packet as stale
+//! replaced real audio with an extrapolation twice a second per swap.
 //!
-//! Short gaps are concealed packet by packet. A long one (the stream paused, or
-//! a burst far past what interpolation can cover) is not: the decoder simply
-//! resynchronises on the next packet. A packet older than one already played
-//! arrived after its slot was concealed, or is a duplicate, and is dropped.
+//! So a packet that arrives early is held while the one before it may still
+//! come: up to [`WINDOW`] − 1 packets. In-order packets pass straight through,
+//! so this costs nothing until a gap appears. A hole is given up on only once a
+//! packet [`WINDOW`] or more ahead of it arrives. Then a short run of missing
+//! packets is concealed packet by packet, and a long one (the stream paused, or
+//! a burst past what interpolation can cover) is skipped, so the decoder
+//! resynchronises on the next real packet. A packet whose slot has already
+//! played, or a duplicate, is dropped.
 
 use sunburst_core::proto::Seq16;
+use sunburst_net::MAX_AUDIO_PACKET;
 
-/// Conceal at most this many consecutive lost packets (15 ms at 5 ms frames).
-/// Past that, PLC's extrapolation decays into noise and a resync is cleaner.
+/// Conceal at most this many consecutive lost packets. Past that, PLC's
+/// extrapolation decays into noise and a resync is cleaner.
 pub const MAX_CONCEALED: u16 = 3;
 
-/// What to do with an arriving audio packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arrival {
-    /// Decode it, after concealing this many lost packets before it.
-    Play { conceal: u16 },
-    /// Late or duplicate: its slot has already played.
-    Stale,
+/// How far ahead of the next expected packet one may arrive before that packet
+/// is given up on. At 2.5 ms frames, 8 waits up to 17.5 ms for a late packet,
+/// inside the playout cushion. 3 was too few on the Homatics: packets arriving
+/// three or more places late were concealed and then dropped, and the stream
+/// of PLC frames sounded like water sloshing.
+pub const WINDOW: u16 = 8;
+
+/// A packet this far ahead is a new stream position, not a reorder: drop what
+/// is held and start again from it.
+pub const RESYNC_AHEAD: u16 = 64;
+
+/// What the caller does next, in order.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Event<'a> {
+    /// Decode and play this Opus packet, which is packet `id`.
+    Decode(Seq16, &'a [u8]),
+    /// Conceal one lost packet.
+    Conceal,
 }
 
-/// Track the audio packet sequence and classify each arrival.
-#[derive(Debug, Default)]
-pub struct AudioSequence {
-    last: Option<Seq16>,
+/// One held packet.
+struct Slot {
+    id: Option<Seq16>,
+    len: usize,
+    data: Box<[u8]>,
 }
 
-impl AudioSequence {
-    pub fn on_packet(&mut self, id: Seq16) -> Arrival {
-        let Some(last) = self.last else {
-            self.last = Some(id);
-            return Arrival::Play { conceal: 0 };
+/// Reorders the audio packet stream within a small window. Allocates once, at
+/// construction.
+pub struct AudioReorder {
+    /// The next packet to play; `None` until the first arrives.
+    next: Option<Seq16>,
+    /// Packets ahead of `next`, at `id % WINDOW`.
+    held: [Slot; WINDOW as usize],
+}
+
+impl Default for AudioReorder {
+    fn default() -> Self {
+        AudioReorder {
+            next: None,
+            held: std::array::from_fn(|_| Slot {
+                id: None,
+                len: 0,
+                data: vec![0u8; MAX_AUDIO_PACKET].into_boxed_slice(),
+            }),
+        }
+    }
+}
+
+impl AudioReorder {
+    /// Take one arriving packet. `emit` receives what to play, in order: none
+    /// (it was held, late or a duplicate), or one or more events.
+    pub fn push(&mut self, id: Seq16, payload: &[u8], mut emit: impl FnMut(Event<'_>)) {
+        let Some(mut next) = self.next else {
+            self.next = Some(id.next());
+            emit(Event::Decode(id, payload));
+            return;
         };
-        if !id.is_newer_than(last) {
-            return Arrival::Stale;
+        if id != next && !id.is_newer_than(next) {
+            return; // its slot has played, or a duplicate of one that did
         }
-        self.last = Some(id);
-        let lost = id.0.wrapping_sub(last.0).wrapping_sub(1);
-        Arrival::Play {
-            conceal: if lost <= MAX_CONCEALED { lost } else { 0 },
+        if id.0.wrapping_sub(next.0) >= RESYNC_AHEAD {
+            for slot in &mut self.held {
+                slot.id = None;
+            }
+            self.next = Some(id.next());
+            emit(Event::Decode(id, payload));
+            return;
         }
+
+        // Give up on holes until `id` is inside the window. A hole is given up
+        // on whole: every packet missing from it up to the next one present
+        // (held, or `id`), concealed if the run is short, skipped if long.
+        while id.0.wrapping_sub(next.0) >= WINDOW {
+            if self.is_held(next) {
+                next = self.play_held(next, &mut emit);
+                continue;
+            }
+            let run = self.missing_run(next, id);
+            for _ in 0..run {
+                if run <= MAX_CONCEALED {
+                    emit(Event::Conceal);
+                }
+                next = next.next();
+            }
+        }
+
+        if id == next {
+            emit(Event::Decode(id, payload));
+            next = next.next();
+        } else if !self.is_held(id) {
+            let slot = &mut self.held[(id.0 % WINDOW) as usize];
+            let len = payload.len().min(slot.data.len());
+            slot.data[..len].copy_from_slice(&payload[..len]);
+            slot.len = len;
+            slot.id = Some(id);
+        }
+        // Whatever was waiting behind `id` (or behind the holes) plays now.
+        while self.is_held(next) {
+            next = self.play_held(next, &mut emit);
+        }
+        self.next = Some(next);
+    }
+
+    fn is_held(&self, id: Seq16) -> bool {
+        self.held[(id.0 % WINDOW) as usize].id == Some(id)
+    }
+
+    /// Emit the held packet `id` and free its slot; returns the one after it.
+    fn play_held(&mut self, id: Seq16, emit: &mut impl FnMut(Event<'_>)) -> Seq16 {
+        let slot = &mut self.held[(id.0 % WINDOW) as usize];
+        slot.id = None;
+        emit(Event::Decode(id, &slot.data[..slot.len]));
+        id.next()
+    }
+
+    /// How many packets from `from` are missing before the first one held or
+    /// `arrived`.
+    fn missing_run(&self, from: Seq16, arrived: Seq16) -> u16 {
+        let mut run = 0;
+        let mut id = from;
+        while id != arrived && !self.is_held(id) {
+            run += 1;
+            id = id.next();
+        }
+        run
     }
 }
 
@@ -55,47 +159,114 @@ impl AudioSequence {
 mod tests {
     use super::*;
 
-    #[test]
-    fn in_order_packets_conceal_nothing() {
-        let mut s = AudioSequence::default();
-        for id in 0..10 {
-            assert_eq!(s.on_packet(Seq16(id)), Arrival::Play { conceal: 0 });
+    /// Push packets whose payload is their own id, and render the events: `n`
+    /// for a decode of packet n, `C` for a conceal.
+    fn run(ids: &[u16]) -> Vec<String> {
+        let mut r = AudioReorder::default();
+        let mut out = Vec::new();
+        for &id in ids {
+            let payload = id.to_le_bytes();
+            r.push(Seq16(id), &payload, |e| {
+                out.push(match e {
+                    Event::Decode(id, p) => {
+                        assert_eq!(id.0, u16::from_le_bytes([p[0], p[1]]), "id/payload");
+                        id.0.to_string()
+                    }
+                    Event::Conceal => "C".into(),
+                })
+            });
         }
+        out
+    }
+
+    fn ev(s: &[&str]) -> Vec<String> {
+        s.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn a_short_gap_is_concealed_packet_by_packet() {
-        let mut s = AudioSequence::default();
-        s.on_packet(Seq16(10));
-        assert_eq!(s.on_packet(Seq16(12)), Arrival::Play { conceal: 1 });
-        assert_eq!(s.on_packet(Seq16(16)), Arrival::Play { conceal: 3 });
+    fn in_order_packets_pass_straight_through() {
+        assert_eq!(run(&[0, 1, 2, 3]), ev(&["0", "1", "2", "3"]));
     }
 
     #[test]
-    fn a_long_gap_resyncs_instead() {
-        let mut s = AudioSequence::default();
-        s.on_packet(Seq16(10));
-        assert_eq!(s.on_packet(Seq16(50)), Arrival::Play { conceal: 0 });
+    fn a_swapped_pair_is_put_back_in_order_without_concealment() {
+        assert_eq!(run(&[0, 2, 1, 3]), ev(&["0", "1", "2", "3"]));
     }
 
     #[test]
-    fn late_and_duplicate_packets_are_stale() {
-        let mut s = AudioSequence::default();
-        s.on_packet(Seq16(10));
-        s.on_packet(Seq16(12));
-        assert_eq!(
-            s.on_packet(Seq16(11)),
-            Arrival::Stale,
-            "its slot was concealed"
-        );
-        assert_eq!(s.on_packet(Seq16(12)), Arrival::Stale, "duplicate");
-        assert_eq!(s.on_packet(Seq16(13)), Arrival::Play { conceal: 0 });
+    fn a_packet_two_late_still_makes_it() {
+        assert_eq!(run(&[0, 2, 3, 1, 4]), ev(&["0", "1", "2", "3", "4"]));
+    }
+
+    /// `0`, then `2..=last`: packet 1 missing.
+    fn without_one(last: u16) -> Vec<u16> {
+        std::iter::once(0).chain(2..=last).collect()
+    }
+
+    /// What `without_one(last)` plays once 1 is given up on: 0, a conceal, then
+    /// 2..=last.
+    fn concealed_one(last: u16) -> Vec<String> {
+        let mut e = ev(&["0", "C"]);
+        e.extend((2..=last).map(|i| i.to_string()));
+        e
+    }
+
+    #[test]
+    fn a_packet_most_of_the_window_late_still_makes_it() {
+        // 1 arrives after WINDOW - 2 later ones: still in time.
+        let mut ids = without_one(WINDOW - 1);
+        ids.push(1);
+        let want: Vec<String> = (0..WINDOW).map(|i| i.to_string()).collect();
+        assert_eq!(run(&ids), want);
+    }
+
+    #[test]
+    fn a_lost_packet_is_held_for_until_the_window_is_exceeded() {
+        // 1 never comes. Everything up to WINDOW waits for it...
+        assert_eq!(run(&without_one(WINDOW)), ev(&["0"]));
+        // ...and the packet WINDOW past it gives up on it.
+        assert_eq!(run(&without_one(WINDOW + 1)), concealed_one(WINDOW + 1));
+    }
+
+    #[test]
+    fn a_late_packet_after_its_slot_was_concealed_is_dropped() {
+        let mut ids = without_one(WINDOW + 1);
+        ids.push(1);
+        assert_eq!(run(&ids), concealed_one(WINDOW + 1));
+    }
+
+    #[test]
+    fn a_short_run_of_losses_is_concealed_packet_by_packet() {
+        // 1-3 lost; the run is given up on once a packet passes the window.
+        let mut ids = vec![0];
+        ids.extend(4..=3 + WINDOW);
+        let mut want = ev(&["0", "C", "C", "C"]);
+        want.extend((4..=3 + WINDOW).map(|i| i.to_string()));
+        assert_eq!(run(&ids), want);
+    }
+
+    #[test]
+    fn a_long_run_is_skipped_for_a_resync() {
+        // 1-19 lost: past MAX_CONCEALED, so skipped rather than concealed.
+        assert_eq!(run(&[0, 20, 21]), ev(&["0", "20", "21"]));
+    }
+
+    #[test]
+    fn a_far_jump_drops_what_is_held_and_starts_again() {
+        assert_eq!(run(&[0, 2, 500, 501]), ev(&["0", "500", "501"]));
+    }
+
+    #[test]
+    fn duplicates_play_once() {
+        assert_eq!(run(&[0, 1, 1, 2, 2]), ev(&["0", "1", "2"]));
+        assert_eq!(run(&[0, 2, 2, 1]), ev(&["0", "1", "2"]));
     }
 
     #[test]
     fn the_sequence_wraps() {
-        let mut s = AudioSequence::default();
-        s.on_packet(Seq16(65_534));
-        assert_eq!(s.on_packet(Seq16(1)), Arrival::Play { conceal: 2 });
+        assert_eq!(
+            run(&[65_534, 0, 65_535, 1]),
+            ev(&["65534", "65535", "0", "1"])
+        );
     }
 }

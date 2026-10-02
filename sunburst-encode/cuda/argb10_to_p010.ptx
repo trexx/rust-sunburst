@@ -18,7 +18,9 @@
 	.param .u64 argb10_to_p010_param_2,
 	.param .u32 argb10_to_p010_param_3,
 	.param .u32 argb10_to_p010_param_4,
-	.param .u32 argb10_to_p010_param_5
+	.param .u32 argb10_to_p010_param_5,
+	.param .f32 argb10_to_p010_param_6,
+	.param .f32 argb10_to_p010_param_7
 )
 {
 	.reg .pred 	%p<21>;

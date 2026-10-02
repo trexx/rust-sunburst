@@ -22,6 +22,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi_Common",
     # DXGI_OUTPUT_DESC{,1} carry an HMONITOR, a GDI type.
     "Win32_Graphics_Gdi",
+    # SDRWhiteLevel: what an HDR desktop draws SDR white at (output.rs).
+    "Win32_Devices_Display",
     # NvFBC / nvcuda.dll are loaded at runtime (no build dep).
     "Win32_Security",
     "Win32_System_LibraryLoader",

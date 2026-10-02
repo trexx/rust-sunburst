@@ -25,9 +25,10 @@ const ENTRIES: &[(&str, &str)] = &[
     ("argb_to_nv12.ptx", "argb10_to_p010_709_tonemap"),
 ];
 
-/// `(src, src_pitch_words, dst, dst_pitch_elems, width, height)` — the launch in
-/// `cuda_convert.rs` passes exactly these six.
-const PARAMS: usize = 6;
+/// `(src, src_pitch_words, dst, dst_pitch_elems, width, height, sdr_white_nits,
+/// peak)` — the launch in `cuda_convert.rs` passes exactly these eight, to every
+/// kernel (only the SDR tonemap kernels read the last two).
+const PARAMS: usize = 8;
 
 fn module(file: &str) -> &'static str {
     if file.starts_with("argb10") {
@@ -87,6 +88,20 @@ fn entries_do_real_work() {
             "`{name}` never writes global memory"
         );
     }
+}
+
+#[test]
+fn the_pq_table_init_takes_no_params_and_fills_the_table() {
+    // cuda_convert.rs launches it with an empty parameter list before the first
+    // tonemapped frame; the tonemap kernels read the table it writes.
+    let body = entry(NV12, "init_pq_lut").expect("no entry `init_pq_lut`");
+    let params_end = body.find(')').expect("unterminated parameter list");
+    assert_eq!(body[..params_end].matches(".param").count(), 0);
+    assert!(
+        body.contains("st.global"),
+        "init_pq_lut never writes the table"
+    );
+    assert!(NV12.contains("pq_lut"), "the module has no pq_lut table");
 }
 
 #[test]

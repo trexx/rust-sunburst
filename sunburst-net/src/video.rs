@@ -269,6 +269,12 @@ pub const DEFAULT_POOL_SLOTS: usize = 8192;
 /// that matters and it is kept.
 const ABANDON_LOG: usize = 16;
 
+/// How long [`Reassembler::nack_due`] waits before re-asking for the same holes.
+/// Above a LAN or Wi-Fi round trip plus the server's retransmit service, and
+/// under one 60 fps frame interval, so a lost retransmit is asked for again
+/// before the jitter buffer gives up on the frame.
+pub const NACK_REASK_MS: u64 = 8;
+
 const NO_SLOT: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -296,6 +302,10 @@ struct FrameSlot {
     token: u32,
     /// `pkt_idx` → pool slot, or [`NO_SLOT`].
     index: Box<[u32]>,
+    /// When this frame was last NACKed, for [`Reassembler::nack_due`].
+    nacked_at_ms: Option<u64>,
+    /// The fewest holes seen since that NACK; more than this means new holes.
+    nacked_holes: usize,
 }
 
 impl FrameSlot {
@@ -311,6 +321,8 @@ impl FrameSlot {
             len: 0,
             token: 0,
             index: vec![NO_SLOT; MAX_PKTS_PER_FRAME].into_boxed_slice(),
+            nacked_at_ms: None,
+            nacked_holes: 0,
         }
     }
 
@@ -328,6 +340,8 @@ impl FrameSlot {
         self.high_water = 0;
         self.len = 0;
         self.keyframe = false;
+        self.nacked_at_ms = None;
+        self.nacked_holes = 0;
     }
 
     /// Complete means every index below the terminator's count is present;
@@ -536,6 +550,42 @@ impl Reassembler {
             n += 1;
         }
         n
+    }
+
+    /// Whether a NACK naming `holes` targets for `frame_id` should go out now,
+    /// recording it if so.
+    ///
+    /// Without this, every later packet of a frame with a hole re-sent the same
+    /// NACK, and the server answers each one, unpaced. Under real loss that
+    /// multiplies inbound traffic into a socket already dropping packets, and
+    /// loses more. So a frame is NACKed when it first has holes, again at once if
+    /// new holes appear (the terminator arrived, or later packets opened a gap),
+    /// and otherwise only once [`NACK_REASK_MS`] has passed without the
+    /// retransmit arriving.
+    pub fn nack_due(&mut self, frame_id: Seq16, holes: usize, now_ms: u64) -> bool {
+        let Some(slot) = self
+            .frames
+            .iter_mut()
+            .find(|s| s.state == SlotState::Partial && s.frame_id == frame_id)
+        else {
+            return false;
+        };
+        if holes == 0 {
+            return false;
+        }
+        let due = match slot.nacked_at_ms {
+            None => true,
+            Some(at) => holes > slot.nacked_holes || now_ms.saturating_sub(at) >= NACK_REASK_MS,
+        };
+        if due {
+            slot.nacked_at_ms = Some(now_ms);
+            slot.nacked_holes = holes;
+        } else {
+            // Retransmits filling holes lower the bar, so a hole opening after
+            // them still counts as new.
+            slot.nacked_holes = slot.nacked_holes.min(holes);
+        }
+        due
     }
 
     /// One past the highest index stored for a frame still being assembled.
@@ -1302,6 +1352,57 @@ mod tests {
         r.push(&pkts[3]);
         let n = r.nack_targets(Seq16(8), true, &mut out);
         assert_eq!(&out[..n], &[1]);
+    }
+
+    #[test]
+    fn a_frame_is_nacked_once_until_it_grows_new_holes_or_the_reask_interval_passes() {
+        let pkts = packetize(Seq16(3), 0, false, &[&[5u8; 6 * MAX_PAYLOAD][..]]); // 0..=5, term 6
+        let mut r = Reassembler::new();
+        r.push(&pkts[0]);
+        r.push(&pkts[2]); // hole at 1
+        assert!(r.nack_due(Seq16(3), 1, 100), "first holes are NACKed");
+        r.push(&pkts[3]);
+        assert!(!r.nack_due(Seq16(3), 1, 101), "same holes: quiet");
+        assert!(
+            !r.nack_due(Seq16(3), 1, 100 + NACK_REASK_MS - 1),
+            "still inside the interval"
+        );
+        assert!(
+            r.nack_due(Seq16(3), 1, 100 + NACK_REASK_MS),
+            "re-asked once the interval passes"
+        );
+        r.push(&pkts[5]); // hole at 4 too
+        assert!(r.nack_due(Seq16(3), 2, 109), "a new hole is NACKed at once");
+        // The retransmit of 1 fills that hole; 4 is already asked for, so wait.
+        r.push(&pkts[1]);
+        assert!(!r.nack_due(Seq16(3), 1, 110));
+        // A hole opening after that is new, even though the count is back to 2.
+        assert!(r.nack_due(Seq16(3), 2, 111));
+    }
+
+    #[test]
+    fn nack_due_ignores_unknown_frames_and_no_holes() {
+        let pkts = packetize(Seq16(4), 0, false, &[&[5u8; 2500][..]]);
+        let mut r = Reassembler::new();
+        assert!(!r.nack_due(Seq16(4), 1, 0), "no such frame");
+        r.push(&pkts[0]);
+        assert!(!r.nack_due(Seq16(4), 0, 0), "nothing to name");
+        assert!(r.nack_due(Seq16(4), 1, 0));
+    }
+
+    #[test]
+    fn a_reused_slot_forgets_the_last_frames_nack() {
+        let mut r = Reassembler::with_capacity(DEFAULT_POOL_SLOTS, 1);
+        let a = packetize(Seq16(1), 0, false, &[&[5u8; 2500][..]]);
+        r.push(&a[0]);
+        assert!(r.nack_due(Seq16(1), 1, 0));
+        // Frame 2 evicts frame 1 from the only slot.
+        let b = packetize(Seq16(2), 0, false, &[&[5u8; 2500][..]]);
+        r.push(&b[0]);
+        assert!(
+            r.nack_due(Seq16(2), 1, 1),
+            "a fresh frame, not frame 1's NACK"
+        );
     }
 
     #[test]

@@ -325,9 +325,11 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
                         // lost terminator is asked for too), and the frame behind.
                         if let Some(fid) = fid {
                             let newer = newest_seen.is_some_and(|n| n.is_newer_than(fid));
+                            let now_ms = origin.elapsed().as_millis() as u64;
                             nacks += send_nack_for(
                                 &mut client,
-                                &reassembler,
+                                &mut reassembler,
+                                now_ms,
                                 fid,
                                 newer,
                                 &mut targets,
@@ -337,7 +339,8 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
                             if reassembler.is_pending(prev) {
                                 nacks += send_nack_for(
                                     &mut client,
-                                    &reassembler,
+                                    &mut reassembler,
+                                    now_ms,
                                     prev,
                                     true,
                                     &mut targets,
@@ -472,9 +475,11 @@ pub fn stream(server: SocketAddr, secret: [u8; 32], opts: StreamOpts) -> Result<
 
 /// NACK a pending frame's missing packets (or abandon), returning 1 if a NACK
 /// was sent. Retransmit-off callers still abandon, so recovery is exercised.
+/// Throttled per frame by [`Reassembler::nack_due`], like the Android client.
 fn send_nack_for(
     client: &mut ClientEndpoint,
-    reassembler: &Reassembler,
+    reassembler: &mut Reassembler,
+    now_ms: u64,
     frame_id: Seq16,
     newer_seen: bool,
     targets: &mut [u16],
@@ -484,7 +489,9 @@ fn send_nack_for(
         return 0;
     }
     let n = reassembler.nack_targets(frame_id, newer_seen, targets);
-    if n > 0 && (newer_seen || reassembler.expected_count(frame_id).is_some()) {
+    if (newer_seen || reassembler.expected_count(frame_id).is_some())
+        && reassembler.nack_due(frame_id, n, now_ms)
+    {
         let _ = client.send_nack(frame_id, &targets[..n]);
         1
     } else {

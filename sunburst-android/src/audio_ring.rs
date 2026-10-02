@@ -94,6 +94,16 @@ impl PcmProducer {
 }
 
 impl PcmConsumer {
+    /// Samples currently buffered, seen from the consumer: at least this many
+    /// can be popped now.
+    pub fn available(&self) -> usize {
+        let inner = &*self.inner;
+        inner
+            .write
+            .load(Ordering::Acquire)
+            .wrapping_sub(inner.read.load(Ordering::Relaxed))
+    }
+
     /// Pop up to `dst.len()` samples into `dst`, returning the count read. The
     /// caller zero-fills `dst[count..]` (an underrun plays as silence).
     pub fn pop(&mut self, dst: &mut [i16]) -> usize {
@@ -122,6 +132,15 @@ mod tests {
         let (p, _c) = pcm_ring(100);
         // 100 -> 128; one slot is always usable, so free starts at 128.
         assert_eq!(p.push(&[7; 200]), 128);
+    }
+
+    #[test]
+    fn both_halves_agree_on_what_is_buffered() {
+        let (p, mut c) = pcm_ring(16);
+        p.push(&[1, 2, 3]);
+        assert_eq!((p.available(), c.available()), (3, 3));
+        c.pop(&mut [0; 2]);
+        assert_eq!((p.available(), c.available()), (1, 1));
     }
 
     #[test]
