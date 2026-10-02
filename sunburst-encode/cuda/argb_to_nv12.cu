@@ -40,6 +40,22 @@ __device__ __forceinline__ float pq_decode(float e) {  // e in [0,1] -> linear [
     return powf(num / (c2 - c3 * ep), 1.0f / m1);
 }
 
+// pq_decode of every 10-bit code. The input is always a 10-bit integer code, so
+// the two powf per channel per pixel (six a pixel, ~50M a 4K frame) reduce to a
+// lookup in a 4 KB table that stays in cache. Filled by init_pq_lut, which
+// cuda_convert.rs launches once each time it loads this module: the table is
+// per-module state.
+__device__ float pq_lut[1024];
+
+extern "C" __global__ void init_pq_lut() {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < 1024) pq_lut[i] = pq_decode((float)i / 1023.0f);
+}
+
+__device__ __forceinline__ float pq_code(float code10) {
+    return __ldg(&pq_lut[(int)code10]);   // unpack() yields exact integers 0..1023
+}
+
 // An HDR desktop draws SDR content at its SDR white (often 200-480 nits).
 // Normalised so that is 1.0, SDR content passes through untouched below KNEE;
 // above it, extended Reinhard on the excess rolls highlights off, continuous in
@@ -84,9 +100,9 @@ __device__ __forceinline__ void to_rec709(float r10, float g10, float b10, bool 
         return;
     }
     // HDR desktop: PQ BT.2020 -> linear -> Rec.709 primaries -> shoulder -> OETF.
-    float lr = pq_decode(r10 / 1023.0f);
-    float lg = pq_decode(g10 / 1023.0f);
-    float lb = pq_decode(b10 / 1023.0f);
+    float lr = pq_code(r10);
+    float lg = pq_code(g10);
+    float lb = pq_code(b10);
     // BT.2020 -> Rec.709 linear primaries.
     float r709 =  1.6605f * lr - 0.5876f * lg - 0.0728f * lb;
     float g709 = -0.1246f * lr + 1.1329f * lg - 0.0083f * lb;

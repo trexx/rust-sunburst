@@ -91,6 +91,20 @@ fn entries_do_real_work() {
 }
 
 #[test]
+fn the_pq_table_init_takes_no_params_and_fills_the_table() {
+    // cuda_convert.rs launches it with an empty parameter list before the first
+    // tonemapped frame; the tonemap kernels read the table it writes.
+    let body = entry(NV12, "init_pq_lut").expect("no entry `init_pq_lut`");
+    let params_end = body.find(')').expect("unterminated parameter list");
+    assert_eq!(body[..params_end].matches(".param").count(), 0);
+    assert!(
+        body.contains("st.global"),
+        "init_pq_lut never writes the table"
+    );
+    assert!(NV12.contains("pq_lut"), "the module has no pq_lut table");
+}
+
+#[test]
 fn the_sdr_p010_entries_write_sixteen_bit_samples() {
     // P010 is u16 per sample; an NV12 (u8) body under a P010 name would write
     // half-width planes and look plausible until it reached the TV.

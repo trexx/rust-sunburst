@@ -125,6 +125,20 @@ impl CudaConverter {
             .module_get_function(module, kernel_name)
             .map_err(|s| unpush(format!("cuModuleGetFunction: {s}")))?;
 
+        // The tonemap kernels read their PQ decode from a table that lives in
+        // this module instance and starts zeroed: fill it once, now, before the
+        // first frame (1024 entries, one thread each).
+        if hdr_source && output != ConvertOutput::P010 {
+            let init = cuda
+                .module_get_function(module, "init_pq_lut")
+                .map_err(|s| unpush(format!("cuModuleGetFunction(init_pq_lut): {s}")))?;
+            if cuda.launch_kernel(init, (4, 1, 1), (256, 1, 1), &mut []) != CUDA_SUCCESS
+                || cuda.ctx_synchronize() != CUDA_SUCCESS
+            {
+                return Err(unpush("init_pq_lut failed".into()));
+            }
+        }
+
         let out_buf = cuda
             .mem_alloc(bytes)
             .map_err(|s| unpush(format!("cuMemAlloc({bytes}): {s}")))?;
