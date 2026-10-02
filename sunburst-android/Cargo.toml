@@ -37,6 +37,6 @@ jni = "0.22.4"
 ndk = { version = "0.9", features = ["media", "audio", "api-level-30"] }
 ndk-sys = "0.6"
 ndk-context = "0.1.1"
-libc = "0.2.189"
+libc = "0.2.190"
 log = "0.4.34"
 android_logger = "0.15.1"
