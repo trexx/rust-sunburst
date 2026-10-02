@@ -474,11 +474,11 @@ fn run_inner(
                     {
                         let id = header.frame_id.0 as u32;
                         instr::record(Stage::AudioRecv, id);
-                        if let Some(pcm) = player.feed(payload, id)
-                            && route_pad
-                        {
-                            headsets.play(pcm);
-                        }
+                        player.feed(payload, id, |pcm| {
+                            if route_pad {
+                                headsets.play(pcm);
+                            }
+                        });
                     }
                 }
                 Some(Inbound::Rumble(r)) => pad_out.on_rumble(r, (mono_ns() / 1_000_000) as u32),

@@ -3,20 +3,28 @@
 
 //! Opus decode and low-latency AAudio playback.
 //!
-//! The client thread decodes each audio packet with [`OpusDecoder`] and pushes
-//! the PCM into a lock-free [`crate::audio_ring`]; AAudio's real-time data
-//! callback pops it. The stream is opened `LowLatency` at 48 kHz stereo i16.
+//! The client thread puts each audio packet back in order ([`crate::plc`]),
+//! decodes it with [`OpusDecoder`] and pushes the PCM into a lock-free
+//! [`crate::audio_ring`]; AAudio's real-time data callback pops it. The stream is
+//! opened `LowLatency` at 48 kHz stereo i16, with AAudio's own buffer cut to two
+//! bursts: the ring is the jitter buffer.
+//!
+//! The ring plays only once it holds a cushion ([`crate::playout`]): a burst
+//! plus a couple of frames, refilled (and grown a frame, capped) after an
+//! underrun.
 //!
 //! A/V sync, without a resampler: audio and video are stamped in the same server
 //! clock domain, and both play out on the client's `CLOCK_MONOTONIC` timeline.
 //! Residual crystal drift between the server's capture clock and the client's
 //! AAudio clock is kept bounded rather than corrected sample-accurately — the
-//! ring drops the newest frame once it fills past a watermark (client running
-//! slow), and the callback zero-fills on underrun (client running fast). Both
-//! bound the audio buffer, so the A/V offset cannot grow without limit over a
-//! long stream. Watermark and capacity are tuned on the boxes.
+//! producer drops the newest frame once the ring passes the cushion plus a few
+//! frames (client running slow), and an underrun rebuffers (client running
+//! fast). Both bound the audio buffer, so the A/V offset cannot grow without
+//! limit over a long stream.
 
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ndk::audio::{
     AudioCallbackResult, AudioDirection, AudioFormat, AudioPerformanceMode, AudioSharingMode,
@@ -30,7 +38,8 @@ use sunburst_gip_bridge::Bridge;
 use crate::audio_ring::{PcmProducer, pcm_ring};
 use crate::headset::HeadsetGate;
 use crate::mic::MicFramer;
-use crate::plc::{Arrival, AudioSequence};
+use crate::playout::Playout;
+use crate::plc::{AudioReorder, Event};
 
 /// Largest Opus frame we might decode (120 ms at 48 kHz), per channel — the
 /// scratch is sized for it even though the server sends 5 ms frames.
@@ -47,11 +56,12 @@ pub struct AudioPlayer {
     channels: usize,
     /// Samples per channel in one packet — the length of a concealed frame.
     frame_samples: usize,
-    /// The packet sequence, to notice losses and conceal them.
-    sequence: AudioSequence,
-    /// Drop a freshly-decoded frame once the ring holds more than this, to keep
-    /// buffering (and so A/V offset) bounded when the client runs slow.
-    high_watermark: usize,
+    /// Puts swapped packets back in order, and says which lost ones to conceal.
+    reorder: AudioReorder,
+    /// The playout cushion in samples, published by the callback (it grows on
+    /// an underrun). Past it plus a little slack a decoded frame is dropped, to
+    /// keep buffering (and so A/V offset) bounded when the client runs slow.
+    cushion: Arc<AtomicUsize>,
     /// Whether decoded audio plays on the TV (the AAudio stream). Off when the
     /// user routed audio to the pad headset only; the decode still happens so the
     /// pad fork gets its PCM.
@@ -70,11 +80,16 @@ impl AudioPlayer {
     ) -> Result<AudioPlayer, String> {
         let ch = channels as usize;
         let frame = frame_samples as usize * ch;
-        // ~16 frames of ring (a power of two after rounding); drop above ~8.
-        let capacity = frame * 16;
-        let high_watermark = frame * 8;
+        // Room for the largest cushion (a burst plus 8 frames) and its trim
+        // slack, whatever the burst turns out to be; a power of two after
+        // rounding.
+        let capacity = frame * 16 + 4096;
 
         let (producer, mut consumer) = pcm_ring(capacity);
+        // No trim until the first callback has sized the cushion.
+        let cushion = Arc::new(AtomicUsize::new(capacity));
+        let callback_cushion = Arc::clone(&cushion);
+        let mut playout: Option<Playout> = None;
 
         let stream = AudioStreamBuilder::new()
             .map_err(|e| format!("AAudio unavailable: {e}"))?
@@ -90,7 +105,20 @@ impl AudioPlayer {
                 let out = unsafe {
                     std::slice::from_raw_parts_mut(buf as *mut i16, frames as usize * ch)
                 };
-                let got = consumer.pop(out);
+                // Sized from the first callback: AAudio's burst is what it pulls.
+                let p = playout.get_or_insert_with(|| {
+                    let p = Playout::new(out.len(), frame);
+                    callback_cushion.store(p.target(), Ordering::Relaxed);
+                    p
+                });
+                let mut got = 0;
+                if p.should_play(consumer.available()) {
+                    got = consumer.pop(out);
+                    if got < out.len() {
+                        p.underrun();
+                        callback_cushion.store(p.target(), Ordering::Relaxed);
+                    }
+                }
                 for slot in &mut out[got..] {
                     *slot = 0; // underrun: play silence rather than stale data
                 }
@@ -98,6 +126,17 @@ impl AudioPlayer {
             }))
             .open_stream()
             .map_err(|e| format!("AAudio open failed: {e}"))?;
+
+        // AAudio's own buffer defaults far deeper than the ring needs (72 ms
+        // was seen queued in it on the Homatics). The ring is the jitter
+        // buffer; AAudio only needs enough to ride out a late callback.
+        let burst = stream.frames_per_burst();
+        let _ = stream.set_buffer_size_in_frames(burst * 2);
+        log::info!(
+            "audio: burst {burst} frames, AAudio buffer {} of {} frames",
+            stream.buffer_size_in_frames(),
+            stream.buffer_capacity_in_frames()
+        );
 
         stream
             .request_start()
@@ -113,48 +152,50 @@ impl AudioPlayer {
             scratch: vec![0i16; MAX_FRAME_SAMPLES * ch],
             channels: ch,
             frame_samples: frame_samples as usize,
-            sequence: AudioSequence::default(),
-            high_watermark,
+            reorder: AudioReorder::default(),
+            cushion,
             route_tv,
         })
     }
 
-    /// Decode one audio packet, play it on the TV (unless routed away or the ring
-    /// is overrun), and return the decoded interleaved stereo PCM so the caller
-    /// can also fork it to a pad headset. `id` is the packet's audio sequence
-    /// number, for the instrumentation chain.
-    ///
-    /// Packets lost just before this one are concealed first (Opus PLC, see
-    /// [`crate::plc`]) and played on the TV; a late or duplicate packet is
-    /// dropped, since its slot has already played.
-    pub fn feed(&mut self, payload: &[u8], id: u32) -> Option<&[i16]> {
-        let conceal = match self.sequence.on_packet(Seq16(id as u16)) {
-            Arrival::Stale => return None,
-            Arrival::Play { conceal } => conceal,
-        };
-        for _ in 0..conceal {
-            if let Ok(samples) = self.decoder.conceal(&mut self.scratch, self.frame_samples) {
-                self.play_tv(samples * self.channels, id);
+    /// Take one audio packet (sequence number `id`): put it back in order,
+    /// conceal what is lost (Opus PLC, see [`crate::plc`]), decode, and play each
+    /// result on the TV unless routed away or the ring is over its trim. `fork`
+    /// gets every played chunk of interleaved stereo PCM, for a pad headset.
+    pub fn feed(&mut self, payload: &[u8], id: u32, mut fork: impl FnMut(&[i16])) {
+        let AudioPlayer {
+            producer,
+            decoder,
+            scratch,
+            channels,
+            frame_samples,
+            reorder,
+            cushion,
+            route_tv,
+            ..
+        } = self;
+        let trim = Playout::trim_above(cushion.load(Ordering::Relaxed), *frame_samples * *channels);
+        reorder.push(Seq16(id as u16), payload, |event| {
+            let (samples, played) = match event {
+                Event::Decode(seq, opus) => {
+                    let Ok(n) = decoder.decode(opus, scratch, false) else {
+                        return;
+                    };
+                    instr::record(Stage::AudioDecode, seq.0 as u32);
+                    (n, seq.0 as u32)
+                }
+                Event::Conceal => match decoder.conceal(scratch, *frame_samples) {
+                    Ok(n) => (n, id),
+                    Err(_) => return,
+                },
+            };
+            let pcm = &scratch[..samples * *channels];
+            if *route_tv && producer.available() <= trim {
+                producer.push(pcm);
+                instr::record(Stage::AudioPlay, played);
             }
-        }
-        let samples = self
-            .decoder
-            .decode(payload, &mut self.scratch, false)
-            .ok()?;
-        instr::record(Stage::AudioDecode, id);
-        let n = samples * self.channels;
-        self.play_tv(n, id);
-        Some(&self.scratch[..n])
-    }
-
-    /// Play the first `n` scratch samples on the TV unless routed away, and
-    /// never past the overrun watermark (keeps buffering — and so A/V offset —
-    /// bounded when the client is slow).
-    fn play_tv(&mut self, n: usize, id: u32) {
-        if self.route_tv && self.producer.available() <= self.high_watermark {
-            self.producer.push(&self.scratch[..n]);
-            instr::record(Stage::AudioPlay, id);
-        }
+            fork(pcm);
+        });
     }
 }
 
