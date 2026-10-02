@@ -182,6 +182,55 @@ impl FrameAccumulator {
     }
 }
 
+/// How long loopback capture may deliver nothing before [`IdleFill`] calls the
+/// endpoint idle. Three 10 ms engine periods: longer than any gap between two
+/// periods of real audio, and the silence that follows is silence anyway.
+pub const IDLE_GRACE_US: u64 = 30_000;
+
+/// When to send silence because loopback capture went quiet.
+///
+/// Loopback emits no packets at all while nothing plays, so the sender fills
+/// the gap with silence frames to keep the client's stream moving. The silence
+/// must come only when the endpoint is idle, not between two of its periods:
+/// the capture loop polls faster than the engine delivers, so most polls with
+/// no new frame are just early. Treating each of those as idle spliced
+/// silence into real audio, sending ~1.2x real time, which the client heard as
+/// a quiet warble while it dropped the surplus.
+///
+/// So silence starts [`IDLE_GRACE_US`] after the last real frame, then follows
+/// the frame cadence until real audio returns.
+#[derive(Debug)]
+pub struct IdleFill {
+    frame_us: u64,
+    /// When the next silence frame is due; pushed out by every real frame.
+    next_silence_us: u64,
+}
+
+impl IdleFill {
+    /// Start a stream at `now_us`: with no audio, silence begins after the grace.
+    pub fn new(frame_us: u64, now_us: u64) -> IdleFill {
+        IdleFill {
+            frame_us: frame_us.max(1),
+            next_silence_us: now_us + IDLE_GRACE_US,
+        }
+    }
+
+    /// One capture poll at `now_us` that produced `real_frames` frames. Returns
+    /// how many silence frames to send now (0 while real audio is flowing).
+    pub fn on_poll(&mut self, real_frames: u64, now_us: u64) -> u64 {
+        if real_frames > 0 {
+            self.next_silence_us = now_us + IDLE_GRACE_US;
+            return 0;
+        }
+        if now_us < self.next_silence_us {
+            return 0;
+        }
+        let due = (now_us - self.next_silence_us) / self.frame_us + 1;
+        self.next_silence_us += due * self.frame_us;
+        due
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +345,56 @@ mod tests {
         assert_eq!(frame, [9, 10, 11, 12, 13, 14, 15, 16]);
         assert!(!acc.pop_frame(&mut frame), "drained");
         assert_eq!(acc.buffered(), 0);
+    }
+
+    #[test]
+    fn real_audio_with_empty_polls_between_periods_gets_no_silence() {
+        // 10 ms engine periods of 4 x 2.5 ms frames, polled every ~5 ms: every
+        // other poll is empty, and none of them may add silence.
+        let mut fill = IdleFill::new(2_500, 0);
+        let mut silence = 0;
+        for poll in 0..400u64 {
+            let now = poll * 5_200;
+            let real = if poll % 2 == 0 { 4 } else { 0 };
+            silence += fill.on_poll(real, now);
+        }
+        assert_eq!(silence, 0);
+    }
+
+    #[test]
+    fn an_idle_endpoint_gets_silence_at_the_frame_cadence_after_the_grace() {
+        let mut fill = IdleFill::new(2_500, 0);
+        assert_eq!(fill.on_poll(4, 0), 0);
+        assert_eq!(fill.on_poll(0, IDLE_GRACE_US - 1), 0, "still in the grace");
+        assert_eq!(fill.on_poll(0, IDLE_GRACE_US), 1, "first silence frame");
+        // 100 ms of 5 ms polls: 2 frames each, 40 in all, never more.
+        let mut sent = 0;
+        for poll in 1..=20u64 {
+            sent += fill.on_poll(0, IDLE_GRACE_US + poll * 5_000);
+        }
+        assert_eq!(sent, 40);
+    }
+
+    #[test]
+    fn a_late_poll_catches_up_the_frames_it_missed() {
+        let mut fill = IdleFill::new(2_500, 0);
+        assert_eq!(fill.on_poll(0, IDLE_GRACE_US + 9_999), 4);
+        assert_eq!(fill.on_poll(0, IDLE_GRACE_US + 10_000), 1);
+    }
+
+    #[test]
+    fn real_audio_returning_stops_the_silence_and_restarts_the_grace() {
+        let mut fill = IdleFill::new(2_500, 0);
+        assert!(fill.on_poll(0, 100_000) > 0);
+        assert_eq!(fill.on_poll(2, 105_000), 0);
+        assert_eq!(fill.on_poll(0, 105_000 + IDLE_GRACE_US - 1), 0);
+        assert_eq!(fill.on_poll(0, 105_000 + IDLE_GRACE_US), 1);
+    }
+
+    #[test]
+    fn a_stream_that_never_has_audio_starts_silence_after_the_grace() {
+        let mut fill = IdleFill::new(5_000, 1_000);
+        assert_eq!(fill.on_poll(0, 1_000), 0);
+        assert_eq!(fill.on_poll(0, 1_000 + IDLE_GRACE_US), 1);
     }
 }
