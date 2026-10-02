@@ -63,6 +63,15 @@ fn init_logging() {
                 .with_max_level(log::LevelFilter::Info)
                 .with_tag("sunburst"),
         );
+        // A panic on any thread but the JNI caller's prints to stderr, which
+        // Android discards: a worker thread just vanished without a word. Route
+        // the message, and where it was raised, to logcat first.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            log::error!("panic on {}: {info}", thread.name().unwrap_or("unnamed"));
+            default_hook(info);
+        }));
         start_instr_reports();
     });
 }
