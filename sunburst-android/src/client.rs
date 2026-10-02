@@ -208,6 +208,14 @@ pub struct StreamPrefs {
     pub display_hdr: bool,
 }
 
+/// Most datagrams handled per pass before the loop services the decoder,
+/// input and feedback: enough to clear a burst in a few passes.
+const RECV_BATCH: usize = 64;
+
+/// Longest a pass keeps receiving. Bounds how late a decoded frame is
+/// presented, or queued input sent, while packets keep arriving.
+const RECV_BUDGET: Duration = Duration::from_millis(1);
+
 /// Run the client until `stop` is set. `codecs` is the bitmask the device can
 /// decode (`sunburst_core::proto::codecs`); the server negotiates one of them.
 #[allow(clippy::too_many_arguments)]
@@ -384,90 +392,103 @@ fn run_inner(
     let mut pad_out = PadOutputRouter::new(BridgePadSink);
 
     while !stop.load(Ordering::Relaxed) {
-        match client.recv().map_err(|e| e.to_string())? {
-            Some(Inbound::Video(pkt)) => {
-                let fid = sunburst_core::proto::Header::decode(&pkt).map(|h| h.frame_id);
-                if let Some(fid) = fid {
-                    newest_seen = Some(match newest_seen {
-                        Some(n) if n.is_newer_than(fid) => n,
-                        _ => fid,
-                    });
-                }
-                match reassembler.push(&pkt) {
-                    Accept::Complete(frame) => {
-                        received += 1;
-                        instr::record(Stage::Recv, frame.frame_id.0 as u32);
-                        owd.push(ticks.to_ns(frame.qpc_timestamp), mono_ns());
-                        if let Err(f) = jitter.push(frame, mono_ns() as u64) {
-                            reassembler.release(f);
-                        }
+        // Drain what the socket holds before the per-pass work below. That work
+        // (a MediaCodec round trip, the input channel, the pads) used to run
+        // after every datagram, so its cost scaled with the packet rate; under a
+        // 4K burst it fell behind and the kernel dropped what did not fit in the
+        // receive buffer. The batch ends on the read timeout when the socket is
+        // empty, or at the cap or the time budget, so a steady trickle of
+        // packets cannot hold input and presentation back either.
+        let batch_end = Instant::now() + RECV_BUDGET;
+        for _ in 0..RECV_BATCH {
+            match client.recv().map_err(|e| e.to_string())? {
+                Some(Inbound::Video(pkt)) => {
+                    let fid = sunburst_core::proto::Header::decode(&pkt).map(|h| h.frame_id);
+                    if let Some(fid) = fid {
+                        newest_seen = Some(match newest_seen {
+                            Some(n) if n.is_newer_than(fid) => n,
+                            _ => fid,
+                        });
                     }
-                    Accept::Buffered => {
-                        if let Some(fid) = fid {
-                            let newer = newest_seen.is_some_and(|n| n.is_newer_than(fid));
-                            if newer || reassembler.expected_count(fid).is_some() {
-                                let n = reassembler.nack_targets(fid, newer, &mut targets);
-                                if n > 0 {
-                                    let _ = client.send_nack(fid, &targets[..n]);
+                    match reassembler.push(&pkt) {
+                        Accept::Complete(frame) => {
+                            received += 1;
+                            instr::record(Stage::Recv, frame.frame_id.0 as u32);
+                            owd.push(ticks.to_ns(frame.qpc_timestamp), mono_ns());
+                            if let Err(f) = jitter.push(frame, mono_ns() as u64) {
+                                reassembler.release(f);
+                            }
+                        }
+                        Accept::Buffered => {
+                            if let Some(fid) = fid {
+                                let newer = newest_seen.is_some_and(|n| n.is_newer_than(fid));
+                                if newer || reassembler.expected_count(fid).is_some() {
+                                    let n = reassembler.nack_targets(fid, newer, &mut targets);
+                                    if reassembler.nack_due(fid, n, mono_ms()) {
+                                        let _ = client.send_nack(fid, &targets[..n]);
+                                    }
                                 }
                             }
                         }
+                        Accept::Ignored => {}
                     }
-                    Accept::Ignored => {}
                 }
-            }
-            // A rebuild on the server (AccessLost, an HDR<->SDR flip).
-            Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
-                if classify(&current, &cp) == Change::Reconfigure {
-                    log::info!(
-                        "reconfiguring the decoder for build at frame {}: {}x{} {:?}",
-                        cp.first_frame.0,
-                        cp.width,
-                        cp.height,
-                        cp.color
-                    );
-                    decoder.reconfigure(&cp, fps, window)?;
-                    gate.close(cp.first_frame, last_fed, mono_ms());
-                    cursor.set_space(cp.width, cp.height);
+                // A rebuild on the server (AccessLost, an HDR<->SDR flip).
+                Some(Inbound::Control(ServerControl::CodecPrivate(cp))) => {
+                    if classify(&current, &cp) == Change::Reconfigure {
+                        log::info!(
+                            "reconfiguring the decoder for build at frame {}: {}x{} {:?}",
+                            cp.first_frame.0,
+                            cp.width,
+                            cp.height,
+                            cp.color
+                        );
+                        decoder.reconfigure(&cp, fps, window)?;
+                        gate.close(cp.first_frame, last_fed, mono_ms());
+                        cursor.set_space(cp.width, cp.height);
+                    }
+                    current = cp;
                 }
-                current = cp;
-            }
-            Some(Inbound::Control(ServerControl::Bye)) => {
-                return Err("the server ended the stream".into());
-            }
-            Some(Inbound::Control(ServerControl::CursorShape(c))) => {
-                if let Some((bgra, w, h, hx, hy)) = cursor_shape.push(&c) {
-                    callbacks.cursor_shape(&bgra, w, h, hx, hy);
+                Some(Inbound::Control(ServerControl::Bye)) => {
+                    return Err("the server ended the stream".into());
                 }
-            }
-            Some(Inbound::Control(ServerControl::CursorPosition {
-                x,
-                y,
-                visible,
-                input_seq,
-            })) => {
-                // For the UI thread's prediction, then the upcall that makes it
-                // look (and the fallback position when it is not predicting).
-                cursor.publish(x, y, visible, input_seq);
-                callbacks.cursor_position(x as i32, y as i32, visible);
-            }
-            Some(Inbound::Audio(pkt)) => {
-                if let Some(player) = audio_player.as_mut()
-                    && let Some((header, payload)) = sunburst_net::parse_audio_packet(&pkt)
-                {
-                    let id = header.frame_id.0 as u32;
-                    instr::record(Stage::AudioRecv, id);
-                    if let Some(pcm) = player.feed(payload, id)
-                        && route_pad
+                Some(Inbound::Control(ServerControl::CursorShape(c))) => {
+                    if let Some((bgra, w, h, hx, hy)) = cursor_shape.push(&c) {
+                        callbacks.cursor_shape(&bgra, w, h, hx, hy);
+                    }
+                }
+                Some(Inbound::Control(ServerControl::CursorPosition {
+                    x,
+                    y,
+                    visible,
+                    input_seq,
+                })) => {
+                    // For the UI thread's prediction, then the upcall that makes it
+                    // look (and the fallback position when it is not predicting).
+                    cursor.publish(x, y, visible, input_seq);
+                    callbacks.cursor_position(x as i32, y as i32, visible);
+                }
+                Some(Inbound::Audio(pkt)) => {
+                    if let Some(player) = audio_player.as_mut()
+                        && let Some((header, payload)) = sunburst_net::parse_audio_packet(&pkt)
                     {
-                        headsets.play(pcm);
+                        let id = header.frame_id.0 as u32;
+                        instr::record(Stage::AudioRecv, id);
+                        if let Some(pcm) = player.feed(payload, id)
+                            && route_pad
+                        {
+                            headsets.play(pcm);
+                        }
                     }
                 }
+                Some(Inbound::Rumble(r)) => pad_out.on_rumble(r, (mono_ns() / 1_000_000) as u32),
+                Some(Inbound::PadOutput(o)) => pad_out.on_pad_output(o),
+                Some(_) => {}
+                None => break,
             }
-            Some(Inbound::Rumble(r)) => pad_out.on_rumble(r, (mono_ns() / 1_000_000) as u32),
-            Some(Inbound::PadOutput(o)) => pad_out.on_pad_output(o),
-            Some(_) => {}
-            None => client.tick().map_err(|e| e.to_string())?,
+            if Instant::now() >= batch_end {
+                break;
+            }
         }
 
         // Release due frames into the decoder.

@@ -113,7 +113,7 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi
 
       - name: arm64-v8a (Shield)
-        run: cargo build -p sunburst-android --target aarch64-linux-android
+        run: cargo build --release -p sunburst-android --target aarch64-linux-android
 
       # Host clippy only sees the crate's empty (non-Android) shell, so lint the
       # real Android target here — the same reasoning as `cargo xwin clippy` for
@@ -124,7 +124,7 @@ jobs:
       # armeabi-v7a is not optional: the Homatics ships a 32-bit userspace on a
       # 64-bit SoC, so dropping it drops half the supported hardware.
       - name: armeabi-v7a (Homatics)
-        run: cargo build -p sunburst-android --target armv7-linux-androideabi
+        run: cargo build --release -p sunburst-android --target armv7-linux-androideabi
 
       # Cache the hash-verified firmware so most builds skip the Microsoft
       # download entirely; it is fetched only on a cold miss. The key is tied to
@@ -175,6 +175,23 @@ jobs:
               || { echo "missing lib/$abi/libsunburst_android.so in the APK"; exit 1; }
           done
           echo "both ABIs packaged"
+
+      - name: Assert the packaged client library is optimised
+        # A debug (opt-level 0) client cannot keep up with a 4K stream: the
+        # socket overflows and video and audio stutter. Overflow-check panic
+        # strings exist only in a debug-profile build, so their absence is the
+        # tell.
+        run: |
+          set -euo pipefail
+          apk=android/app/build/outputs/apk/debug/app-debug.apk
+          dir=$(mktemp -d)
+          unzip -q "$apk" 'lib/*' -d "$dir"
+          for so in "$dir"/lib/*/libsunburst_android.so; do
+            if strings "$so" | grep -q 'attempt to add with overflow'; then
+              echo "$so is a debug build"; exit 1
+            fi
+          done
+          echo "client library is a release build"
 
       # Fail loudly rather than ship a silently firmware-less APK if the fetch
       # above regressed.
