@@ -27,8 +27,11 @@ use sunburst_net::MAX_AUDIO_PACKET;
 pub const MAX_CONCEALED: u16 = 3;
 
 /// How far ahead of the next expected packet one may arrive before that packet
-/// is given up on. At 2.5 ms frames, 3 holds a swap for up to 5 ms.
-pub const WINDOW: u16 = 3;
+/// is given up on. At 2.5 ms frames, 8 waits up to 17.5 ms for a late packet,
+/// inside the playout cushion. 3 was too few on the Homatics: packets arriving
+/// three or more places late were concealed and then dropped, and the stream
+/// of PLC frames sounded like water sloshing.
+pub const WINDOW: u16 = 8;
 
 /// A packet this far ahead is a new stream position, not a reorder: drop what
 /// is held and start again from it.
@@ -195,28 +198,57 @@ mod tests {
         assert_eq!(run(&[0, 2, 3, 1, 4]), ev(&["0", "1", "2", "3", "4"]));
     }
 
+    /// `0`, then `2..=last`: packet 1 missing.
+    fn without_one(last: u16) -> Vec<u16> {
+        std::iter::once(0).chain(2..=last).collect()
+    }
+
+    /// What `without_one(last)` plays once 1 is given up on: 0, a conceal, then
+    /// 2..=last.
+    fn concealed_one(last: u16) -> Vec<String> {
+        let mut e = ev(&["0", "C"]);
+        e.extend((2..=last).map(|i| i.to_string()));
+        e
+    }
+
     #[test]
-    fn a_lost_packet_is_concealed_once_the_window_is_exceeded() {
-        // 1 never comes: 2 and 3 are held, 4 gives up on it.
-        assert_eq!(run(&[0, 2, 3, 4, 5]), ev(&["0", "C", "2", "3", "4", "5"]));
+    fn a_packet_most_of_the_window_late_still_makes_it() {
+        // 1 arrives after WINDOW - 2 later ones: still in time.
+        let mut ids = without_one(WINDOW - 1);
+        ids.push(1);
+        let want: Vec<String> = (0..WINDOW).map(|i| i.to_string()).collect();
+        assert_eq!(run(&ids), want);
+    }
+
+    #[test]
+    fn a_lost_packet_is_held_for_until_the_window_is_exceeded() {
+        // 1 never comes. Everything up to WINDOW waits for it...
+        assert_eq!(run(&without_one(WINDOW)), ev(&["0"]));
+        // ...and the packet WINDOW past it gives up on it.
+        assert_eq!(run(&without_one(WINDOW + 1)), concealed_one(WINDOW + 1));
     }
 
     #[test]
     fn a_late_packet_after_its_slot_was_concealed_is_dropped() {
-        assert_eq!(
-            run(&[0, 2, 3, 4, 1, 5]),
-            ev(&["0", "C", "2", "3", "4", "5"])
-        );
+        let mut ids = without_one(WINDOW + 1);
+        ids.push(1);
+        assert_eq!(run(&ids), concealed_one(WINDOW + 1));
     }
 
     #[test]
     fn a_short_run_of_losses_is_concealed_packet_by_packet() {
-        assert_eq!(run(&[0, 4, 5]), ev(&["0", "C", "C", "C", "4", "5"]));
+        // 1-3 lost; the run is given up on once a packet passes the window.
+        let mut ids = vec![0];
+        ids.extend(4..=3 + WINDOW);
+        let mut want = ev(&["0", "C", "C", "C"]);
+        want.extend((4..=3 + WINDOW).map(|i| i.to_string()));
+        assert_eq!(run(&ids), want);
     }
 
     #[test]
     fn a_long_run_is_skipped_for_a_resync() {
-        assert_eq!(run(&[0, 10, 11]), ev(&["0", "10", "11"]));
+        // 1-19 lost: past MAX_CONCEALED, so skipped rather than concealed.
+        assert_eq!(run(&[0, 20, 21]), ev(&["0", "20", "21"]));
     }
 
     #[test]

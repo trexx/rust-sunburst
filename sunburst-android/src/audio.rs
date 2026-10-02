@@ -10,21 +10,22 @@
 //! bursts: the ring is the jitter buffer.
 //!
 //! The ring plays only once it holds a cushion ([`crate::playout`]): a burst
-//! plus a couple of frames, refilled (and grown a frame, capped) after an
-//! underrun.
+//! plus the peak gap between packet arrivals (decaying slowly) plus a frame,
+//! refilled after an underrun, which also raises the peak.
 //!
 //! A/V sync, without a resampler: audio and video are stamped in the same server
 //! clock domain, and both play out on the client's `CLOCK_MONOTONIC` timeline.
 //! Residual crystal drift between the server's capture clock and the client's
 //! AAudio clock is kept bounded rather than corrected sample-accurately — the
-//! producer drops the newest frame once the ring passes the cushion plus a few
-//! frames (client running slow), and an underrun rebuffers (client running
+//! producer drops the newest frame once the ring passes the cushion plus another
+//! peak gap and a few frames (client running slow), and an underrun rebuffers (client running
 //! fast). Both bound the audio buffer, so the A/V offset cannot grow without
 //! limit over a long stream.
 
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ndk::audio::{
     AudioCallbackResult, AudioDirection, AudioFormat, AudioPerformanceMode, AudioSharingMode,
@@ -38,7 +39,7 @@ use sunburst_gip_bridge::Bridge;
 use crate::audio_ring::{PcmProducer, pcm_ring};
 use crate::headset::HeadsetGate;
 use crate::mic::MicFramer;
-use crate::playout::Playout;
+use crate::playout::{Cushion, Gate};
 use crate::plc::{AudioReorder, Event};
 
 /// Largest Opus frame we might decode (120 ms at 48 kHz), per channel — the
@@ -58,10 +59,19 @@ pub struct AudioPlayer {
     frame_samples: usize,
     /// Puts swapped packets back in order, and says which lost ones to conceal.
     reorder: AudioReorder,
-    /// The playout cushion in samples, published by the callback (it grows on
-    /// an underrun). Past it plus a little slack a decoded frame is dropped, to
-    /// keep buffering (and so A/V offset) bounded when the client runs slow.
-    cushion: Arc<AtomicUsize>,
+    /// The arrival jitter, and the cushion and trim sized from it. Past the
+    /// trim a decoded frame is dropped, to keep buffering (and so A/V offset)
+    /// bounded when the client runs slow.
+    jitter: Cushion,
+    /// The cushion the callback waits for, published from `jitter`.
+    target: Arc<AtomicUsize>,
+    /// Underruns the callback has had, and how many `jitter` has taken in.
+    underruns: Arc<AtomicU32>,
+    underruns_seen: u32,
+    /// When the previous packet arrived, for the gap to this one.
+    last_arrival: Option<Instant>,
+    /// Interleaved samples of playback per second, to turn a gap into samples.
+    samples_per_sec: f64,
     /// Whether decoded audio plays on the TV (the AAudio stream). Off when the
     /// user routed audio to the pad headset only; the decode still happens so the
     /// pad fork gets its PCM.
@@ -80,16 +90,18 @@ impl AudioPlayer {
     ) -> Result<AudioPlayer, String> {
         let ch = channels as usize;
         let frame = frame_samples as usize * ch;
-        // Room for the largest cushion (a burst plus 8 frames) and its trim
-        // slack, whatever the burst turns out to be; a power of two after
-        // rounding.
-        let capacity = frame * 16 + 4096;
+        // Room for the largest cushion and trim (two peaks of 24 frames, plus a
+        // burst and slack), whatever the burst turns out to be; a power of two
+        // after rounding.
+        let capacity = frame * 64 + 4096;
 
         let (producer, mut consumer) = pcm_ring(capacity);
-        // No trim until the first callback has sized the cushion.
-        let cushion = Arc::new(AtomicUsize::new(capacity));
-        let callback_cushion = Arc::clone(&cushion);
-        let mut playout: Option<Playout> = None;
+        // Never reached until the stream is open and the real target published.
+        let target = Arc::new(AtomicUsize::new(usize::MAX));
+        let callback_target = Arc::clone(&target);
+        let underruns = Arc::new(AtomicU32::new(0));
+        let callback_underruns = Arc::clone(&underruns);
+        let mut gate = Gate::default();
 
         let stream = AudioStreamBuilder::new()
             .map_err(|e| format!("AAudio unavailable: {e}"))?
@@ -105,18 +117,13 @@ impl AudioPlayer {
                 let out = unsafe {
                     std::slice::from_raw_parts_mut(buf as *mut i16, frames as usize * ch)
                 };
-                // Sized from the first callback: AAudio's burst is what it pulls.
-                let p = playout.get_or_insert_with(|| {
-                    let p = Playout::new(out.len(), frame);
-                    callback_cushion.store(p.target(), Ordering::Relaxed);
-                    p
-                });
                 let mut got = 0;
-                if p.should_play(consumer.available()) {
+                let target = callback_target.load(Ordering::Relaxed);
+                if gate.should_play(consumer.available(), target) {
                     got = consumer.pop(out);
                     if got < out.len() {
-                        p.underrun();
-                        callback_cushion.store(p.target(), Ordering::Relaxed);
+                        gate.underrun();
+                        callback_underruns.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 for slot in &mut out[got..] {
@@ -138,6 +145,10 @@ impl AudioPlayer {
             stream.buffer_capacity_in_frames()
         );
 
+        // The callback's size is what the cushion must cover beyond the jitter.
+        let jitter = Cushion::new(burst.max(1) as usize * ch, frame);
+        target.store(jitter.target(), Ordering::Relaxed);
+
         stream
             .request_start()
             .map_err(|e| format!("AAudio start failed: {e}"))?;
@@ -153,7 +164,12 @@ impl AudioPlayer {
             channels: ch,
             frame_samples: frame_samples as usize,
             reorder: AudioReorder::default(),
-            cushion,
+            jitter,
+            target,
+            underruns,
+            underruns_seen: 0,
+            last_arrival: None,
+            samples_per_sec: f64::from(sample_rate) * ch as f64,
             route_tv,
         })
     }
@@ -170,11 +186,27 @@ impl AudioPlayer {
             channels,
             frame_samples,
             reorder,
-            cushion,
+            jitter,
+            target,
+            underruns,
+            underruns_seen,
+            last_arrival,
+            samples_per_sec,
             route_tv,
             ..
         } = self;
-        let trim = Playout::trim_above(cushion.load(Ordering::Relaxed), *frame_samples * *channels);
+        // Size the cushion from this packet's gap and any underruns since.
+        let now = Instant::now();
+        if let Some(prev) = last_arrival.replace(now) {
+            jitter.on_arrival(((now - prev).as_secs_f64() * *samples_per_sec) as usize);
+        }
+        let seen = underruns.load(Ordering::Relaxed);
+        for _ in 0..seen.wrapping_sub(*underruns_seen) {
+            jitter.on_underrun();
+        }
+        *underruns_seen = seen;
+        target.store(jitter.target(), Ordering::Relaxed);
+        let trim = jitter.trim_above();
         reorder.push(Seq16(id as u16), payload, |event| {
             let (samples, played) = match event {
                 Event::Decode(seq, opus) => {
