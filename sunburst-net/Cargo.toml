@@ -15,7 +15,7 @@ thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # setsockopt for the socket buffer sizes (`sockbuf`).
-libc = "0.2.189"
+libc = "0.2.190"
 
 [target.'cfg(windows)'.dependencies]
 # UDP send offload (WSASendMsg + UDP_SEND_MSG_SIZE). Cross-platform code lives
