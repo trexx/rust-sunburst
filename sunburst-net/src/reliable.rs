@@ -105,11 +105,9 @@ fn fresh_epoch() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
-    let prev = LAST_EPOCH
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-            Some(now.max(last + 1))
-        })
-        .expect("the closure always returns Some");
+    let prev = LAST_EPOCH.update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        now.max(last + 1)
+    });
     now.max(prev + 1)
 }
 
