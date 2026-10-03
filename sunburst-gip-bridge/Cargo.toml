@@ -36,4 +36,4 @@ vendored = []
 # Android (see build.rs); on every other build it does nothing, so the dep is
 # cheap and the host toolchain is never invoked.
 [build-dependencies]
-cc = "1.5.1"
+cc = "1.6.0"
