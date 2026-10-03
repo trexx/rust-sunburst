@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # On demand, from the Actions tab, for any branch: the one way to get the
+  # Windows artifact for a PR branch without merging it first.
+  workflow_dispatch:
 
 # RUSTFLAGS is set per job, not here: Cargo takes extra flags from exactly one
 # source, and RUSTFLAGS beats `.cargo/config.toml`'s per-target rustflags. Set
