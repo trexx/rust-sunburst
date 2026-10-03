@@ -7,11 +7,40 @@
 # API 30 is deliberate and not merely the minSdk: KEY_LOW_LATENCY and
 # Surface.setFrameRate() both landed exactly there.
 
+# Each target maps to exactly one machine (CLAUDE.md "Hardware targets"), so it
+# is compiled for what that machine's CPU is known to have. These apply only when Cargo's extra flags
+# come from here: a RUSTFLAGS environment variable replaces them entirely (see
+# ci.yml's `env:`).
+#
+# arm64-v8a is the Shield alone: Tegra X1, Cortex-A57. The ABI already
+# guarantees NEON; this tunes for the core.
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android30-clang"
+rustflags = ["-C", "target-cpu=cortex-a57"]
 
+# armeabi-v7a is the Homatics alone: Amlogic S905X4, Cortex-A55 cores running
+# a 32-bit userspace. Rust's armv7 Android target leaves NEON *off* (a holdover
+# from pre-NEON phones), so without this the client was scalar: Opus decode,
+# PCM conversion and the reassembler's copies never vectorised. `+neon` is
+# needed as well as the core: the target spec's `-neon` beats the core's
+# default (cortex-a55 alone left 124 NEON ops in the library; with `+neon`,
+# 1410). rustc warns that `neon` is an unstable feature flag on 32-bit ARM; it
+# is the only way to get NEON on this target, so the warning is expected.
 [target.armv7-linux-androideabi]
 linker = "armv7a-linux-androideabi30-clang"
+rustflags = ["-C", "target-cpu=cortex-a55", "-C", "target-feature=+neon"]
+
+# Both cores imply optional extensions (crypto, and on the A55 dot-product) not
+# confirmed on either box. A disassembly of both client libraries found no
+# AES/SHA/PMULL/dot-product instruction at all: nothing here uses them except
+# through intrinsics, which this code does not call. Re-check with llvm-objdump
+# if a crypto crate lands in the client.
+
+# The server is the 4070 box alone: a Coffee Lake CPU, which has AVX2, FMA
+# and BMI2 (x86-64-v3). The default target stops at SSE3. A CPU without AVX2
+# cannot run this binary, which is the point of pinning the hardware.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 # `cc` (sunburst-gip-bridge's vendored C/C++, built only for Android) guesses the
 # wrong compiler name for armv7 — `arm-linux-androideabi-clang`, an old

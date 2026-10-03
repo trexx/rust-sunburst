@@ -596,6 +596,16 @@ linker = "aarch64-linux-android30-clang"
 linker = "armv7a-linux-androideabi30-clang"
 ```
 
+**Each target is compiled for its one machine's CPU** (`.cargo/config.toml`):
+armv7 gets `target-cpu=cortex-a55` plus `+neon`, because Rust's armv7 Android
+target ships with NEON *off* and the client was scalar until this was set.
+aarch64 gets `cortex-a57`, and the Windows server gets `x86-64-v3` (the box is
+Coffee Lake). A `RUSTFLAGS` environment variable replaces these silently, since
+Cargo takes extra flags from one source only. So CI sets it per lint/test job,
+never on the artifact jobs, and a local `RUSTFLAGS` produces a build that is not
+what ships. 32-bit ARM disassembly needs the unstripped library to count NEON
+ops; a stripped one decodes Thumb as ARM.
+
 targetSdk 34 brings Android 14 rules: declare `foregroundServiceType`, and
 runtime-registered receivers need explicit `RECEIVER_EXPORTED`/`RECEIVER_NOT_EXPORTED`.
 If AGP rejects compileSdk 37, `android.suppressUnsupportedCompileSdk=37` unblocks.
