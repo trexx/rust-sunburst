@@ -26,13 +26,14 @@ use sunburst_net::{
 
 use crate::cursor_predict::CursorShared;
 use crate::decode::Decoder;
-use crate::input_map::{ClientInput, InputAccumulator};
+use crate::input_map::{ClientInput, InputAccumulator, PadAnnouncer};
 use crate::pad::{PadOutputRouter, PadSink};
 use crate::reconfig::{Change, KeyframeGate, classify};
-use sunburst_core::proto::input::GamepadState;
+use sunburst_core::proto::input::{GamepadState, presence};
 use sunburst_core::proto::padoutput::PadOutput;
 use sunburst_core::proto::rumble::Rumble;
 use sunburst_gip_bridge::PadEvent;
+use sunburst_input::pad::registry::PadType;
 
 /// Where decoded server→client pad output goes: the physical controller, via the
 /// currently-attached GIP bridge. The bridge lives in a process global set by the
@@ -53,6 +54,11 @@ impl PadSink for BridgePadSink {
         }
     }
 }
+
+/// What an Xbox pad on the GIP bridge is announced as: its own family, and the
+/// battery section its input carries.
+const GIP_PAD: PadType = PadType::XboxSeriesXS;
+const GIP_CAPS: u16 = presence::BATTERY as u16;
 
 /// CLOCK_MONOTONIC nanoseconds — the base `MediaCodec` release timestamps and
 /// `System.nanoTime()` share.
@@ -386,6 +392,7 @@ fn run_inner(
     let mut last_feedback = Instant::now();
     let mut last_keepalive = Instant::now();
     let mut input_acc = InputAccumulator::new();
+    let mut pads = PadAnnouncer::new();
     let mut cursor_shape = CursorReassembler::default();
     // Server→client rumble/pad-output, deduplicated and timed out before it
     // reaches the pad. The sink is a stub until the GIP bridge lands (Stage B).
@@ -568,6 +575,13 @@ fn run_inner(
         // counter.
         while let Ok(raw) = input_rx.try_recv() {
             let seq = raw.seq();
+            // The TV-native pad has no connect event; its first input announces
+            // it. Its family is unknown here, so it gets the universal fallback.
+            if raw.is_native_pad()
+                && let Some(c) = pads.connect(0, PadType::Xbox360, 0)
+            {
+                let _ = client.send_control(&c);
+            }
             if let Some(event) = input_acc.apply(raw) {
                 let input_seq = seq.unwrap_or_else(|| cursor.next_seq());
                 let _ = client.send_input(&InputPacket { input_seq, event });
@@ -581,19 +595,39 @@ fn run_inner(
             while let Some(ev) = bridge.poll() {
                 let (index, state) = match ev {
                     PadEvent::Input(state) => (state.pad_index, state),
-                    // A neutral state so the server releases held buttons/sticks.
-                    PadEvent::Disconnected { index } => (
-                        index,
-                        GamepadState {
+                    PadEvent::Disconnected { index } => {
+                        // A neutral state first, so a held button is released
+                        // even if the unplug is slow to land; then the unplug.
+                        let neutral = GamepadState {
                             pad_index: index,
                             ..Default::default()
-                        },
-                    ),
+                        };
+                        if let Some(event) = input_acc.apply(ClientInput::Pad {
+                            index,
+                            state: neutral,
+                        }) {
+                            let input_seq = cursor.next_seq();
+                            let _ = client.send_input(&InputPacket { input_seq, event });
+                        }
+                        if let Some(c) = pads.disconnect(index) {
+                            let _ = client.send_control(&c);
+                        }
+                        log::info!("gip: pad {index} disconnected");
+                        continue;
+                    }
                     PadEvent::Connected { index } => {
+                        if let Some(c) = pads.connect(index, GIP_PAD, GIP_CAPS) {
+                            let _ = client.send_control(&c);
+                        }
                         log::info!("gip: pad {index} connected");
                         continue;
                     }
                 };
+                // A pad attached before this session began announced itself to
+                // the last one; its first input here announces it to this one.
+                if let Some(c) = pads.connect(index, GIP_PAD, GIP_CAPS) {
+                    let _ = client.send_control(&c);
+                }
                 if let Some(event) = input_acc.apply(ClientInput::Pad { index, state }) {
                     let input_seq = cursor.next_seq();
                     let _ = client.send_input(&InputPacket { input_seq, event });
@@ -633,8 +667,12 @@ fn run_inner(
         client.tick().map_err(|e| e.to_string())?;
     }
 
-    // Tell the server now, so the stream stops at once and a reconnect is not
-    // left waiting on the old one's timeout.
+    // Unplug this session's virtual pads, then tell the server now, so the
+    // stream stops at once and a reconnect is not left waiting on the old one's
+    // timeout. `bye` waits for the reliable channel to drain, unplugs included.
+    for c in pads.disconnect_all() {
+        let _ = client.send_control(&c);
+    }
     client.bye();
     decoder.stop();
     Ok(())
