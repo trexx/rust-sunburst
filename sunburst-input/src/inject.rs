@@ -200,6 +200,8 @@ impl Drop for Injector {
 /// One plugged virtual pad: its encoding session and the driver sections it feeds.
 struct PadState {
     client: u32,
+    /// The family it was plugged as (`PadConnected.pad_type`).
+    pad_type: u8,
     session: PadSession,
     input: shmem::Section,
     output: shmem::Section,
@@ -317,6 +319,18 @@ fn connect_pad(
     let Some(slot) = pads.get_mut(pad_index as usize) else {
         return;
     };
+    // Pads outlive a session that ends without unplugging them (a lost Wi-Fi,
+    // a killed app), so the next session re-announces a plugged slot. The same
+    // family keeps its node, and the game keeps its controller.
+    if let Some(pad) = slot.as_mut()
+        && pad.pad_type == pad_type
+    {
+        pad.client = client;
+        return;
+    }
+    // Otherwise unplug what is there first: the new node reuses its instance
+    // name (`HM_{index:04}`), and creating it beside the old one would collide.
+    *slot = None;
     let Some(profile) = registry::profile_for(pad_type) else {
         return;
     };
@@ -347,6 +361,7 @@ fn connect_pad(
 
     *slot = Some(PadState {
         client,
+        pad_type,
         session,
         input,
         output,

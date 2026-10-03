@@ -8,10 +8,12 @@
 //! [`GamepadState`], mouse deltas and wheel to their events. Keyboard/gamepad
 //! routing is Kotlin's job (it knows the event source); this maps each stream.
 
+use sunburst_core::proto::ClientControl;
 use sunburst_core::proto::input::{
     GamepadState, InputEvent, MAX_PADS, MouseButton, MouseMotion, buttons,
 };
 use sunburst_input::keymap::modifiers;
+use sunburst_input::pad::registry::PadType;
 
 /// A raw Android event, before mapping. Floats are Android's normalised axis
 /// values (sticks −1..1, triggers/hats 0..1 or −1..1).
@@ -303,6 +305,70 @@ impl InputAccumulator {
     }
 }
 
+impl ClientInput {
+    /// An event from the TV-native pad, which accumulates into slot 0.
+    pub fn is_native_pad(&self) -> bool {
+        matches!(
+            self,
+            ClientInput::PadButton { .. } | ClientInput::PadAxis { .. }
+        )
+    }
+}
+
+/// Which pad slots the server has been told about this session.
+///
+/// The server creates a virtual pad only on `PadConnected`, and drops gamepad
+/// input for a slot it has no pad in — so a pad that is never announced does
+/// nothing, however healthy its input. A slot is announced when the bridge
+/// reports the pad, or on its first input: that covers a pad already attached
+/// when the session started, and the TV-native pad, which has no connect event.
+/// Once per slot per session, since the server rebuilds a re-announced pad of a
+/// different family, and the game sees it unplug.
+#[derive(Debug, Default)]
+pub struct PadAnnouncer {
+    announced: u8,
+}
+
+impl PadAnnouncer {
+    pub fn new() -> PadAnnouncer {
+        PadAnnouncer::default()
+    }
+
+    /// The `PadConnected` to send for `index`, unless it was already sent. An
+    /// index past [`MAX_PADS`] is never announced, like its input.
+    pub fn connect(
+        &mut self,
+        index: u8,
+        pad_type: PadType,
+        capabilities: u16,
+    ) -> Option<ClientControl> {
+        if index >= MAX_PADS || self.announced & (1 << index) != 0 {
+            return None;
+        }
+        self.announced |= 1 << index;
+        Some(ClientControl::PadConnected {
+            pad_index: index,
+            pad_type: pad_type as u8,
+            capabilities,
+        })
+    }
+
+    /// The `PadDisconnected` to send for `index`, if it was announced.
+    pub fn disconnect(&mut self, index: u8) -> Option<ClientControl> {
+        if index >= MAX_PADS || self.announced & (1 << index) == 0 {
+            return None;
+        }
+        self.announced &= !(1 << index);
+        Some(ClientControl::PadDisconnected { pad_index: index })
+    }
+
+    /// A `PadDisconnected` for every announced slot, for a session ending
+    /// cleanly, so no virtual pad outlives the stream on the server.
+    pub fn disconnect_all(&mut self) -> impl Iterator<Item = ClientControl> + '_ {
+        (0..MAX_PADS).filter_map(|i| self.disconnect(i))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +537,95 @@ mod tests {
                 state: GamepadState::default(),
             }),
             None
+        );
+    }
+
+    #[test]
+    fn a_pad_is_announced_once_per_slot() {
+        let mut pads = PadAnnouncer::new();
+        assert_eq!(
+            pads.connect(1, PadType::XboxSeriesXS, 4),
+            Some(ClientControl::PadConnected {
+                pad_index: 1,
+                pad_type: 1,
+                capabilities: 4,
+            })
+        );
+        // Every later input for the slot asks again; none re-announces it.
+        assert_eq!(pads.connect(1, PadType::XboxSeriesXS, 4), None);
+        assert_eq!(pads.connect(1, PadType::Xbox360, 0), None);
+        // Other slots are independent.
+        assert!(pads.connect(0, PadType::Xbox360, 0).is_some());
+        // Out of range is never announced, so it cannot claim another slot.
+        assert_eq!(pads.connect(MAX_PADS, PadType::Xbox360, 0), None);
+    }
+
+    #[test]
+    fn a_pad_is_disconnected_only_if_announced_and_can_return() {
+        let mut pads = PadAnnouncer::new();
+        assert_eq!(pads.disconnect(2), None);
+        pads.connect(2, PadType::XboxSeriesXS, 0);
+        assert_eq!(
+            pads.disconnect(2),
+            Some(ClientControl::PadDisconnected { pad_index: 2 })
+        );
+        assert_eq!(pads.disconnect(2), None);
+        // A pad that comes back is announced afresh.
+        assert!(pads.connect(2, PadType::XboxSeriesXS, 0).is_some());
+    }
+
+    #[test]
+    fn a_clean_exit_unplugs_every_announced_pad() {
+        let mut pads = PadAnnouncer::new();
+        pads.connect(0, PadType::Xbox360, 0);
+        pads.connect(3, PadType::XboxSeriesXS, 0);
+        let sent: Vec<_> = pads.disconnect_all().collect();
+        assert_eq!(
+            sent,
+            vec![
+                ClientControl::PadDisconnected { pad_index: 0 },
+                ClientControl::PadDisconnected { pad_index: 3 },
+            ]
+        );
+        assert_eq!(pads.disconnect_all().count(), 0);
+    }
+
+    #[test]
+    fn only_view_pad_events_are_the_native_pad() {
+        assert!(
+            ClientInput::PadButton {
+                code: 96,
+                down: true
+            }
+            .is_native_pad()
+        );
+        assert!(
+            ClientInput::PadAxis {
+                lx: 0.0,
+                ly: 0.0,
+                rx: 0.0,
+                ry: 0.0,
+                lt: 0.0,
+                rt: 0.0,
+                hat_x: 0.0,
+                hat_y: 0.0,
+            }
+            .is_native_pad()
+        );
+        // A bridge pad brings its own index and is announced by the bridge path.
+        assert!(
+            !ClientInput::Pad {
+                index: 0,
+                state: GamepadState::default(),
+            }
+            .is_native_pad()
+        );
+        assert!(
+            !ClientInput::Wheel {
+                delta: 1.0,
+                horizontal: false
+            }
+            .is_native_pad()
         );
     }
 
