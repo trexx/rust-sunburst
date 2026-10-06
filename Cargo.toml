@@ -48,7 +48,7 @@ unsafe-libopus = "0.2"
 # Control plane only. CLAUDE.md permits tokio in sunburst-server; sunburst-web is
 # the same plane and never sits between the frame path and anything.
 tokio = { version = "1.53.2", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "process"] }
-hyper = { version = "1.11.1", default-features = false, features = ["server", "http1"] }
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 # hyper 1.x moved body helpers out of the core crate. Collecting a request body
 # by hand means writing an async Body impl, which is the one part of this that
