@@ -66,7 +66,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Build the server and fakeclient (release)
         run: cargo build --release -p sunburst-server -p fakeclient
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24.21.0
           cache: npm
@@ -85,7 +85,7 @@ jobs:
           cp target/release/sunburst-server.exe dist/
           cp target/release/fakeclient.exe dist/
           cp -r web/dist/* dist/web/
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sunburst-windows
           path: dist/
@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24.21.0
           cache: npm
@@ -236,7 +236,7 @@ jobs:
       # twin of the Windows `package` job. Debug-signed: installable via sideload,
       # not Play. Uploaded on PRs too, so a reviewer can grab the build.
       - name: Publish the APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sunburst-android
           path: android/app/build/outputs/apk/debug/app-debug.apk
