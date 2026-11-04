@@ -27,7 +27,7 @@ env:
 jobs:
   rust:
     name: Rust (tests, clippy, fmt)
-    uses: trexx/actions/.github/workflows/rust-check.yml@shared-steps
+    uses: trexx/actions/.github/workflows/rust-check.yml@main
     permissions:
       contents: read
     with:
@@ -40,11 +40,11 @@ jobs:
     runs-on: windows-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: trexx/actions/.github/actions/checkout@shared-steps
-      - uses: trexx/actions/.github/actions/rust-cache@shared-steps
+      - uses: trexx/actions/.github/actions/checkout@main
+      - uses: trexx/actions/.github/actions/rust-cache@main
       - name: Build the server and fakeclient (release)
         run: cargo build --release -p sunburst-server -p fakeclient
-      - uses: trexx/actions/.github/actions/setup-node@shared-steps
+      - uses: trexx/actions/.github/actions/setup-node@main
         with:
           node-version: 26.13.0
           cache: npm
@@ -63,7 +63,7 @@ jobs:
           cp target/release/sunburst-server.exe dist/
           cp target/release/fakeclient.exe dist/
           cp -r web/dist/* dist/web/
-      - uses: trexx/actions/.github/actions/upload-artifact@shared-steps
+      - uses: trexx/actions/.github/actions/upload-artifact@main
         with:
           name: sunburst-windows
           path: dist/
@@ -73,8 +73,8 @@ jobs:
     name: Management UI
     runs-on: ubuntu-latest
     steps:
-      - uses: trexx/actions/.github/actions/checkout@shared-steps
-      - uses: trexx/actions/.github/actions/setup-node@shared-steps
+      - uses: trexx/actions/.github/actions/checkout@main
+      - uses: trexx/actions/.github/actions/setup-node@main
         with:
           node-version: 26.13.0
           cache: npm
@@ -89,8 +89,8 @@ jobs:
     name: Android (both ABIs + Gradle)
     runs-on: ubuntu-latest
     steps:
-      - uses: trexx/actions/.github/actions/checkout@shared-steps
-      - uses: trexx/actions/.github/actions/rust-cache@shared-steps
+      - uses: trexx/actions/.github/actions/checkout@main
+      - uses: trexx/actions/.github/actions/rust-cache@main
 
       # The runner ships an Android SDK and NDK already. Using them avoids a
       # third-party action and a version string that would have to be guessed
@@ -123,7 +123,7 @@ jobs:
       # a public artifact.
       - name: Cache the dongle firmware
         id: fw-cache
-        uses: trexx/actions/.github/actions/cache@shared-steps
+        uses: trexx/actions/.github/actions/cache@main
         with:
           path: android/app/src/main/assets/xone_dongle_fw.bin
           key: xone-dongle-fw-${{ hashFiles('scripts/fetch-firmware.sh') }}
@@ -148,7 +148,7 @@ jobs:
       # over the last instead of needing an uninstall (which wipes the pairing).
       # Fork PRs get no secrets and fall back to a throwaway key, as before.
       - name: Install the stable debug signing key
-        uses: trexx/actions/.github/actions/decode-keystore@shared-steps
+        uses: trexx/actions/.github/actions/decode-keystore@main
         with:
           keystore_base64: ${{ secrets.SUNBURST_DEBUG_KEYSTORE_B64 }}
           filename: sunburst-debug.keystore
@@ -209,7 +209,7 @@ jobs:
       # twin of the Windows `package` job. Debug-signed: installable via sideload,
       # not Play. Uploaded on PRs too, so a reviewer can grab the build.
       - name: Publish the APK
-        uses: trexx/actions/.github/actions/upload-artifact@shared-steps
+        uses: trexx/actions/.github/actions/upload-artifact@main
         with:
           name: sunburst-android
           path: android/app/build/outputs/apk/debug/app-debug.apk
