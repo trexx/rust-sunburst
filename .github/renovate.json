@@ -2,15 +2,12 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "github>trexx/actions",
-    "config:recommended",
-    ":dependencyDashboard",
-    ":semanticCommits"
+    "config:recommended"
   ],
   "labels": ["dependencies"],
   "prConcurrentLimit": 5,
   "rangeStrategy": "bump",
   "lockFileMaintenance": {
-    "enabled": true,
     "schedule": ["before 6am on monday"]
   },
   "packageRules": [
