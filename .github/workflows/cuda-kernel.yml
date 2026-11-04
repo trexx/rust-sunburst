@@ -25,7 +25,7 @@ jobs:
     name: nvcc -ptx (P010 + NV12 kernels)
     runs-on: ubuntu-latest
     steps:
-      - uses: trexx/actions/.github/actions/checkout@shared-steps
+      - uses: trexx/actions/.github/actions/checkout@main
 
       - name: Install the CUDA toolkit (nvcc)
         run: |
@@ -48,7 +48,7 @@ jobs:
           head -12 argb10_to_p010.ptx
           sha256sum argb10_to_p010.ptx argb_to_nv12.ptx | tee SHA256SUMS.txt
 
-      - uses: trexx/actions/.github/actions/upload-artifact@shared-steps
+      - uses: trexx/actions/.github/actions/upload-artifact@main
         with:
           name: cuda-ptx-${{ github.event.inputs.arch }}
           path: |
