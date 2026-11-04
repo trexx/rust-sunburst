@@ -86,7 +86,7 @@ jobs:
         run: |
           cd extracted && sha256sum * | tee SHA256SUMS.txt
 
-      - uses: trexx/actions/.github/actions/upload-artifact@shared-steps
+      - uses: trexx/actions/.github/actions/upload-artifact@main
         with:
           name: hidmaestro-driver-${{ github.event.inputs.hidmaestro_ref }}
           path: extracted/
