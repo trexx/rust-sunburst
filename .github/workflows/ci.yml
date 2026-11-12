@@ -46,7 +46,7 @@ jobs:
         run: cargo build --release -p sunburst-server -p fakeclient
       - uses: trexx/actions/.github/actions/setup-node@main
         with:
-          node-version: 26.13.0
+          node-version: 26.13.1
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Build the web UI
@@ -76,7 +76,7 @@ jobs:
       - uses: trexx/actions/.github/actions/checkout@main
       - uses: trexx/actions/.github/actions/setup-node@main
         with:
-          node-version: 26.13.0
+          node-version: 26.13.1
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
