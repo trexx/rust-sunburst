@@ -37,7 +37,7 @@ sunburst-input = { path = "sunburst-input" }
 sunburst-audio = { path = "sunburst-audio" }
 sunburst-gip-bridge = { path = "sunburst-gip-bridge" }
 
-blake3 = { version = "1.8.7", default-features = false, features = ["std"] }
+blake3 = { version = "1.8.8", default-features = false, features = ["std"] }
 
 # libopus transpiled to pure Rust (c2rust). Pure Rust so the Opus encoder (server)
 # and decoder (client) cross-compile to Windows and both Android ABIs with no C
